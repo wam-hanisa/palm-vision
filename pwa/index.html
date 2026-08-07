@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Palm Vision — Field</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <meta name="theme-color" content="#2F4A38">
+  <link rel="apple-touch-icon" href="/pwa/icons/icon-192.png">
+  <link rel="stylesheet" href="/pwa/css/app.css">
+</head>
+<body>
+  <div id="app">
+    <div class="screen"><p class="muted">Loading…</p></div>
+  </div>
+
+  <!-- Load order matters: db.js and geo.js have no dependencies; api.js
+       depends on db.js (token storage); sync.js depends on both api.js and
+       db.js; app.js depends on all four. -->
+  <script src="/pwa/js/db.js"></script>
+  <script src="/pwa/js/api.js"></script>
+  <script src="/pwa/js/sync.js"></script>
+  <script src="/pwa/js/geo.js"></script>
+  <script src="/pwa/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,201 @@
+"""
+Celery Beat periodic checks — docs/12-security-ops.md § Alerting &
+notifications: "Delivered via Celery Beat periodic checks (most are
+daily-digest material) plus event-driven triggers for anything that
+shouldn't wait." The one trigger in that doc's list that genuinely needs to
+be event-driven — a failed processing run — is NOT here; it's called
+directly from apps/imagery/services.py's run_processing() the moment it
+happens. Everything else below is legitimately digest-shaped (a daily
+"here's what needs attention" scan), which is what Celery Beat's schedule
+in palmvision/settings/base.py's CELERY_BEAT_SCHEDULE runs these as.
+
+Each check notifies farm Managers (the office-facing role compliance/
+approval/backlog problems are actually actionable by), except
+check_stalled_sync, which notifies the affected field user directly — a
+Manager can't do anything about someone else's phone being offline; the
+person who needs to know is the one holding it.
+"""
+from datetime import timedelta
+
+from celery import shared_task
+from django.conf import settings
+from django.db.models import Count, Q
+from django.utils import timezone
+
+from apps.compliance.models import ComplianceDocument
+from apps.farms.models import FarmBlock, UserFarmRole
+from apps.imagery.models import TreeDetection, TreeHealthClassification
+from apps.operations.models import Fertilizer, Harvest, PlanStatus
+from apps.sync.models import SyncCheckIn
+
+from .models import NotificationCategory
+from .services import notify
+
+
+def _managers_for_farm(farm):
+    manager_ids = UserFarmRole.objects.filter(farm=farm, role=UserFarmRole.ROLE_MANAGER).values_list(
+        "user_id", flat=True
+    )
+    from apps.users.models import User
+
+    return User.objects.filter(id__in=manager_ids)
+
+
+@shared_task
+def check_compliance_expiry():
+    """Fires on exact-day matches against each configured threshold
+    (settings.COMPLIANCE_NOTIFICATION_THRESHOLDS_DAYS, default [90, 60, 30])
+    rather than "expiry_date within N days" continuously — the latter would
+    re-notify every single day for the entire window, which is exactly the
+    "sending everyone everything is how alerts stop getting read" failure
+    docs/12-security-ops.md warns against. Three notifications per document
+    (at 90, 60, 30 days out) is the intended escalation, not a daily nag.
+    """
+    thresholds = getattr(settings, "COMPLIANCE_NOTIFICATION_THRESHOLDS_DAYS", [90, 60, 30])
+    today = timezone.localdate()
+    for threshold in thresholds:
+        target_date = today + timedelta(days=threshold)
+        documents = ComplianceDocument.objects.filter(expiry_date=target_date).select_related(
+            "farm", "farm_block__farm"
+        )
+        for document in documents:
+            farm = document.farm or document.farm_block.farm
+            for manager in _managers_for_farm(farm):
+                notify(
+                    manager,
+                    NotificationCategory.COMPLIANCE_EXPIRY,
+                    title=f"{document.get_document_type_display()} expires in {threshold} days",
+                    message=(
+                        f"{document.get_document_type_display()} for "
+                        f"{document.farm_block or document.farm} expires on {document.expiry_date}."
+                    ),
+                    link=f"/api/compliance-documents/{document.id}/",
+                )
+
+
+@shared_task
+def check_tree_health_anomalies():
+    """docs/12-security-ops.md: 'a meaningful week-over-week increase in
+    yellow/unhealthy classifications for a block.' Compares the trailing
+    window (settings.TREE_HEALTH_ANOMALY_WINDOW_DAYS, default 7 days)
+    against the equal-length window immediately before it, per block. Uses
+    `effective_label` — a reviewed correction counts as the real answer,
+    same reasoning as apps/reporting/services.py's tree-health report.
+    """
+    window_days = getattr(settings, "TREE_HEALTH_ANOMALY_WINDOW_DAYS", 7)
+    min_increase = getattr(settings, "TREE_HEALTH_ANOMALY_MIN_INCREASE", 5)
+    today = timezone.localdate()
+    window_start = today - timedelta(days=window_days)
+    prior_start = window_start - timedelta(days=window_days)
+
+    unhealthy_labels = [TreeHealthClassification.HEALTH_SMALL, TreeHealthClassification.HEALTH_YELLOW]
+
+    for block in FarmBlock.objects.filter(boundary__isnull=False).select_related("farm"):
+        base_qs = TreeHealthClassification.objects.filter(
+            tree_detection__processing_run__farm_block=block,
+        )
+        # effective_label isn't a DB field (it's corrected_label-or-health_label
+        # in Python), so this counts both label fields' matches directly —
+        # equivalent for classifications that have no correction, which is
+        # the common case; a corrected classification is counted by its
+        # corrected value, not double-counted.
+        current_count = base_qs.filter(
+            created_at__date__gte=window_start, created_at__date__lt=today
+        ).filter(
+            Q(corrected_label__in=unhealthy_labels)
+            | (Q(corrected_label="") & Q(health_label__in=unhealthy_labels))
+        ).count()
+        prior_count = base_qs.filter(
+            created_at__date__gte=prior_start, created_at__date__lt=window_start
+        ).filter(
+            Q(corrected_label__in=unhealthy_labels)
+            | (Q(corrected_label="") & Q(health_label__in=unhealthy_labels))
+        ).count()
+
+        if current_count - prior_count >= min_increase:
+            for manager in _managers_for_farm(block.farm):
+                notify(
+                    manager,
+                    NotificationCategory.TREE_HEALTH_ANOMALY,
+                    title=f"Tree health anomaly — {block.name}",
+                    message=(
+                        f"Unhealthy classifications for {block.name} rose from {prior_count} to "
+                        f"{current_count} over the last {window_days} days."
+                    ),
+                    link=f"/api/farm-blocks/{block.id}/",
+                )
+
+
+@shared_task
+def check_stalled_sync():
+    """See apps/sync/models.py's SyncCheckIn docstring for why this signal
+    exists at all — without the PWA's check-in call, this check would have
+    nothing to query. Fires every run this check finds a still-stalled
+    device on (no per-device snooze/dedup yet — see BUILD_STATUS.md).
+    """
+    stalled_days = getattr(settings, "STALLED_SYNC_DAYS", 3)
+    cutoff = timezone.now() - timedelta(days=stalled_days)
+    stalled = SyncCheckIn.objects.filter(pending_count__gt=0, last_checkin_at__lt=cutoff).select_related("user")
+    for checkin in stalled:
+        notify(
+            checkin.user,
+            NotificationCategory.STALLED_SYNC,
+            title="Unsynced data on your device",
+            message=(
+                f"Your device last checked in on {checkin.last_checkin_at:%Y-%m-%d} with "
+                f"{checkin.pending_count} item(s) still queued. Reconnect to sync."
+            ),
+        )
+
+
+@shared_task
+def check_review_backlog():
+    """Unresolved detections (new_candidate/ambiguous, never confirmed,
+    rejected, or linked — i.e. still sitting with no `tree` and an
+    unresolved match_status) per block, above
+    settings.REVIEW_BACKLOG_THRESHOLD (default 20).
+    """
+    threshold = getattr(settings, "REVIEW_BACKLOG_THRESHOLD", 20)
+    unresolved = [TreeDetection.MATCH_NEW_CANDIDATE, TreeDetection.MATCH_AMBIGUOUS]
+
+    backlog_by_block = (
+        TreeDetection.objects.filter(tree__isnull=True, match_status__in=unresolved)
+        .values("processing_run__farm_block")
+        .annotate(count=Count("id"))
+        .filter(count__gte=threshold)
+    )
+    for row in backlog_by_block:
+        block = FarmBlock.objects.select_related("farm").get(id=row["processing_run__farm_block"])
+        for manager in _managers_for_farm(block.farm):
+            notify(
+                manager,
+                NotificationCategory.REVIEW_BACKLOG,
+                title=f"Detection review backlog — {block.name}",
+                message=f"{row['count']} detections awaiting review on {block.name}.",
+                link=f"/api/farm-blocks/{block.id}/processing-runs/",
+            )
+
+
+@shared_task
+def check_approvals_pending():
+    """Harvest/Fertilizer plans sitting in an awaiting-approval status
+    (docs/03-data-model.md's PlanStatus machine) longer than
+    settings.APPROVAL_PENDING_DAYS (default 3).
+    """
+    pending_days = getattr(settings, "APPROVAL_PENDING_DAYS", 3)
+    cutoff = timezone.now() - timedelta(days=pending_days)
+    waiting_statuses = [PlanStatus.ON_PROGRESS_WAIT, PlanStatus.DONE_WAIT]
+
+    for model, label in [(Harvest, "Harvest"), (Fertilizer, "Fertilizer")]:
+        pending = model.objects.filter(status__in=waiting_statuses, updated_at__lt=cutoff).select_related(
+            "farm_block__farm"
+        )
+        for plan in pending:
+            for manager in _managers_for_farm(plan.farm_block.farm):
+                notify(
+                    manager,
+                    NotificationCategory.APPROVAL_PENDING,
+                    title=f"{label} approval pending — {plan.farm_block.name}",
+                    message=f"{label} plan for {plan.farm_block.name} has been awaiting approval since {plan.updated_at:%Y-%m-%d}.",
+                    link=f"/api/{label.lower()}s/{plan.id}/",
+                )

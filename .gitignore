@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.env
+*.sqlite3
+staticfiles/
+.pytest_cache/
+.DS_Store
+media/
+test_media/
+backups/*.dump
+celerybeat-schedule
+.ruff_cache/

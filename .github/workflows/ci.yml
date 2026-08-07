@@ -1,0 +1,93 @@
+name: CI
+
+# docs/02-build-plan.md Phase 8: "GitHub Actions workflow: run tests +
+# linting on push." Two independent jobs — lint doesn't need Postgres/GDAL
+# at all, so it's kept fast and separate rather than bundled into the test
+# job's much heavier setup.
+#
+# The test job installs GDAL/GEOS/PROJ/WeasyPrint's native libs directly on
+# the runner and runs pytest against real service containers (Postgres+PostGIS,
+# Redis) — not `docker compose` — because GitHub Actions' `services:` feature
+# gives the same "real Postgres/PostGIS, real Redis" guarantee with much
+# less overhead than building and orchestrating this project's own Docker
+# images inside CI. The Dockerfile/docker-compose.yml remain the source of
+# truth for what actually deploys; this workflow exists to catch regressions
+# on every push, not to validate the Docker image itself (Phase 8's backup/
+# restore drill and the Dockerfile's own build are checked separately — see
+# BUILD_STATUS.md).
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check .
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_DB: palmvision
+          POSTGRES_USER: palmvision
+          POSTGRES_PASSWORD: palmvision
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U palmvision"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DJANGO_SETTINGS_MODULE: palmvision.settings.test
+      SECRET_KEY: ci-test-secret-key-not-for-real-use
+      DB_NAME: palmvision
+      DB_USER: palmvision
+      DB_PASSWORD: palmvision
+      DB_HOST: localhost
+      DB_PORT: 5432
+      CELERY_BROKER_URL: redis://localhost:6379/0
+      CELERY_RESULT_BACKEND: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Same GDAL/GEOS/PROJ + WeasyPrint native-library set the Dockerfile
+      # installs — see that file's comments for why each package is there,
+      # and specifically why libgdk-pixbuf-2.0-0 (hyphenated) is the name
+      # used, not the older libgdk-pixbuf2.0-0 (confirmed against a real
+      # `docker compose build` failure — see BUILD_STATUS.md Phase 7/8).
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gdal-bin libgdal-dev libgeos-dev libproj-dev libpq-dev \
+            libpango-1.0-0 libpangocairo-1.0-0 libcairo2 libgdk-pixbuf-2.0-0 fonts-dejavu-core
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run migrations
+        run: python manage.py migrate
+
+      - name: Run tests
+        run: pytest -v

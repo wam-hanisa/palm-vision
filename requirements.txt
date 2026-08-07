@@ -1,0 +1,58 @@
+Django>=5.2,<5.3
+djangorestframework>=3.15
+djangorestframework-gis>=1.0
+djangorestframework-simplejwt>=5.3
+django-cors-headers>=4.4
+django-simple-history>=3.7
+celery>=5.4
+redis>=5.0
+psycopg[binary]>=3.2
+django-storages>=1.14
+gunicorn>=22.0
+
+# Imagery / ML pipeline (docs/06-ml-pipeline.md) — Phase 5.
+# rasterio ships its own bundled GDAL wheel; no extra system packages needed
+# for it specifically (the Dockerfile's gdal-bin/libgdal-dev are for
+# GeoDjango, not rasterio). torch/torchvision/ultralytics are CPU-inference
+# viable at this volume per docs/06-ml-pipeline.md and are only actually
+# imported when DETECTION_MODEL_PATH/CLASSIFICATION_MODEL_PATH are set to a
+# real weights file — see apps/imagery/ml/*.py — so local dev without
+# trained weights never pays their import cost at runtime, only at install.
+rasterio>=1.3
+Pillow>=10.3
+numpy>=1.24
+# Uncomment once real trained weights exist — these are large downloads and
+# not needed to exercise the pipeline's clip/match/status-transition logic
+# against the stub models:
+# torch>=2.3
+# torchvision>=0.18
+# ultralytics>=8.2
+
+# Reporting exports (docs/08-reporting.md) — Phase 7.
+# WeasyPrint needs native Pango/cairo/gdk-pixbuf libraries, not just the pip
+# package — the Dockerfile needs a system-package install step added for
+# these (fonts-dejavu, libpango-1.0-0, libpangocairo-1.0-0, libgdk-pixbuf2.0-0,
+# libcairo2 on Debian/Ubuntu) alongside the existing gdal-bin/libgdal-dev.
+# Verified importable and able to actually render a PDF in this sandbox
+# (pip install alone was sufficient here — the sandbox image apparently
+# already had the native libs), so the code itself is real, tested logic,
+# not just structurally checked — but the Docker image this project
+# actually deploys with hasn't been confirmed to have those same native
+# libs yet. See BUILD_STATUS.md Phase 7 section.
+weasyprint>=62.0
+openpyxl>=3.1
+
+# Testing
+pytest>=8.2
+pytest-django>=4.8
+# Forces DJANGO_SETTINGS_MODULE=palmvision.settings.test regardless of the
+# container's ambient env var — see pytest.ini's comment for why this is
+# necessary, not just belt-and-suspenders.
+pytest-env>=1.1
+
+# Linting (docs/02-build-plan.md Phase 8) — see pyproject.toml for config.
+# Only pyflakes-equivalent rules (E/F/W, minus line-length) are enabled —
+# real-bug detection (unused imports, undefined names), not style
+# enforcement on top of this codebase's already-established long-docstring
+# convention.
+ruff>=0.6

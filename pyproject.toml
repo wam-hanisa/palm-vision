@@ -1,0 +1,21 @@
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+exclude = ["*/migrations/*"]
+
+[tool.ruff.lint]
+# E/F = pyflakes + pycodestyle errors (real bugs: unused imports, undefined
+# names, etc.). Not enabling the full pycodestyle style-nit set (E5xx line
+# length, etc.) — this codebase's docstrings are deliberately long and
+# explanatory (CLAUDE.md's own convention), so line-length nits would just
+# be noise a real linter shouldn't be gating CI on.
+select = ["E", "F", "W"]
+ignore = [
+    "E501",  # line too long — see note above
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Star imports are the standard, correct Django pattern for layering
+# settings/local.py and settings/test.py on top of settings/base.py.
+"palmvision/settings/local.py" = ["F403", "F405"]
+"palmvision/settings/test.py" = ["F403", "F405"]

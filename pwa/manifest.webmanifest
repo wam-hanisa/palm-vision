@@ -1,0 +1,14 @@
+{
+  "name": "Palm Vision — Field",
+  "short_name": "PalmVision",
+  "start_url": "/field/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#FAF8F3",
+  "theme_color": "#2F4A38",
+  "icons": [
+    { "src": "/pwa/icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/pwa/icons/icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}
