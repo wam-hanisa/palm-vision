@@ -1,0 +1,125 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Overview{% endblock %}
+{% block page_title %}Overview{% endblock %}
+{% block content %}
+<div class="card-grid">
+  <div class="metric-card {% if pending_approvals_total %}metric-attention{% endif %}">
+    <div class="metric-value">{{ pending_approvals_total }}</div>
+    <div class="metric-label">Pending approvals</div>
+    <div class="metric-sub">{{ pending_harvests }} harvest · {{ pending_fertilizers }} fertilizer</div>
+  </div>
+  <div class="metric-card {% if review_queue_count %}metric-attention{% endif %}">
+    <div class="metric-value">{{ review_queue_count }}</div>
+    <div class="metric-label">Detections awaiting review</div>
+  </div>
+  <div class="metric-card {% if compliance_attention_count %}metric-attention{% endif %}">
+    <div class="metric-value">{{ compliance_attention_count }}</div>
+    <div class="metric-label">Compliance docs expiring/expired</div>
+  </div>
+  <div class="metric-card {% if unread_notifications %}metric-attention{% endif %}">
+    <div class="metric-value">{{ unread_notifications }}</div>
+    <div class="metric-label">Unread notifications</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-value">{{ farm_count }}</div>
+    <div class="metric-label">Farms in scope</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-value">{{ block_count }}</div>
+    <div class="metric-label">Blocks in scope</div>
+  </div>
+</div>
+
+<p class="panel-note">
+  This overview mirrors what the daily notification checks already watch
+  (apps/notifications/tasks.py) — pending approvals, the detection review
+  queue, and compliance expiry — scoped to what you manage, the same way
+  the API scopes it.
+</p>
+
+{% comment %}
+Chart.js (CDN — same accepted exception this app already makes for
+Leaflet/tile imagery on the map pages) renders three charts from
+chart_data (HomeView._chart_data() in apps/dashboard/views.py): yield
+over the last 6 months, active-tree health distribution, and tree counts
+for the 10 blocks with the most trees. Each chart is skipped (not drawn
+at all, rather than shown empty/broken) if it has no data — a brand-new
+deployment with zero harvest history yet shouldn't show a misleading
+blank chart.
+{% endcomment %}
+<div class="chart-grid">
+  <section class="panel">
+    <h2 class="section-heading">Yield, last 6 months</h2>
+    <canvas id="yield-chart"></canvas>
+    <p class="empty-state" id="yield-chart-empty" hidden>No harvest records in the last 6 months yet.</p>
+  </section>
+  <section class="panel">
+    <h2 class="section-heading">Tree health</h2>
+    <canvas id="health-chart"></canvas>
+    <p class="empty-state" id="health-chart-empty" hidden>No active trees recorded yet.</p>
+  </section>
+  <section class="panel panel-wide">
+    <h2 class="section-heading">Tree quantities by block (top 10)</h2>
+    <canvas id="tree-quantities-chart"></canvas>
+    <p class="empty-state" id="tree-quantities-chart-empty" hidden>No active trees recorded yet.</p>
+  </section>
+</div>
+
+{{ chart_data|json_script:"chart-data" }}
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.0/chart.umd.min.js"></script>
+<script>
+(function () {
+  var data = JSON.parse(document.getElementById("chart-data").textContent);
+  if (typeof Chart === "undefined") return; // CDN failed to load -- charts just don't render, rest of the page is unaffected
+
+  var healthColors = { Healthy: "#6B8F71", Yellow: "#B85C4A", Unknown: "#8A8578" };
+
+  function renderOrHide(canvasId, hasData, renderFn) {
+    var canvas = document.getElementById(canvasId);
+    var empty = document.getElementById(canvasId + "-empty");
+    if (!hasData) {
+      if (canvas) canvas.hidden = true;
+      if (empty) empty.hidden = false;
+      return;
+    }
+    renderFn(canvas);
+  }
+
+  renderOrHide("yield-chart", data.yield.labels.length > 0, function (canvas) {
+    new Chart(canvas, {
+      type: "bar",
+      data: {
+        labels: data.yield.labels,
+        datasets: [{ label: "Yield (quantity)", data: data.yield.values, backgroundColor: "#6B8F71" }],
+      },
+      options: { responsive: true, plugins: { legend: { display: false } } },
+    });
+  });
+
+  renderOrHide("health-chart", data.health.labels.length > 0, function (canvas) {
+    new Chart(canvas, {
+      type: "doughnut",
+      data: {
+        labels: data.health.labels,
+        datasets: [{
+          data: data.health.values,
+          backgroundColor: data.health.labels.map(function (l) { return healthColors[l] || "#8A8578"; }),
+        }],
+      },
+      options: { responsive: true },
+    });
+  });
+
+  renderOrHide("tree-quantities-chart", data.tree_quantities.labels.length > 0, function (canvas) {
+    new Chart(canvas, {
+      type: "bar",
+      data: {
+        labels: data.tree_quantities.labels,
+        datasets: [{ label: "Trees", data: data.tree_quantities.values, backgroundColor: "#2F4A38" }],
+      },
+      options: { responsive: true, indexAxis: "y", plugins: { legend: { display: false } } },
+    });
+  });
+})();
+</script>
+{% endblock %}

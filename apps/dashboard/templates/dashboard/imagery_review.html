@@ -1,0 +1,139 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Review queue{% endblock %}
+{% block page_title %}Review queue — {{ run.farm_block.name }}{% endblock %}
+{% block content %}
+<p class="panel-note">
+  Run started {{ run.created_at }} · status
+  <span class="tag {% if run.status == 'ready' %}tag-success{% elif run.status == 'failed' %}tag-danger{% else %}tag-warning{% endif %}" id="run-status-tag">{{ run.get_status_display }}</span>
+  · <span id="run-counts">{{ run.detected_tree_count }} detected, {{ run.new_candidate_count }} new candidates.</span>
+</p>
+
+{% if run.status == "failed" %}
+  <p class="flash flash-error">{{ run.error_message }}</p>
+{% endif %}
+
+<!-- Always in the DOM (like imagery_list.html's own #upload-progress),
+     shown/hidden via the `hidden` attribute rather than conditionally
+     rendered — the polling JS below needs these elements to already
+     exist even when the run is still "pending"/"clipping" (no percent
+     yet) at initial page load, since progress can start appearing on the
+     very next poll. -->
+<div class="upload-progress" id="run-progress" {% if run.progress_percent is None %}hidden{% endif %}>
+  <div class="upload-progress-track"><div class="upload-progress-fill" id="run-progress-fill" style="width:{{ run.progress_percent|default:0 }}%;"></div></div>
+  <span class="upload-progress-label" id="run-progress-label">{{ run.progress_percent|default:0 }}%</span>
+</div>
+
+{% if run.status != "ready" and run.status != "failed" %}
+<script>
+(function () {
+  // Polls RunStatusView every 2s while this run is still working, updating
+  // the progress bar/status tag in place — same "poll then reload once
+  // done" shape the upload flow's own status polling already uses (see
+  // ImageConfirmBlocksView/FarmMapView's upload_confirm mode). Reloads the
+  // whole page once done, rather than trying to inject the detection
+  // cards client-side, since those only exist once detect+match+classify
+  // has actually finished (see run_processing() in apps/imagery/services.py)
+  // — there's nothing to render incrementally before that.
+  var STATUS_URL = "{% url 'dashboard:imagery-run-status' run_id=run.id %}";
+  var statusTag = document.getElementById("run-status-tag");
+  var countsEl = document.getElementById("run-counts");
+  var progressWrap = document.getElementById("run-progress");
+  var progressFill = document.getElementById("run-progress-fill");
+  var progressLabel = document.getElementById("run-progress-label");
+
+  function poll() {
+    fetch(STATUS_URL)
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (data.done) {
+          window.location.reload();
+          return;
+        }
+        statusTag.textContent = data.status_display;
+        countsEl.textContent = data.detected_tree_count + " detected, " + data.new_candidate_count + " new candidates.";
+        if (data.progress_percent !== null) {
+          if (progressWrap) progressWrap.hidden = false;
+          if (progressFill) progressFill.style.width = data.progress_percent + "%";
+          if (progressLabel) progressLabel.textContent = data.progress_percent + "%";
+        }
+        setTimeout(poll, 2000);
+      })
+      .catch(function () { setTimeout(poll, 4000); }); // transient network hiccup — keep trying, don't give up silently
+  }
+  setTimeout(poll, 2000);
+})();
+</script>
+{% endif %}
+
+{% if not detections %}
+  <p class="empty-state">Nothing left to review for this run — every detection is matched or already reviewed.</p>
+{% else %}
+<form method="post" action="{% url 'dashboard:imagery-run-confirm-all' run_id=run.id %}" class="inline-form" style="margin-bottom:16px;">
+  {% csrf_token %}
+  <button type="submit" class="primary-button" {% if not confirmable_count %}disabled{% endif %}>
+    Confirm all new candidates as trees{% if confirmable_count %} ({{ confirmable_count }}){% endif %}
+  </button>
+  {% if not confirmable_count %}
+    <span class="panel-note" style="margin-left:8px;">No plain new-candidate detections left — remaining ones are ambiguous and need individual review.</span>
+  {% endif %}
+</form>
+<div class="detection-grid">
+  {% for detection in detections %}
+  <div class="detection-card">
+    {% if detection.classification.patch_image %}
+      <img class="detection-thumb" src="{{ detection.classification.patch_image.url }}" alt="Cropped detection patch">
+    {% else %}
+      <div class="detection-thumb detection-thumb-placeholder">No preview available</div>
+    {% endif %}
+
+    <div class="detection-status">
+      {% if detection.match_status == "new_candidate" %}<span class="tag tag-warning">New candidate</span>
+      {% else %}<span class="tag tag-warning">Ambiguous</span>{% endif %}
+      <span class="detection-confidence">{{ detection.detection_confidence|floatformat:2 }} confidence</span>
+    </div>
+    <div class="detection-coords">{{ detection.detected_location.y|floatformat:6 }}, {{ detection.detected_location.x|floatformat:6 }}</div>
+
+    {% if detection.classification %}
+      <div class="detection-classification">
+        {% with label=detection.classification.effective_label %}
+          {% if label == "healthy" %}<span class="tag tag-success">Healthy</span>
+          {% elif label == "yellow" %}<span class="tag tag-danger">Yellow</span>
+          {% else %}<span class="tag">{{ label|title }}</span>{% endif %}
+        {% endwith %}
+        <span>{{ detection.classification.confidence|floatformat:2 }} confidence</span>
+      </div>
+    {% endif %}
+
+    {% if detection.match_status == "new_candidate" %}
+    <form method="post" action="{% url 'dashboard:imagery-detection-confirm' detection_id=detection.id %}" class="inline-form">
+      {% csrf_token %}
+      <button type="submit" class="primary-button primary-button-small">Confirm as new tree</button>
+    </form>
+    {% endif %}
+
+    {% if has_block_trees %}
+    <form method="post" action="{% url 'dashboard:imagery-detection-link' detection_id=detection.id %}" class="inline-form detection-link-form">
+      {% csrf_token %}
+      {% comment %}
+        Only the nearest few trees to THIS detection, not every tree in
+        the block — see ReviewQueueView's own comment for why.
+      {% endcomment %}
+      <select name="tree_id">
+        <option value="">Link to nearest tree…</option>
+        {% for tree in detection.link_candidates %}
+          <option value="{{ tree.id }}">{{ tree.name|default:tree.id }}</option>
+        {% endfor %}
+      </select>
+      <button type="submit" class="secondary-button">Link</button>
+    </form>
+    {% endif %}
+
+    <form method="post" action="{% url 'dashboard:imagery-detection-reject' detection_id=detection.id %}" class="inline-form">
+      {% csrf_token %}
+      <button type="submit" class="link-button-danger">Reject (false positive)</button>
+    </form>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+{% endblock %}

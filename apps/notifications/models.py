@@ -70,3 +70,40 @@ class NotificationPreference(models.Model):
 
     def __str__(self):
         return f"{self.user} — {self.get_category_display()}"
+
+
+class NotificationDedupState(models.Model):
+    """Tracks the last time a given (user, category, dedup_key) alert
+    actually fired — used by apps/notifications/services.py's
+    notify_with_snooze() to stop the non-compliance Beat checks
+    (check_stalled_sync, check_review_backlog, check_approvals_pending)
+    from re-notifying identically every single day a condition stays true,
+    which docs/12-security-ops.md explicitly warns against ("sending
+    everyone everything is how alerts stop getting read").
+
+    Deliberately a separate model from `Notification`, not "the most recent
+    Notification row with this category/link" — a user can have in-app
+    delivery disabled for a category (NotificationPreference), which means
+    no Notification row is ever created for them at all; deriving the
+    snooze window from Notification's own rows would silently defeat the
+    snooze for exactly those users (email would still be sent, so it would
+    re-fire every day regardless of how recently it last fired). This model
+    records "did this alert fire" independent of which channels were
+    actually enabled for it.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="+")
+    category = models.CharField(max_length=32, choices=NotificationCategory.choices)
+    dedup_key = models.CharField(
+        max_length=255,
+        help_text="Identifies the specific condition being alerted on, e.g. 'review-backlog:<block-id>' — "
+        "not necessarily the same as the Notification's own `link`.",
+    )
+    last_fired_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("user", "category", "dedup_key")
+
+    def __str__(self):
+        return f"{self.user} — {self.category} — {self.dedup_key}"

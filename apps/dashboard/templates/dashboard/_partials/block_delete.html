@@ -1,0 +1,32 @@
+{% comment %}
+Delete-block confirmation — see _partials/block_form.html's comment for
+why this is a shared fragment (used by both the standalone block_delete.html
+page and, now, the Farm Map panel via FarmBlockDeleteView's AJAX branch).
+See the module-level comment above FarmBlockDeleteView in views.py for why
+this refuses to delete anything that's actually been used.
+{% endcomment %}
+{% if blockers %}
+  <div class="flash flash-error">
+    This block can't be deleted — it still has:
+    <ul>
+      {% for label, count in blockers %}
+        <li>{{ count }} {{ label }}{{ count|pluralize }}</li>
+      {% endfor %}
+    </ul>
+    Deleting it would permanently destroy that history. Remove/reassign
+    what's above first if you genuinely need this block gone, or leave it
+    as-is.
+  </div>
+  <div class="panel-actions">
+    <a href="{% url 'dashboard:farms' %}?block={{ farm_block.id }}" class="secondary-button" data-panel-cancel>Back</a>
+  </div>
+{% else %}
+  <p class="panel-note">This block has nothing recorded against it yet — no trees, processing runs, or compliance records. Deleting it is safe and permanent.</p>
+  <form method="post" data-panel-form action="{% url 'dashboard:block-delete' block_id=farm_block.id %}">
+    {% csrf_token %}
+    <div class="panel-actions">
+      <button type="submit" class="primary-button primary-button-inline">Delete “{{ farm_block.name }}” permanently</button>
+      <a href="{% url 'dashboard:farms' %}?block={{ farm_block.id }}" class="secondary-button" data-panel-cancel>Cancel</a>
+    </div>
+  </form>
+{% endif %}

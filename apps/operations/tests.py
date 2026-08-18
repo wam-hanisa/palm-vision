@@ -204,3 +204,57 @@ def test_resubmitting_same_fertilizer_tree_uuid_updates_in_place(as_pic_block, f
 
     assert FertilizerTree.objects.filter(id=fertilizer_tree_id).count() == 1
     assert FertilizerTree.objects.get(id=fertilizer_tree_id).quantity == 3.0
+
+
+# --- FK write-scope validation (BUILD_STATUS.md "Known gaps" — DRF's
+# default PrimaryKeyRelatedField only checks a referenced row *exists*, not
+# that the requester can reach it. apps/common/scoping.py +
+# apps/common/serializers.py now restrict farm_block/harvest/fertilizer/tree
+# fields to the requesting user's actual scope.) ---
+
+@pytest.mark.django_db
+def test_pic_block_cannot_create_harvest_plan_for_a_block_they_are_not_assigned_to(as_pic_block, block_b):
+    response = as_pic_block.post(
+        "/api/harvests/",
+        {"farm_block": str(block_b.id), "assessment_date": "2026-08-01", "assessment_quantity": 500.0},
+        format="json",
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert not Harvest.objects.filter(farm_block=block_b).exists()
+
+
+@pytest.mark.django_db
+def test_pic_block_cannot_log_actual_harvest_against_an_out_of_scope_harvest_plan(as_pic_block, block_b):
+    """block_b's harvest plan belongs to a block as_pic_block has no access
+    to — logging an actual against it should be rejected the same way
+    referencing the block directly is, since ActualHarvest.harvest is the
+    write path into that same out-of-scope data.
+    """
+    other_plan = Harvest.objects.create(farm_block=block_b, assessment_date="2026-08-01", assessment_quantity=500.0)
+    response = as_pic_block.post(
+        "/api/actual-harvests/",
+        {"harvest": str(other_plan.id), "date": "2026-08-02", "quantity": 100.0},
+        format="json",
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert not ActualHarvest.objects.filter(harvest=other_plan).exists()
+
+
+@pytest.mark.django_db
+def test_pic_block_cannot_log_harvest_tree_for_a_tree_outside_their_block(as_pic_block, harvest_plan, block_b, pic_block):
+    from django.contrib.gis.geos import Point
+
+    from apps.trees.models import Tree
+
+    tree_in_block_b = Tree.objects.create(
+        farm_block=block_b, name="Block B tree", location=Point(101.4470, 0.5320, srid=4326),
+        created_by=pic_block, updated_by=pic_block,
+    )
+    actual = ActualHarvest.objects.create(harvest=harvest_plan, date="2026-08-02", quantity=500.0)
+    response = as_pic_block.post(
+        "/api/harvest-trees/",
+        {"actual_harvest": str(actual.id), "tree": str(tree_in_block_b.id), "quantity": 50.0},
+        format="json",
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert not HarvestTree.objects.filter(tree=tree_in_block_b).exists()

@@ -30,6 +30,15 @@ services:
     command: python manage.py runserver 0.0.0.0:8000
     volumes:
       - .:/app
+      # Trained ML weights live in the sibling palm-vision-ml repo (the
+      # actual training project), not duplicated into this repo — see
+      # BUILD_STATUS.md's "real models referenced from palm-vision-ml"
+      # update for why. Read-only: this container only ever loads these
+      # files, never writes them. If you don't have palm-vision-ml checked
+      # out as a sibling of this repo, comment this out and leave
+      # DETECTION_MODEL_PATH/CLASSIFICATION_MODEL_PATH blank in .env — the
+      # app falls back to the honest stub detector/classifier either way.
+      - ../palm-vision-ml/tree_health_pipeline/trained_models:/ml_models:ro
     ports:
       - "8000:8000"
     env_file: .env
@@ -44,6 +53,15 @@ services:
     command: celery -A palmvision worker -l info
     volumes:
       - .:/app
+      # Trained ML weights live in the sibling palm-vision-ml repo (the
+      # actual training project), not duplicated into this repo — see
+      # BUILD_STATUS.md's "real models referenced from palm-vision-ml"
+      # update for why. Read-only: this container only ever loads these
+      # files, never writes them. If you don't have palm-vision-ml checked
+      # out as a sibling of this repo, comment this out and leave
+      # DETECTION_MODEL_PATH/CLASSIFICATION_MODEL_PATH blank in .env — the
+      # app falls back to the honest stub detector/classifier either way.
+      - ../palm-vision-ml/tree_health_pipeline/trained_models:/ml_models:ro
     env_file: .env
     depends_on:
       db:
@@ -56,6 +74,15 @@ services:
     command: celery -A palmvision beat -l info
     volumes:
       - .:/app
+      # Trained ML weights live in the sibling palm-vision-ml repo (the
+      # actual training project), not duplicated into this repo — see
+      # BUILD_STATUS.md's "real models referenced from palm-vision-ml"
+      # update for why. Read-only: this container only ever loads these
+      # files, never writes them. If you don't have palm-vision-ml checked
+      # out as a sibling of this repo, comment this out and leave
+      # DETECTION_MODEL_PATH/CLASSIFICATION_MODEL_PATH blank in .env — the
+      # app falls back to the honest stub detector/classifier either way.
+      - ../palm-vision-ml/tree_health_pipeline/trained_models:/ml_models:ro
     env_file: .env
     depends_on:
       db:

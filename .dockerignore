@@ -4,3 +4,15 @@ __pycache__/
 *.sqlite3
 .git/
 .pytest_cache/
+.ruff_cache/
+celerybeat-schedule
+# media/ and test_media/ are never needed IN the image — web/worker/beat
+# all get them at runtime via docker-compose.yml's `.:/app` bind mount, not
+# via COPY. Excluding them keeps the build context small regardless of how
+# much real imagery has been uploaded locally (currently ~17GB in media/ —
+# see BUILD_STATUS.md for why some of that is real drone orthomosaic
+# uploads and some is leftover waste worth cleaning up separately).
+media/
+test_media/
+backups/
+staticfiles/

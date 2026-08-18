@@ -1,0 +1,65 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Reports{% endblock %}
+{% block page_title %}Reports{% endblock %}
+{% block content %}
+<section class="panel">
+  <h2 class="section-heading">New report definition</h2>
+  <form method="post" class="stacked-form">
+    {% csrf_token %}
+    {% if form.non_field_errors %}<div class="flash flash-error">{{ form.non_field_errors.0 }}</div>{% endif %}
+
+    <label for="{{ form.farm.id_for_label }}">Farm</label>
+    {{ form.farm }}
+    {% if form.farm.errors %}<div class="field-error">{{ form.farm.errors.0 }}</div>{% endif %}
+
+    <label for="{{ form.name.id_for_label }}">Name</label>
+    {{ form.name }}
+    {% if form.name.errors %}<div class="field-error">{{ form.name.errors.0 }}</div>{% endif %}
+
+    <label for="{{ form.report_type.id_for_label }}">Report type</label>
+    {{ form.report_type }}
+    <p class="panel-note">Only Production and Tree health reports actually generate a file today — the others are recognized but not yet implemented (see BUILD_STATUS.md).</p>
+
+    <label for="{{ form.export_format.id_for_label }}">Export format</label>
+    {{ form.export_format }}
+
+    <label for="{{ form.recurrence.id_for_label }}">Recurrence</label>
+    {{ form.recurrence }}
+
+    <label>Subscribers (emailed the generated file on each scheduled run — only relevant if Recurrence isn't "None")</label>
+    {{ form.subscribers }}
+    {% if form.subscribers.errors %}<div class="field-error">{{ form.subscribers.errors.0 }}</div>{% endif %}
+
+    <button type="submit" class="primary-button primary-button-inline">Create</button>
+  </form>
+</section>
+
+<section>
+  <h2 class="section-heading">Report definitions</h2>
+  {% if not definitions %}
+    <p class="empty-state">No report definitions yet.</p>
+  {% else %}
+    <table class="data-table">
+      <thead><tr><th>Name</th><th>Farm</th><th>Type</th><th>Format</th><th>Recurrence</th><th></th></tr></thead>
+      <tbody>
+        {% for definition in definitions %}
+        <tr>
+          <td>{{ definition.name }}</td>
+          <td>{{ definition.farm.name }}</td>
+          <td>{{ definition.get_report_type_display }}</td>
+          <td>{{ definition.get_export_format_display }}</td>
+          <td>{{ definition.get_recurrence_display }}</td>
+          <td>
+            <form method="post" action="{% url 'dashboard:report-run' definition.id %}" class="inline-form">
+              {% csrf_token %}
+              <button type="submit" class="link-button-accent">Run now</button>
+            </form>
+            <a href="{% url 'dashboard:report-runs' definition.id %}">View runs</a>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</section>
+{% endblock %}

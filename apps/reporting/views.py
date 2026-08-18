@@ -44,11 +44,22 @@ class ReportDefinitionViewSet(viewsets.ModelViewSet):
         qs = ReportDefinition.objects.select_related("farm").prefetch_related("subscribers")
         return _scoped_to_user_farms(qs, self.request.user)
 
-    def perform_create(self, serializer):
-        farm = serializer.validated_data["farm"]
+    def _require_manager_or_superadmin_for_farm(self, farm):
         if not (self.request.user.is_superuser or user_role_on_farm(self.request.user, farm) == UserFarmRole.ROLE_MANAGER):
-            raise PermissionDenied("Only a Manager or Super Admin can define a new report.")
+            raise PermissionDenied("Only a Manager or Super Admin can define or edit a report.")
+
+    def perform_create(self, serializer):
+        self._require_manager_or_superadmin_for_farm(serializer.validated_data["farm"])
         serializer.save(created_by=self.request.user)
+
+    def perform_update(self, serializer):
+        # Also covers a `farm` reassignment on update — check the new farm,
+        # not just the one the definition already belonged to (was missing
+        # entirely before this fix: only perform_create() checked anything,
+        # so PATCHing an existing definition bypassed the Manager-only rule).
+        farm = serializer.validated_data.get("farm", serializer.instance.farm)
+        self._require_manager_or_superadmin_for_farm(farm)
+        serializer.save()
 
     @action(detail=True, methods=["post"])
     def run(self, request, pk=None):

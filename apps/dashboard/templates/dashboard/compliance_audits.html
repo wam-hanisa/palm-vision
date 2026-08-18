@@ -1,0 +1,63 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Compliance audits{% endblock %}
+{% block page_title %}Compliance audits{% endblock %}
+{% block content %}
+<nav class="subnav">
+  <a href="{% url 'dashboard:compliance-documents' %}">Documents</a>
+  <a href="{% url 'dashboard:compliance-batches' %}">Batches &amp; export</a>
+  <a href="{% url 'dashboard:compliance-baselines' %}">Deforestation baselines</a>
+  <a href="{% url 'dashboard:compliance-audits' %}" class="active">Audits</a>
+  <a href="{% url 'dashboard:compliance-grievances' %}">Grievances</a>
+</nav>
+<p class="panel-note">
+  Read-only. Audits are scored against a certification-scheme checklist
+  (ISPO/RSPO/internal) by an auditor and recorded via the API or /admin/ —
+  this page is for reviewing results, including the per-checklist-item
+  breakdown, not for authoring a new audit.
+</p>
+
+<section>
+  <h2 class="section-heading">Audits</h2>
+  {% if not audits %}
+    <p class="empty-state">No compliance audits recorded yet.</p>
+  {% else %}
+    {% for audit in audits %}
+    <details class="panel audit-details">
+      <summary>
+        <strong>{{ audit.farm_block.name }} — {{ audit.farm_block.farm.name }}</strong>
+        · {{ audit.template.name }} · {{ audit.audit_date }} ·
+        {% if audit.overall_status == "passed" %}<span class="tag tag-success">Passed</span>
+        {% elif audit.overall_status == "failed" %}<span class="tag tag-danger">Failed</span>
+        {% else %}<span class="tag tag-warning">Conditional</span>{% endif %}
+      </summary>
+      <table class="data-table">
+        <tbody>
+          <tr><th>Auditor</th><td>{{ audit.auditor_name }} ({{ audit.get_auditor_type_display }})</td></tr>
+          <tr><th>Next audit due</th><td>{{ audit.next_audit_due|default:"—" }}</td></tr>
+        </tbody>
+      </table>
+      {% if audit.results.all %}
+      <table class="data-table">
+        <thead><tr><th>Checklist item</th><th>Result</th><th>Notes</th></tr></thead>
+        <tbody>
+          {% for result in audit.results.all %}
+          <tr>
+            <td>{{ result.checklist_item.text }}</td>
+            <td>
+              {% if result.result == "pass" %}<span class="tag tag-success">Pass</span>
+              {% elif result.result == "fail" %}<span class="tag tag-danger">Fail</span>
+              {% else %}<span class="tag tag-warning">N/A</span>{% endif %}
+            </td>
+            <td>{{ result.notes|default:"—" }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p class="empty-state">No per-item results recorded for this audit.</p>
+      {% endif %}
+    </details>
+    {% endfor %}
+  {% endif %}
+</section>
+{% endblock %}

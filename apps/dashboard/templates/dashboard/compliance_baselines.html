@@ -1,0 +1,56 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Deforestation baselines{% endblock %}
+{% block page_title %}Deforestation baselines{% endblock %}
+{% block content %}
+<nav class="subnav">
+  <a href="{% url 'dashboard:compliance-documents' %}">Documents</a>
+  <a href="{% url 'dashboard:compliance-batches' %}">Batches &amp; export</a>
+  <a href="{% url 'dashboard:compliance-baselines' %}" class="active">Deforestation baselines</a>
+  <a href="{% url 'dashboard:compliance-audits' %}">Audits</a>
+  <a href="{% url 'dashboard:compliance-grievances' %}">Grievances</a>
+</nav>
+<p class="panel-note">
+  One baseline per block — the EUDR/no-deforestation-since-cutoff determination
+  docs/07-compliance.md describes. Baselines themselves are created via the API
+  or /admin/ (they need a cutoff date and source survey set up once per block);
+  this page is for reviewing and verifying them.
+</p>
+
+<section>
+  <h2 class="section-heading">Baselines</h2>
+  {% if not baselines %}
+    <p class="empty-state">No deforestation baselines recorded yet.</p>
+  {% else %}
+    <table class="data-table">
+      <thead><tr><th>Block</th><th>Cutoff date</th><th>Source</th><th>Status</th><th>Verified by</th><th>Update status</th></tr></thead>
+      <tbody>
+        {% for baseline in baselines %}
+        <tr>
+          <td>{{ baseline.farm_block.name }} — {{ baseline.farm_block.farm.name }}</td>
+          <td>{{ baseline.cutoff_date }}</td>
+          <td>{{ baseline.source|default:"—" }}</td>
+          <td>
+            {% if baseline.status == "deforestation_free" %}<span class="tag tag-success">Deforestation-free</span>
+            {% elif baseline.status == "flagged" %}<span class="tag tag-danger">Flagged</span>
+            {% else %}<span class="tag tag-warning">Under review</span>{% endif %}
+          </td>
+          <td>{% if baseline.verified_by %}{{ baseline.verified_by.get_full_name|default:baseline.verified_by.username }} — {{ baseline.verified_at|date:"Y-m-d" }}{% else %}—{% endif %}</td>
+          <td>
+            <form method="post" class="inline-form">
+              {% csrf_token %}
+              <input type="hidden" name="baseline_id" value="{{ baseline.id }}">
+              <select name="status">
+                {% for value, label in status_choices %}
+                <option value="{{ value }}" {% if value == baseline.status %}selected{% endif %}>{{ label }}</option>
+                {% endfor %}
+              </select>
+              <button type="submit" class="link-button-accent">Save</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</section>
+{% endblock %}

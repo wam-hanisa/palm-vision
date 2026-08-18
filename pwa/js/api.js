@@ -4,10 +4,12 @@
  *
  * IMPORTANT per docs/05-offline-sync.md § Conflict handling: only *creates*
  * on offline-writable resources (Tree, HarvestTree, FertilizerTree,
- * ActualHarvest, ActualFertilizer) go through the queue. Editing an
- * existing record and the approve action are online-only — see
- * queueableWrite() below, which is the single gate other code should call
- * through rather than deciding for itself.
+ * ActualHarvest, ActualFertilizer) go through the queue — see
+ * queueableWrite() below. Editing an existing record (e.g. app.js's tree
+ * edit form) and the approve action are online-only — see
+ * onlineOnlyWrite() below. Two differently-named functions, not one
+ * flag-driven function, so which behavior a given call site gets is
+ * obvious from the call site itself, not from an easy-to-miss argument.
  */
 
 const API_BASE = ""; // same-origin — Django serves both the API and this PWA locally
@@ -126,10 +128,35 @@ async function queueableWrite(resource, path, method, body) {
   }
 }
 
+/** Edits go through here, never queueableWrite() — docs/05-offline-sync.md
+ * § Conflict handling: "Editing an existing record is an online-only
+ * action, not part of the offline queue — this deliberately avoids the
+ * harder class of conflict-resolution problems rather than half-solving
+ * them." A network failure here is never silently queued for later replay
+ * (unlike queueableWrite()'s 5xx/offline handling) — it propagates as
+ * apiFetch()'s usual distinguishable NetworkError (`.isNetworkError`) so
+ * the caller can tell the field worker plainly "try again once you're
+ * back online," instead of the edit vanishing into a queue that won't
+ * apply it until later (by which point the record may have changed under
+ * it — exactly the conflict this project chose not to try to resolve).
+ */
+async function onlineOnlyWrite(path, method, body) {
+  const response = await apiFetch(path, { method, body: JSON.stringify(body) });
+  if (!response.ok) {
+    const errorBody = await response.json().catch(() => ({}));
+    const error = new Error("Request rejected by the server.");
+    error.status = response.status;
+    error.body = errorBody;
+    throw error;
+  }
+  return response.json();
+}
+
 window.PalmVisionAPI = {
   login,
   logout,
   apiFetch,
   queueableWrite,
+  onlineOnlyWrite,
   getTokens,
 };

@@ -29,7 +29,7 @@ from apps.operations.models import Fertilizer, Harvest, PlanStatus
 from apps.sync.models import SyncCheckIn
 
 from .models import NotificationCategory
-from .services import notify
+from .services import notify, notify_with_snooze
 
 
 def _managers_for_farm(farm):
@@ -88,7 +88,11 @@ def check_tree_health_anomalies():
     window_start = today - timedelta(days=window_days)
     prior_start = window_start - timedelta(days=window_days)
 
-    unhealthy_labels = [TreeHealthClassification.HEALTH_SMALL, TreeHealthClassification.HEALTH_YELLOW]
+    # HEALTH_SMALL no longer exists (SMALL predictions now map to
+    # HEALTH_UNKNOWN — see classification.py's own docstring): "unknown" is
+    # an absence of a real signal, not itself an unhealthy finding, so only
+    # yellow counts toward this anomaly trigger now.
+    unhealthy_labels = [TreeHealthClassification.HEALTH_YELLOW]
 
     for block in FarmBlock.objects.filter(boundary__isnull=False).select_related("farm"):
         base_qs = TreeHealthClassification.objects.filter(
@@ -130,16 +134,19 @@ def check_tree_health_anomalies():
 def check_stalled_sync():
     """See apps/sync/models.py's SyncCheckIn docstring for why this signal
     exists at all — without the PWA's check-in call, this check would have
-    nothing to query. Fires every run this check finds a still-stalled
-    device on (no per-device snooze/dedup yet — see BUILD_STATUS.md).
+    nothing to query. Snoozed per-device (notify_with_snooze) rather than
+    firing on every run this check finds a still-stalled device on — a
+    phone that's been offline for two weeks doesn't need fourteen identical
+    notifications, one per day, to make the point.
     """
     stalled_days = getattr(settings, "STALLED_SYNC_DAYS", 3)
     cutoff = timezone.now() - timedelta(days=stalled_days)
     stalled = SyncCheckIn.objects.filter(pending_count__gt=0, last_checkin_at__lt=cutoff).select_related("user")
     for checkin in stalled:
-        notify(
+        notify_with_snooze(
             checkin.user,
             NotificationCategory.STALLED_SYNC,
+            dedup_key=f"stalled-sync:{checkin.id}",
             title="Unsynced data on your device",
             message=(
                 f"Your device last checked in on {checkin.last_checkin_at:%Y-%m-%d} with "
@@ -153,7 +160,9 @@ def check_review_backlog():
     """Unresolved detections (new_candidate/ambiguous, never confirmed,
     rejected, or linked — i.e. still sitting with no `tree` and an
     unresolved match_status) per block, above
-    settings.REVIEW_BACKLOG_THRESHOLD (default 20).
+    settings.REVIEW_BACKLOG_THRESHOLD (default 20). Snoozed per block
+    (notify_with_snooze) — a still-open backlog doesn't need a fresh
+    notification every single day this check happens to run.
     """
     threshold = getattr(settings, "REVIEW_BACKLOG_THRESHOLD", 20)
     unresolved = [TreeDetection.MATCH_NEW_CANDIDATE, TreeDetection.MATCH_AMBIGUOUS]
@@ -167,9 +176,10 @@ def check_review_backlog():
     for row in backlog_by_block:
         block = FarmBlock.objects.select_related("farm").get(id=row["processing_run__farm_block"])
         for manager in _managers_for_farm(block.farm):
-            notify(
+            notify_with_snooze(
                 manager,
                 NotificationCategory.REVIEW_BACKLOG,
+                dedup_key=f"review-backlog:{block.id}",
                 title=f"Detection review backlog — {block.name}",
                 message=f"{row['count']} detections awaiting review on {block.name}.",
                 link=f"/api/farm-blocks/{block.id}/processing-runs/",
@@ -180,7 +190,9 @@ def check_review_backlog():
 def check_approvals_pending():
     """Harvest/Fertilizer plans sitting in an awaiting-approval status
     (docs/03-data-model.md's PlanStatus machine) longer than
-    settings.APPROVAL_PENDING_DAYS (default 3).
+    settings.APPROVAL_PENDING_DAYS (default 3). Snoozed per plan
+    (notify_with_snooze) — a still-pending approval doesn't need a fresh
+    notification every single day this check happens to run.
     """
     pending_days = getattr(settings, "APPROVAL_PENDING_DAYS", 3)
     cutoff = timezone.now() - timedelta(days=pending_days)
@@ -192,9 +204,10 @@ def check_approvals_pending():
         )
         for plan in pending:
             for manager in _managers_for_farm(plan.farm_block.farm):
-                notify(
+                notify_with_snooze(
                     manager,
                     NotificationCategory.APPROVAL_PENDING,
+                    dedup_key=f"approval-pending:{label.lower()}:{plan.id}",
                     title=f"{label} approval pending — {plan.farm_block.name}",
                     message=f"{label} plan for {plan.farm_block.name} has been awaiting approval since {plan.updated_at:%Y-%m-%d}.",
                     link=f"/api/{label.lower()}s/{plan.id}/",

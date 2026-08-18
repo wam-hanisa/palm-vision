@@ -75,15 +75,38 @@ label {
   color: var(--text);
 }
 
-input {
+input, select {
   font-size: 1.2rem;
   padding: 0.8rem;
   border: 2px solid var(--text-muted);
   border-radius: 0.5rem;
   background: white;
+  font-family: inherit;
+  color: var(--text);
 }
 
-input:focus { border-color: var(--primary); outline: none; }
+input:focus, select:focus { border-color: var(--primary); outline: none; }
+
+/* treeDetailScreen()'s edit form — the "update_location" checkbox reads as
+   a sentence ("Update pin to my current GPS position…"), so it needs the
+   checkbox and its label text side by side, not the stacked
+   label-above-field layout the rest of this file's `label` rule gives
+   text/select inputs. */
+.checkbox-label {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.6rem;
+  font-weight: 500;
+}
+
+.checkbox-label input[type="checkbox"] {
+  width: 1.4rem;
+  height: 1.4rem;
+  flex-shrink: 0;
+  accent-color: var(--primary);
+}
+
+.checkbox-label input[type="checkbox"]:disabled { opacity: 0.5; }
 
 .action-row { display: flex; flex-wrap: wrap; gap: 0.6rem; margin: 1rem 0; }
 .action-row button { flex: 1 1 auto; }
@@ -129,6 +152,31 @@ input:focus { border-color: var(--primary); outline: none; }
 
 .proximity-prompt button { background: var(--accent); color: var(--text); min-height: 44px; }
 
+/* Stage-1 "needs harvest/fertilizer" flags a Manager set from the office
+   dashboard — see Tree.harvest_marked_at's help_text (apps/trees/models.py)
+   and app.js's blockScreen()/markBanner(). Reuses .pill--accent so these
+   read as the same "needs attention" visual language as the "You are here"
+   pill already used elsewhere, rather than inventing a new color. */
+.attention-banner { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1rem; }
+.attention-banner .pill { margin-top: 0; }
+
+.tree-item__meta .pill { margin-top: 0; margin-left: 0.4rem; font-size: 0.75rem; }
+
+.mark-banner {
+  background: var(--accent);
+  color: var(--text);
+  border-radius: 0.6rem;
+  padding: 1rem;
+  margin-bottom: 1rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+}
+
+.mark-banner .pill { margin-top: 0; background: transparent; padding: 0; font-weight: 600; }
+.mark-banner button { min-height: 44px; flex-shrink: 0; }
+
 /* Always-visible offline/sync status chip — docs/09-design-system.md is
    explicit this must never be buried in a menu. */
 .sync-chip {
@@ -146,5 +194,84 @@ input:focus { border-color: var(--primary); outline: none; }
 .sync-chip--syncing { background: var(--primary); }
 .sync-chip--offline { background: var(--danger); }
 
+/* Only rendered when the outbox actually has queued items — see
+   app.js's renderUnsyncedBanner(). More prominent and more explicit than
+   the chip above ("3 items waiting to sync"), plus a manual "Sync now"
+   affordance, since a subtle status chip is easy to stop noticing. */
+.unsynced-banner {
+  position: sticky;
+  top: 1.9rem; /* sits directly under the sync-chip, not overlapping it */
+  z-index: 9;
+  background: var(--warning-bg);
+  color: var(--warning-fg);
+  padding: 0.6rem 0.9rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.unsynced-banner button {
+  background: var(--primary);
+  color: white;
+  min-height: 36px;
+  padding: 0.3rem 0.8rem;
+  font-size: 0.85rem;
+  flex-shrink: 0;
+}
+
+.unsynced-banner button:disabled {
+  background: var(--text-muted);
+}
+
 .screen--login { padding-top: 3rem; text-align: center; }
 .screen--login form { text-align: left; }
+
+.screen-header__actions { display: flex; gap: 0.4rem; }
+
+/* Farm-level offline map (screen--map) — app.js's mapScreen(). A small,
+   custom-drawn SVG of block boundaries plus a live GPS dot; no basemap
+   tile imagery (see mapScreen()'s own comment for why). */
+.map-svg {
+  width: 100%;
+  max-height: 60vh;
+  background: var(--card);
+  border-radius: 0.6rem;
+  margin: 0.75rem 0;
+}
+
+.map-block-shape {
+  fill: rgba(107, 143, 113, 0.35); /* var(--success) at low opacity */
+  stroke: var(--primary);
+  stroke-width: 3;
+  cursor: pointer;
+}
+
+.map-block-shape--here {
+  fill: rgba(217, 164, 65, 0.35); /* var(--accent) at low opacity */
+  stroke: var(--accent);
+}
+
+.map-block-label {
+  fill: var(--text);
+  font-size: 14px;
+  font-weight: 700;
+  pointer-events: none;
+}
+
+.map-user-dot {
+  fill: #2E7BD6;
+  stroke: white;
+  stroke-width: 2;
+}
+
+.map-accuracy-ring {
+  fill: rgba(46, 123, 214, 0.15);
+  stroke: rgba(46, 123, 214, 0.4);
+  stroke-width: 1;
+}
+
+.map-legend-note { font-size: 0.85rem; }

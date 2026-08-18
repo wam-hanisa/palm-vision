@@ -1,0 +1,90 @@
+{% extends "dashboard/base.html" %}
+{% block title %}{% if is_create %}Add tree{% else %}Edit tree{% endif %}{% endblock %}
+{% block page_title %}{% if is_create %}Add tree — {{ farm_block.name }}{% else %}Edit tree — {{ farm_block.name }}{% endif %}{% endblock %}
+{% block content %}
+{% comment %}
+Direct-URL fallback — the Farm Map page itself now opens this same form
+inline in its side panel and drives placement on its own shared map
+(TreeCreateView/TreeUpdateView's AJAX branch; see farm_map.html's
+enableTreePlacement()) instead of navigating here. This standalone page
+still needs its own small map since there's no shared one to borrow —
+Tree.location is a required PostGIS point, placed by clicking the map
+below rather than typed as text (docs/01-architecture.md's coordinate
+rule) — the click handler drops a single draggable marker and writes its
+lat/lng into the #tree-lat/#tree-lng hidden inputs
+_partials/tree_form.html defines. Editing an existing tree pre-places the
+marker at its current location and only overwrites it if the map is
+clicked again.
+{% endcomment %}
+<section class="panel panel-wide">
+  <div id="tree-map"></div>
+  {% include "dashboard/_partials/tree_form.html" %}
+</section>
+
+{{ tree_map_data|json_script:"tree-map-data" }}
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+(function () {
+  var data = JSON.parse(document.getElementById("tree-map-data").textContent);
+  var el = document.getElementById("tree-map");
+  var latInput = document.getElementById("tree-lat");
+  var lngInput = document.getElementById("tree-lng");
+  if (!el || typeof L === "undefined") return;
+
+  var map = L.map(el);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 21,
+    attribution: "&copy; OpenStreetMap contributors",
+  }).addTo(map);
+
+  var boundsSources = [];
+
+  if (data.boundary) {
+    var boundary = L.geoJSON(data.boundary, { style: { color: "#2F4A38", weight: 2, fillOpacity: 0.05 } }).addTo(map);
+    boundsSources.push(boundary);
+  }
+
+  data.other_trees.forEach(function (t) {
+    var coords = t.geometry.coordinates; // [lon, lat]
+    var marker = L.circleMarker([coords[1], coords[0]], {
+      radius: 5, color: "#8A8578", fillColor: "#8A8578", fillOpacity: 0.6, weight: 1,
+    });
+    marker.bindPopup(t.name);
+    marker.addTo(map);
+    boundsSources.push(marker);
+  });
+
+  var placedMarker = null;
+
+  function placeAt(lat, lng) {
+    if (placedMarker) map.removeLayer(placedMarker);
+    placedMarker = L.marker([lat, lng], { draggable: true }).addTo(map);
+    placedMarker.on("dragend", function () {
+      var pos = placedMarker.getLatLng();
+      latInput.value = pos.lat;
+      lngInput.value = pos.lng;
+    });
+    latInput.value = lat;
+    lngInput.value = lng;
+  }
+
+  if (data.existing_point) {
+    var coords = data.existing_point.coordinates; // [lon, lat]
+    placeAt(coords[1], coords[0]);
+    boundsSources.push(placedMarker);
+  }
+
+  map.on("click", function (event) {
+    placeAt(event.latlng.lat, event.latlng.lng);
+    if (boundsSources.indexOf(placedMarker) === -1) boundsSources.push(placedMarker);
+  });
+
+  if (boundsSources.length) {
+    map.fitBounds(L.featureGroup(boundsSources).getBounds().pad(0.2));
+  } else {
+    map.setView([0, 0], 2);
+  }
+})();
+</script>
+{% endblock %}

@@ -1,0 +1,114 @@
+{% load static %}<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}Overview{% endblock %} · Palm Vision</title>
+  <link rel="stylesheet" href="{% static 'dashboard/style.css' %}">
+  <!-- Same palm-crown mark the field PWA already uses (pwa/icons/,
+       pwa/manifest.webmanifest) — served at /pwa/... by the static-serve
+       rule in palmvision/urls.py, not a Django staticfiles asset, so this
+       is a plain href rather than a Django static-tag reference. The
+       dashboard had no favicon at all before this. -->
+  <link rel="icon" type="image/png" sizes="192x192" href="/pwa/icons/icon-192.png">
+  <link rel="icon" type="image/png" sizes="512x512" href="/pwa/icons/icon-512.png">
+  <link rel="apple-touch-icon" href="/pwa/icons/icon-192.png">
+</head>
+<body class="{% block body_class %}{% endblock %}">
+{% if user.is_authenticated %}
+  {% comment %}
+  Original line-icon set for the sidebar nav — docs/09-design-system.md
+  mentions "line icons" as part of the office-dashboard layout; this
+  project previously left nav entries text-only rather than reach for a
+  placeholder icon font (see style.css's own flagged deviation note).
+  Drawn here from scratch as plain stroke-based SVG primitives (circles,
+  rects, paths built from simple arcs/lines — not traced or copied from
+  any existing icon set), defined once as <symbol>s and referenced via
+  <use> so the markup below stays lightweight. currentColor means each
+  icon automatically follows .nav-link's own text color, including the
+  active/hover states already defined in style.css — no separate
+  "active icon" variant needed.
+
+  Regression note: this was previously a single hash-style comment tag
+  spanning multiple lines — Django's inline hash-style comment syntax is
+  single-line only (its tokenizer regex doesn't match across a newline);
+  a multi-line one silently fails to be recognized as a comment at all
+  and renders as literal visible text instead. Confirmed live: this
+  exact text was showing up on the page. This block-style comment tag is
+  the correct one for a multi-line comment, and was verified to no
+  longer appear in the rendered output.
+  {% endcomment %}
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+      <symbol id="icon-overview" viewBox="0 0 24 24">
+        <rect x="3" y="3" width="8" height="8" rx="1.5"/>
+        <rect x="13" y="3" width="8" height="5" rx="1.5"/>
+        <rect x="13" y="10" width="8" height="11" rx="1.5"/>
+        <rect x="3" y="13" width="8" height="8" rx="1.5"/>
+      </symbol>
+      <symbol id="icon-farms" viewBox="0 0 24 24">
+        <rect x="3" y="4" width="18" height="16" rx="1.5"/>
+        <path d="M3 10.5h18M3 15.5h18M9 4v16M15 4v16"/>
+      </symbol>
+      <symbol id="icon-map" viewBox="0 0 24 24">
+        <path d="M12 21s-7-6.1-7-11.5a7 7 0 0 1 14 0C19 14.9 12 21 12 21z"/>
+        <circle cx="12" cy="9.5" r="2.5"/>
+      </symbol>
+      <symbol id="icon-imagery" viewBox="0 0 24 24">
+        <path d="M4 8.5 12 4l8 4.5v7L12 20l-8-4.5z"/>
+        <path d="M4 8.5 12 13l8-4.5M12 13v7"/>
+      </symbol>
+      <symbol id="icon-compliance" viewBox="0 0 24 24">
+        <path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/>
+        <path d="M9 12l2 2 4-4.5"/>
+      </symbol>
+      <symbol id="icon-reports" viewBox="0 0 24 24">
+        <path d="M4 20V4M4 20h16"/>
+        <rect x="7" y="12" width="3" height="8" rx="0.5"/>
+        <rect x="12" y="8" width="3" height="12" rx="0.5"/>
+        <rect x="17" y="5" width="3" height="15" rx="0.5"/>
+      </symbol>
+      <symbol id="icon-notifications" viewBox="0 0 24 24">
+        <path d="M6 10a6 6 0 1 1 12 0c0 4 1.5 5.5 1.5 5.5h-15S6 14 6 10z"/>
+        <path d="M10 18.5a2 2 0 0 0 4 0"/>
+      </symbol>
+    </defs>
+  </svg>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">Palm Vision</div>
+      <nav>
+        <a href="{% url 'dashboard:home' %}" class="nav-link{% if request.resolver_match.url_name == 'home' %} active{% endif %}"><svg class="nav-icon"><use href="#icon-overview"></use></svg>Overview</a>
+        <a href="{% url 'dashboard:farms' %}" class="nav-link{% if request.resolver_match.url_name in "farms,map,block-add,block-edit,block-boundary,block-delete,tree-add,tree-edit,harvest-plan-add" %} active{% endif %}"><svg class="nav-icon"><use href="#icon-map"></use></svg>Farm Map</a>
+        <a href="{% url 'dashboard:imagery' %}" class="nav-link{% if request.resolver_match.url_name == 'imagery' or request.resolver_match.url_name == 'imagery-block' or request.resolver_match.url_name == 'imagery-run' %} active{% endif %}"><svg class="nav-icon"><use href="#icon-imagery"></use></svg>Imagery</a>
+        <!-- Compliance nav link removed — asked directly to keep this site
+             focused as an AI/ML + remote sensing portfolio rather than a
+             certification/traceability tool. The underlying app (models,
+             views, URLs, data) is untouched and still directly reachable
+             by URL — this is a navigation-only hide, not a deletion. -->
+        <a href="{% url 'dashboard:reports' %}" class="nav-link{% if request.resolver_match.url_name == 'reports' or request.resolver_match.url_name == 'report-runs' %} active{% endif %}"><svg class="nav-icon"><use href="#icon-reports"></use></svg>Reports</a>
+        <a href="{% url 'dashboard:notifications' %}" class="nav-link{% if request.resolver_match.url_name == 'notifications' %} active{% endif %}"><svg class="nav-icon"><use href="#icon-notifications"></use></svg>Notifications</a>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="user-chip">{{ user.get_full_name|default:user.username }}</div>
+        <form method="post" action="{% url 'dashboard:logout' %}">
+          {% csrf_token %}
+          <button type="submit" class="link-button">Log out</button>
+        </form>
+      </div>
+    </aside>
+    <main class="content">
+      {% if messages %}
+        {% for message in messages %}
+          <div class="flash flash-{{ message.tags|default:'info' }}">{{ message }}</div>
+        {% endfor %}
+      {% endif %}
+      <h1 class="page-title">{% block page_title %}{% endblock %}</h1>
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+{% else %}
+  {% block guest_content %}{% endblock %}
+{% endif %}
+</body>
+</html>

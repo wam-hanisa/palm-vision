@@ -1,0 +1,29 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Report runs{% endblock %}
+{% block page_title %}Runs — {{ definition.name }}{% endblock %}
+{% block content %}
+<p class="panel-note"><a href="{% url 'dashboard:reports' %}">&larr; Report definitions</a></p>
+
+{% if not runs %}
+  <p class="empty-state">No runs yet. Use "Run now" on the report definitions page to start one.</p>
+{% else %}
+  <table class="data-table">
+    <thead><tr><th>Started</th><th>Status</th><th>Triggered by</th><th>File</th></tr></thead>
+    <tbody>
+      {% for run in runs %}
+      <tr>
+        <td>{{ run.created_at }}</td>
+        <td>
+          {% if run.status == "ready" %}<span class="tag tag-success">Ready</span>
+          {% elif run.status == "failed" %}<span class="tag tag-danger">Failed — {{ run.error_message }}</span>
+          {% elif run.status == "running" %}<span class="tag tag-warning">Running</span>
+          {% else %}<span class="tag tag-warning">Pending</span>{% endif %}
+        </td>
+        <td>{{ run.triggered_by|default:"Scheduled" }}</td>
+        <td>{% if run.file %}<a href="{{ run.file.url }}">Download</a>{% else %}—{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+{% endblock %}

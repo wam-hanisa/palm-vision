@@ -1,0 +1,73 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Compliance documents{% endblock %}
+{% block page_title %}Compliance documents{% endblock %}
+{% block content %}
+<nav class="subnav">
+  <a href="{% url 'dashboard:compliance-documents' %}" class="active">Documents</a>
+  <a href="{% url 'dashboard:compliance-batches' %}">Batches &amp; export</a>
+  <a href="{% url 'dashboard:compliance-baselines' %}">Deforestation baselines</a>
+  <a href="{% url 'dashboard:compliance-audits' %}">Audits</a>
+  <a href="{% url 'dashboard:compliance-grievances' %}">Grievances</a>
+</nav>
+
+<section class="panel">
+  <h2 class="section-heading">Upload a document</h2>
+  <form method="post" enctype="multipart/form-data" class="stacked-form">
+    {% csrf_token %}
+    {% if form.non_field_errors %}<div class="flash flash-error">{{ form.non_field_errors.0 }}</div>{% endif %}
+
+    <label for="{{ form.farm.id_for_label }}">Farm (leave blank if attaching to a block)</label>
+    {{ form.farm }}
+    {% if form.farm.errors %}<div class="field-error">{{ form.farm.errors.0 }}</div>{% endif %}
+
+    <label for="{{ form.farm_block.id_for_label }}">Block (leave blank if attaching to a farm)</label>
+    {{ form.farm_block }}
+    {% if form.farm_block.errors %}<div class="field-error">{{ form.farm_block.errors.0 }}</div>{% endif %}
+
+    <label for="{{ form.document_type.id_for_label }}">Document type</label>
+    {{ form.document_type }}
+    {% if form.document_type.errors %}<div class="field-error">{{ form.document_type.errors.0 }}</div>{% endif %}
+
+    <label for="{{ form.document_file.id_for_label }}">File</label>
+    {{ form.document_file }}
+    {% if form.document_file.errors %}<div class="field-error">{{ form.document_file.errors.0 }}</div>{% endif %}
+
+    <label for="{{ form.issued_date.id_for_label }}">Issued date (optional)</label>
+    {{ form.issued_date }}
+
+    <label for="{{ form.expiry_date.id_for_label }}">Expiry date (blank if none, e.g. land titles)</label>
+    {{ form.expiry_date }}
+
+    <label for="{{ form.issuing_authority.id_for_label }}">Issuing authority (optional)</label>
+    {{ form.issuing_authority }}
+
+    <button type="submit" class="primary-button primary-button-inline">Upload</button>
+  </form>
+</section>
+
+<section>
+  <h2 class="section-heading">Documents on file</h2>
+  {% if not documents %}
+    <p class="empty-state">No compliance documents uploaded yet.</p>
+  {% else %}
+    <table class="data-table">
+      <thead><tr><th>Type</th><th>Attached to</th><th>Status</th><th>Expiry</th><th>Issuing authority</th></tr></thead>
+      <tbody>
+        {% for doc in documents %}
+        <tr>
+          <td>{{ doc.get_document_type_display }}</td>
+          <td>{{ doc.farm|default:doc.farm_block }}</td>
+          <td>
+            {% if doc.status == "valid" %}<span class="tag tag-success">Valid</span>
+            {% elif doc.status == "expiring_soon" %}<span class="tag tag-warning">Expiring soon</span>
+            {% else %}<span class="tag tag-danger">Expired</span>{% endif %}
+          </td>
+          <td>{{ doc.expiry_date|default:"—" }}</td>
+          <td>{{ doc.issuing_authority|default:"—" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</section>
+{% endblock %}

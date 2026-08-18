@@ -1,0 +1,48 @@
+{% comment %}
+Tree create/edit form fields — see _partials/block_form.html's comment
+for why this is a shared fragment. Unlike the old standalone tree_form.html,
+this fragment has no map of its own and no click-to-place script — when
+loaded into the Farm Map's side panel, farm_map.html's
+enableTreePlacement() drives the *shared* map instead, and just writes
+into the #tree-lat/#tree-lng hidden inputs below by id. The standalone
+tree_form.html page (kept as a direct-URL fallback) still supplies its
+own small map via tree_map_data and writes into these same two inputs
+the same way — same fields, two different sources of clicks.
+{% endcomment %}
+<form method="post" class="stacked-form" data-panel-form
+      action="{% if is_create %}{% url 'dashboard:tree-add' block_id=farm_block.id %}{% else %}{% url 'dashboard:tree-edit' tree_id=tree.id %}{% endif %}">
+  {% csrf_token %}
+  {% if form.non_field_errors %}<div class="flash flash-error">{{ form.non_field_errors.0 }}</div>{% endif %}
+
+  {{ form.farm_block }}
+
+  <label for="{{ form.name.id_for_label }}">Name (optional)</label>
+  {{ form.name }}
+
+  <label for="{{ form.source.id_for_label }}">Source</label>
+  {{ form.source }}
+
+  <label for="{{ form.status.id_for_label }}">Status</label>
+  {{ form.status }}
+
+  <label for="{{ form.current_health.id_for_label }}">Health</label>
+  {{ form.current_health }}
+
+  {% if not is_create %}
+  <label for="{{ form.last_harvested_at.id_for_label }}">Last harvested (optional — normally set via the block's "Mark trees harvested" action, not here)</label>
+  {{ form.last_harvested_at }}
+
+  <label for="{{ form.last_fertilized_at.id_for_label }}">Last fertilized (optional — normally set via the block's "Mark trees fertilized" action, not here)</label>
+  {{ form.last_fertilized_at }}
+  {% endif %}
+
+  <input type="hidden" name="lat" id="tree-lat">
+  <input type="hidden" name="lng" id="tree-lng">
+
+  <p class="panel-note">{% if is_create %}Click the map to place this tree.{% else %}Click the map to move this tree (optional — leave it if the location is already correct).{% endif %}</p>
+
+  <div class="panel-actions">
+    <button type="submit" class="primary-button primary-button-inline">{% if is_create %}Add tree{% else %}Save changes{% endif %}</button>
+    <a href="{% url 'dashboard:farms' %}?block={{ farm_block.id }}{% if tree %}&amp;tree={{ tree.id }}{% endif %}" class="secondary-button" data-panel-cancel>Cancel</a>
+  </div>
+</form>

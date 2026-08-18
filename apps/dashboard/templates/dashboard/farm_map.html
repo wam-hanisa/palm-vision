@@ -1,0 +1,1996 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Farm Map{% endblock %}
+{% block page_title %}Farm Map{% endblock %}
+{% block body_class %}farm-map-fullpage{% endblock %}
+{% block content %}
+
+{% if upload_confirm_image and not farm_map_data.upload_confirm %}
+{% comment %}
+Georeferencing is still running (or failed) for the image this page was
+reached with (?upload_image=<id> — see FarmMapView.get_context_data()).
+Mirrors ImageConfirmBlocksView's own two "not ready yet" states — the map
+itself only appears once there's a real footprint to show, so it's left
+out entirely here rather than rendered empty. Wrapped in .farm-map-waiting
+since .farm-map-fullpage zeroes out .content's normal padding for the map
+layout below — this branch has no map, so it needs its own padding back.
+{% endcomment %}
+<div class="farm-map-waiting">
+  {% if upload_confirm_image.georeference_status == "pending" %}
+    <section class="panel">
+      <p>Georeferencing this image — this page will refresh automatically in
+      a few seconds.</p>
+      <p class="panel-note">Once it finishes, its footprint will show on the
+      map below against this farm's blocks, so you can pick which one(s) to
+      process it against.</p>
+    </section>
+    <script>
+      setTimeout(function () { window.location.reload(); }, 4000);
+    </script>
+  {% elif upload_confirm_image.georeference_status == "failed" %}
+    <section class="panel">
+      <div class="flash flash-error">Georeferencing failed: {{ upload_confirm_image.georeference_error }}</div>
+      <p class="panel-note">This image can't be processed against any block
+      until it has a real footprint. <a href="{% url 'dashboard:imagery' %}">Back to Imagery</a>.</p>
+    </section>
+  {% endif %}
+</div>
+
+{% else %}
+{% comment %}
+The one map-first hub — see FarmMapView's own docstring
+(apps/dashboard/views.py) for the full reasoning. Leaflet + Leaflet.
+markercluster + Leaflet.draw + OpenStreetMap tiles from a CDN, same
+accepted exception this app already makes on every other map page (see
+style.css's own flagged font/icon deviations and the old map.html's
+matching note).
+
+Everything below the map/legend is built entirely by JS from one
+embedded JSON payload (farm_map_data) — no separate page load for
+browsing farms → blocks → trees, no separate page load for any write
+action either (create/edit/delete a block, draw a boundary, add/edit/
+remove a tree, create a harvest or fertilizer plan — see each view's
+own AJAX branch in apps/dashboard/views.py), AND, as of this pass, no
+separate page load for the imagery upload flow's own first step either.
+Direct, explicit feedback across two rounds shaped this:
+"all activities must be in that same page by changing the panel, not
+redirected into different page... adding tree, selecting tree, or
+editing block are using the same leaflet map in same page" (which
+converted every block/tree/harvest write to in-page AJAX), and then
+"I dont see any two step for uploading imagery. also where is the
+harvest, fertilizer process in map page?" — which is what brought the
+imagery upload trigger itself in-page (previously still a link to
+imagery_list.html's own page) and added Fertilizer planning as a
+sibling to Harvest planning below. Every write now happens right here:
+forms are fetched as HTML fragments and injected into this page's own
+side panel, boundary drawing uses Leaflet.draw directly on this page's
+own map instance, imagery upload uses the same chunked-upload JSON
+endpoints imagery_list.html's own page already exposed (just called
+from here instead), and a successful save refreshes this page's own
+farm_map_data in place (refreshData() below) rather than navigating
+anywhere.
+
+Three modes share this same page and the same #farm-map element, all
+driven by client-side state rather than separate server-rendered pages:
+
+- Normal browsing + management: the farm/block/tree drill-down side
+  panel, plus every write action described above. Restores selection
+  from ?farm=/?block=/?tree= on a fresh page load or bookmark.
+- Imagery upload: the toolbar's "Upload imagery" button opens a farm +
+  block(s) + file picker in the side panel — block selection now happens
+  right here, upfront, not as a separate step after georeferencing (direct
+  feedback: "when upload image choose farm and block so there are no two
+  step anymore"). Uploads via the existing chunked-upload endpoints
+  (apps/dashboard/views.py's CreateUploadSessionView etc.), then polls
+  FarmMapView's own AJAX GET (?upload_image=<id>) until georeferencing
+  finishes, then immediately starts processing against the block(s)
+  already chosen (startProcessingForPreselectedBlocks()) — no intermediate
+  confirm screen for the normal path.
+- Imagery upload-confirm: a fallback, not the normal path any more — only
+  reached when there's no pre-chosen block to act on (landing here via a
+  bare ?upload_image=<id>, e.g. a bookmark or a slow upload finishing
+  after a page reload, or the full-page upload fallback which still only
+  asks for a farm) or when auto-starting processing for pre-chosen blocks
+  fails. Shows the image's footprint plus a block checklist inline on this
+  same map instead of the drill-down panel — the exact step
+  ImageConfirmBlocksView already provides on its own standalone page
+  (still kept working as a direct-URL fallback), just merged onto the
+  shared map per the "GIS-first" redesign instead of a second Leaflet
+  instance on a second page. showUploadConfirm() below is reusable from
+  both entry points (initial page load and the in-page upload's own
+  poll) so there's exactly one implementation of this step.
+{% endcomment %}
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/MarkerCluster.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/MarkerCluster.Default.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css">
+
+{% comment %}
+Full-page, Google-Maps-style layout: #farm-map fills the entire content
+area behind everything else; the toolbar + drill-down panel float together
+as one card (farm-map-float, top-left) and the legend floats separately
+(bottom-right) — see style.css's ".farm-map-fullpage"/".farm-map-float"
+rules. No element here changes id/class in a way the JS below depends on
+(getElementById("farm-map-panel") etc. all still resolve identically) —
+this is a pure positioning change, not a DOM-structure change to anything
+scripted.
+{% endcomment %}
+<div id="farm-map-flash"></div>
+
+<div class="farm-map-shell">
+  <div id="farm-map"></div>
+
+  <div class="farm-map-float">
+    <div class="map-toolbar">
+      <label for="map-farm-filter">Farm</label>
+      <select id="map-farm-filter">
+        <option value="">All farms</option>
+        {% for farm in farm_map_data.farms %}<option value="{{ farm.id }}">{{ farm.name }}</option>{% endfor %}
+      </select>
+      <label for="map-block-filter">Block</label>
+      <select id="map-block-filter"><option value="">All blocks</option></select>
+      <button type="button" id="upload-imagery-btn" class="secondary-button">Upload imagery</button>
+    </div>
+    <aside class="farm-map-panel" id="farm-map-panel"></aside>
+  </div>
+
+  <div class="map-legend">
+    <div class="map-legend-group"><span class="legend-swatch legend-swatch-line" style="background:#2F4A38;"></span> Block boundary</div>
+    <div class="map-legend-group"><span class="legend-swatch legend-swatch-line" style="background:#D9A441;"></span> Image footprint</div>
+    <div class="map-legend-group"><span class="legend-swatch" style="background:#6B8F71;"></span> Healthy tree</div>
+    <div class="map-legend-group"><span class="legend-swatch" style="background:#B85C4A;"></span> Yellowing</div>
+    <div class="map-legend-group"><span class="legend-swatch" style="background:#8A8578;"></span> Unknown health</div>
+    <div class="map-legend-group"><span class="legend-swatch legend-swatch-ring" style="border-color:#3B6FA0;"></span> Needs action (marked by a Manager)</div>
+    <div class="map-legend-group"><span class="legend-swatch legend-swatch-ring" style="border-color:#C0392B;"></span> Harvest/fertilizer overdue</div>
+    <div class="map-legend-group"><span class="legend-swatch legend-swatch-ring" style="border-color:#D9A441;"></span> Due soon</div>
+    <div class="map-legend-group"><span class="legend-swatch legend-swatch-ring legend-swatch-ring-dashed" style="border-color:#8A8578;"></span> Never recorded</div>
+    <div class="map-legend-group"><span class="legend-swatch legend-swatch-ring" style="border-color:#1F7A8C;"></span> OK (within interval)</div>
+  </div>
+</div>
+
+{{ farm_map_data|json_script:"farm-map-data" }}
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/leaflet.markercluster.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+<script>
+(function () {
+  var mapEl = document.getElementById("farm-map");
+  if (!mapEl || typeof L === "undefined") return; // Leaflet failed to load off the CDN
+
+  var data = JSON.parse(document.getElementById("farm-map-data").textContent);
+  var panelEl = document.getElementById("farm-map-panel");
+  var toolbarEl = document.querySelector(".map-toolbar");
+  var flashHost = document.getElementById("farm-map-flash");
+  var farmSelect = document.getElementById("map-farm-filter");
+  var blockSelect = document.getElementById("map-block-filter");
+  var uploadImageryBtn = document.getElementById("upload-imagery-btn");
+  // Any valid CSRF token from this session works for any POST on this
+  // page — pulled from base.html's always-present logout form. Every
+  // AJAX-loaded form fragment below also carries its own {% csrf_token %}
+  // (see _partials/*.html), so this is only needed for the requests this
+  // page builds its own FormData/headers for by hand: boundary saves, the
+  // imagery upload-confirm form, and the chunked upload endpoints.
+  var CSRF_TOKEN = document.querySelector('input[name="csrfmiddlewaretoken"]').value;
+
+  function buildUrl(template, id) {
+    return template.replace(data.url_placeholder, id);
+  }
+
+  // Image footprints are always axis-aligned rectangles (georeference_image()
+  // builds them directly from raster bounds — see apps/imagery/services.py),
+  // so this bounding-box conversion is exact, not an approximation, for the
+  // shape it's actually used on.
+  function ringBounds(geometry) {
+    var ring = geometry.coordinates[0];
+    var lons = ring.map(function (c) { return c[0]; });
+    var lats = ring.map(function (c) { return c[1]; });
+    return [
+      [Math.min.apply(null, lats), Math.min.apply(null, lons)],
+      [Math.max.apply(null, lats), Math.max.apply(null, lons)],
+    ];
+  }
+
+  // Tiny DOM-building helper — the side panel is rebuilt from scratch on
+  // every selection change (innerHTML reset + append), so this keeps that
+  // code from turning into a wall of createElement/setAttribute calls.
+  function el(tag, attrs, children) {
+    var node = document.createElement(tag);
+    attrs = attrs || {};
+    Object.keys(attrs).forEach(function (key) {
+      if (key === "class") node.className = attrs[key];
+      else if (key === "text") node.textContent = attrs[key];
+      else node.setAttribute(key, attrs[key]);
+    });
+    (children || []).forEach(function (child) { if (child) node.appendChild(child); });
+    return node;
+  }
+
+  function breadcrumb(items) {
+    var wrap = el("div", { class: "panel-breadcrumb" });
+    items.forEach(function (item, index) {
+      if (index > 0) wrap.appendChild(document.createTextNode(" / "));
+      if (item.onClick) {
+        var btn = el("button", { type: "button", text: item.label });
+        btn.addEventListener("click", item.onClick);
+        wrap.appendChild(btn);
+      } else {
+        wrap.appendChild(document.createTextNode(item.label));
+      }
+    });
+    return wrap;
+  }
+
+  function detailRow(label, value) {
+    return el("div", { class: "detail-row" }, [
+      el("span", { class: "detail-row-label", text: label }),
+      el("span", { class: "detail-row-value", text: value }),
+    ]);
+  }
+
+  function actionButton(label, onClick, cls) {
+    var btn = el("button", { type: "button", class: cls || "secondary-button", text: label });
+    btn.addEventListener("click", onClick);
+    return btn;
+  }
+
+  function showFlash(message, kind) {
+    if (!flashHost || !message) return;
+    flashHost.innerHTML = "";
+    var div = el("div", { class: "flash flash-" + (kind || "info") }, [document.createTextNode(message)]);
+    flashHost.appendChild(div);
+    setTimeout(function () { if (flashHost.contains(div)) flashHost.removeChild(div); }, 5000);
+  }
+
+  function getJson(url) {
+    return fetch(url, { headers: { "X-Requested-With": "XMLHttpRequest" } })
+      .then(function (r) { return r.json(); })
+      .catch(function (err) {
+        showFlash("Couldn't load that — try again.", "error");
+        throw err;
+      });
+  }
+
+  function postJson(url, formData) {
+    return fetch(url, { method: "POST", headers: { "X-Requested-With": "XMLHttpRequest" }, body: formData })
+      .then(function (r) { return r.json(); })
+      .catch(function (err) {
+        showFlash("Couldn't save that — try again.", "error");
+        throw err;
+      });
+  }
+
+  // zoomControl: false — the default +/- control sits top-left, exactly
+  // where the floating panel (.farm-map-float, see style.css) now lives
+  // in the full-page layout, hiding behind/under it. Re-added explicitly
+  // below, at top-right, stacked under the street/satellite toggle
+  // instead (Leaflet stacks same-corner controls in the order they're
+  // added — adding this one after the layers control puts it below,
+  // not on top of, that button).
+  var map = L.map(mapEl, { zoomControl: false });
+
+  // Street/satellite basemap toggle — Esri World Imagery since it's usable
+  // free and without an API key (unlike Google/Mapbox satellite tiles),
+  // same reasoning already applied to the OSM street layer below. Standard
+  // Leaflet layer control, no extra plugin needed.
+  var streetBaseLayer = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 20,
+    attribution: "&copy; OpenStreetMap contributors",
+  });
+  var satelliteBaseLayer = L.tileLayer(
+    "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    { maxZoom: 20, attribution: "Tiles &copy; Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community" }
+  );
+  streetBaseLayer.addTo(map);
+  L.control.layers({ "Street map": streetBaseLayer, "Satellite": satelliteBaseLayer }, null, { position: "topright" }).addTo(map);
+  L.control.zoom({ position: "topright" }).addTo(map);
+
+  // --- Imagery upload-confirm mode — see the module docstring above for
+  // why this is a reusable function rather than inline code that only
+  // ever runs once at page load: it's now reached two ways (a fresh page
+  // load with ?upload_image=<id> in the URL, AND the in-page upload
+  // flow's own poll finishing — see pollUploadStatus() below), and it's
+  // the exact same "footprint vs. block checklist, suggested blocks
+  // pre-checked" logic ImageConfirmBlocksView's own standalone page
+  // already uses, just targeting this page's shared map/panel elements
+  // instead of its own. Submits via postJson() rather than a native form
+  // POST — an earlier version used a real <form method="post"> here,
+  // which caused a full page navigation on confirm and was missed until
+  // direct feedback flagged the imagery flow wasn't fully in-page. ---
+
+  var uploadConfirmLayers = []; // this mode's own map layers — never mixed into blockLayers/imageLayers/treeMarkers
+
+  function clearUploadConfirmLayers() {
+    uploadConfirmLayers.forEach(function (layer) { map.removeLayer(layer); });
+    uploadConfirmLayers = [];
+  }
+
+  function exitUploadConfirmMode() {
+    clearUploadConfirmLayers();
+    if (toolbarEl) toolbarEl.hidden = false;
+    if (window.history && window.history.replaceState) {
+      var url = new URL(window.location.href);
+      url.searchParams.delete("upload_image");
+      window.history.replaceState({}, "", url);
+    }
+    renderMap();
+    renderPanel();
+  }
+
+  function showUploadConfirm(confirm) {
+    exitInteractiveModes();
+    clearCurrentMapLayers();
+    clearUploadConfirmLayers();
+    if (toolbarEl) toolbarEl.hidden = true; // farm/block filters don't apply to this mode
+
+    var boundsSources = [];
+
+    if (confirm.image.geometry) {
+      var footprintLayer = L.geoJSON(confirm.image.geometry, {
+        style: { color: "#D9A441", weight: 2, dashArray: "6 4", fillOpacity: confirm.image.preview_url ? 0 : 0.05 },
+      }).addTo(map);
+      uploadConfirmLayers.push(footprintLayer);
+      boundsSources.push(footprintLayer);
+      if (confirm.image.preview_url) {
+        var overlay = L.imageOverlay(confirm.image.preview_url, ringBounds(confirm.image.geometry), { opacity: 0.85 }).addTo(map);
+        uploadConfirmLayers.push(overlay);
+      }
+    }
+
+    panelEl.innerHTML = "";
+    panelEl.appendChild(el("h2", { class: "panel-heading", text: "Confirm blocks for this image" }));
+    panelEl.appendChild(el("p", { class: "panel-subheading", text: "Suggested blocks (footprint overlaps them) are pre-checked. Flight overshoot can mean a real, useful overlap even where the boundaries don't strictly touch — check any additional block you still want processed." }));
+
+    if (!confirm.blocks.length) {
+      panelEl.appendChild(el("p", { class: "panel-empty", text: "No blocks on this farm have a boundary drawn yet — draw one before this image can be processed." }));
+    } else {
+      var form = el("form", { class: "stacked-form" });
+      var list = el("ul", { class: "tree-checklist" });
+      var blockLayersConfirm = {};
+
+      function setBlockChecked(blockId, checked) {
+        var checkbox = list.querySelector('input[value="' + blockId + '"]');
+        if (checkbox) checkbox.checked = checked;
+        var layer = blockLayersConfirm[blockId];
+        if (layer) layer.setStyle({ fillOpacity: checked ? 0.35 : 0.05, weight: checked ? 3 : 2 });
+      }
+
+      confirm.blocks.forEach(function (block) {
+        var layer = L.geoJSON(block.geometry, {
+          style: { color: "#2F4A38", weight: block.suggested ? 3 : 2, fillOpacity: block.suggested ? 0.35 : 0.05 },
+        }).addTo(map);
+        layer.bindPopup(block.name);
+        layer.on("click", function () {
+          var checkbox = list.querySelector('input[value="' + block.id + '"]');
+          setBlockChecked(block.id, checkbox ? !checkbox.checked : true);
+        });
+        blockLayersConfirm[block.id] = layer;
+        uploadConfirmLayers.push(layer);
+        boundsSources.push(layer);
+
+        var checkbox = el("input", { type: "checkbox", name: "block_id", value: block.id });
+        checkbox.checked = block.suggested;
+        checkbox.addEventListener("change", function () { setBlockChecked(block.id, checkbox.checked); });
+        var label = el("label", {}, [
+          checkbox,
+          document.createTextNode(block.name + (block.suggested ? " (suggested)" : "")),
+        ]);
+        list.appendChild(el("li", {}, [label]));
+      });
+
+      form.appendChild(list);
+      var confirmSubmitBtn = el("button", { type: "submit", class: "primary-button primary-button-inline", text: "Confirm & start processing" });
+      form.appendChild(confirmSubmitBtn);
+      form.addEventListener("submit", function (e) {
+        e.preventDefault();
+        var checkedIds = Array.prototype.slice
+          .call(list.querySelectorAll('input[type="checkbox"]:checked'))
+          .map(function (checkbox) { return checkbox.value; });
+        if (!checkedIds.length) {
+          showFlash("Choose at least one block to process this image against.", "error");
+          return;
+        }
+        confirmSubmitBtn.disabled = true;
+        var formData = new FormData();
+        checkedIds.forEach(function (id) { formData.append("block_id", id); });
+        formData.append("csrfmiddlewaretoken", CSRF_TOKEN);
+        postJson(buildUrl(data.urls.imagery_confirm_blocks, confirm.image.id), formData).then(function (json) {
+          confirmSubmitBtn.disabled = false;
+          if (json.ok) {
+            showFlash(json.message, "success");
+            exitUploadConfirmMode();
+            refreshData(json.farm_map_data, json.focus);
+          } else {
+            showFlash(json.message || "Couldn't start processing.", "error");
+          }
+        });
+      });
+      panelEl.appendChild(form);
+    }
+
+    panelEl.appendChild(actionButton("Cancel", exitUploadConfirmMode, "secondary-button"));
+
+    if (boundsSources.length) {
+      map.fitBounds(L.featureGroup(boundsSources).getBounds().pad(0.15));
+    } else {
+      map.setView([0, 0], 2);
+    }
+  }
+
+  // --- Normal browsing + management: farm → block → tree drill-down,
+  // panel driven entirely by client-side state, and every write action
+  // (add/edit/delete a block, draw a boundary, add/edit/remove a tree,
+  // create a harvest plan) happens right here too — a form fragment
+  // fetched into the panel, and for boundary/tree placement, direct
+  // interaction with this page's own map. No page reload, ever. ---
+
+  // "small" retired as a health value (see classification.py's own
+  // docstring) — the model's SMALL predictions now map to "unknown", so
+  // there's no longer a separate color for it. healthColors[tree.health] ||
+  // healthColors.unknown below already handles any stale pre-migration
+  // "small" value gracefully, falling back to the unknown color.
+  var healthColors = { healthy: "#6B8F71", yellow: "#B85C4A", unknown: "#8A8578" };
+
+  // Harvest/fertilizer indicator — drawn as the marker's *stroke*
+  // (color/weight/dashArray), independent of fillColor (which stays
+  // health-based, healthColors above) so a tree can show both at once:
+  // health via fill, harvest/fertilizer stage via ring. Reads *_stage
+  // (not *_status) — Tree.harvest_stage()/fertilizer_stage()
+  // (apps/trees/models.py) already fold "a Manager explicitly flagged
+  // this tree" ahead of the plain interval math, so "marked" (stage 1,
+  // pending PIC Block action) wins over "overdue," which wins over "due
+  // soon," which wins over "never recorded" (dashed, since there's
+  // nothing to compare against yet), which wins over the plain default
+  // ring once both axes are within-interval ("ok").
+  //
+  // Update: the "ok" ring used to be #2F4A38 at weight 1 — the EXACT same
+  // color as the block-boundary line (see the legend's own "Block
+  // boundary" swatch) and thin enough to disappear against a busy
+  // orthomosaic background. Reported directly, with a screenshot showing a
+  // block where every visible marker read as the same indicator regardless
+  // of stage: an in-interval tree's ring was indistinguishable from "no
+  // ring at all," and had no legend entry either, so there was no way to
+  // tell "this tree is fine" from "this tree has no computed status" just
+  // by looking. Given its own distinct color (teal, unused anywhere else
+  // in the legend — health fills, the other four ring states, and the
+  // boundary/footprint lines are all warm greens/browns/oranges/reds/grays)
+  // and bumped to weight 2, same as "never," which had the same
+  // near-invisible weight-1 problem.
+  function treeIndicatorStyle(tree) {
+    var marked = tree.harvest_stage === "marked" || tree.fertilizer_stage === "marked";
+    var overdue = tree.harvest_stage === "overdue" || tree.fertilizer_stage === "overdue";
+    var dueSoon = tree.harvest_stage === "due_soon" || tree.fertilizer_stage === "due_soon";
+    var neverRecorded = tree.harvest_stage === "never" && tree.fertilizer_stage === "never";
+    if (marked) return { color: "#3B6FA0", weight: 3, dashArray: null };
+    if (overdue) return { color: "#C0392B", weight: 3, dashArray: null };
+    if (dueSoon) return { color: "#D9A441", weight: 2, dashArray: null };
+    if (neverRecorded) return { color: "#8A8578", weight: 2, dashArray: "2 3" };
+    return { color: "#1F7A8C", weight: 2, dashArray: null };
+  }
+
+  var intervalStatusLabels = {
+    never: "Never recorded", ok: "OK", due_soon: "Due soon", overdue: "Overdue", marked: "Needs action",
+  };
+
+  // Human-readable status line for the tree detail panel — one of:
+  // "Needs action — assigned 12 Jun 2026 by J. Tan." (stage === "marked",
+  // regardless of interval math — see Tree.harvest_stage()'s docstring),
+  // "12 Jun 2026 — 8 days ago (overdue, every 14 days)" (a real last-done
+  // date on record), or "Never recorded (every 14 days)" (no date yet).
+  function formatIntervalDetail(lastAtIso, stage, intervalDays, markedAtIso, markedByName) {
+    if (stage === "marked") {
+      var assignedWhen = markedAtIso ? new Date(markedAtIso).toLocaleDateString() : "recently";
+      return "Needs action — assigned " + assignedWhen + (markedByName ? " by " + markedByName : "") + ".";
+    }
+    var label = intervalStatusLabels[stage] || stage;
+    if (!lastAtIso) return label + " (every " + intervalDays + " days)";
+    var lastDate = new Date(lastAtIso + "T00:00:00");
+    var daysAgo = Math.round((Date.now() - lastDate.getTime()) / 86400000);
+    var when = lastDate.toLocaleDateString();
+    return when + " — " + daysAgo + " day" + (daysAgo === 1 ? "" : "s") + " ago (" + label + ", every " + intervalDays + " days)";
+  }
+
+  var blocksById = {}, treesById = {}, farmsById = {}, imagesById = {}, blocksByFarm = {}, treesByBlock = {};
+
+  function buildIndexes() {
+    blocksById = {};
+    data.blocks.forEach(function (b) { blocksById[b.id] = b; });
+    treesById = {};
+    data.trees.forEach(function (t) { treesById[t.id] = t; });
+    farmsById = {};
+    data.farms.forEach(function (f) { farmsById[f.id] = f; });
+    imagesById = {};
+    data.images.forEach(function (img) { imagesById[img.id] = img; });
+    blocksByFarm = {};
+    data.blocks.forEach(function (b) { (blocksByFarm[b.farm_id] = blocksByFarm[b.farm_id] || []).push(b); });
+    treesByBlock = {};
+    data.trees.forEach(function (t) { (treesByBlock[t.block_id] = treesByBlock[t.block_id] || []).push(t); });
+  }
+
+  // Rebuildable — called once on load and again after every successful
+  // write (refreshData() below), since a write can add/remove/move
+  // exactly the kind of thing these arrays hold. Always tears down
+  // whatever this function's own previous run put on the map first.
+  var blockLayers = [], imageLayers = [], treeMarkers = [];
+  var currentBlockLayers = [], currentImageLayers = [], currentClusterGroup = null;
+
+  // Shared teardown for whatever the browse-and-manage state machine
+  // currently has on the map — used both here (buildLayers() rebuilds
+  // from scratch) and by showUploadConfirm() above (clearing the normal
+  // browsing view before showing the upload-confirm footprint/checklist
+  // instead). renderMap() below does its own reassignment of
+  // currentBlockLayers/currentImageLayers right after calling this, so
+  // calling this alone always leaves the map in a valid, if momentarily
+  // empty, state.
+  function clearCurrentMapLayers() {
+    currentBlockLayers.forEach(function (e) { map.removeLayer(e.layer); });
+    currentImageLayers.forEach(function (e) { map.removeLayer(e.layer); });
+    if (currentClusterGroup) map.removeLayer(currentClusterGroup);
+    currentBlockLayers = [];
+    currentImageLayers = [];
+    currentClusterGroup = null;
+  }
+
+  function buildLayers() {
+    clearCurrentMapLayers();
+
+    // Blocks with no drawn boundary yet are still real management targets
+    // (that's exactly how a boundary gets drawn) — they just have nothing
+    // to plot on the map itself, so they're skipped here but still appear
+    // in the side panel's block lists below.
+    blockLayers = data.blocks.filter(function (b) { return b.geometry; }).map(function (block) {
+      var layer = L.geoJSON(block.geometry, { style: { color: "#2F4A38", weight: 2, fillOpacity: 0.05 } });
+      layer.on("click", function () { selectBlock(block.id); });
+      return { farmId: block.farm_id, blockId: block.id, layer: layer };
+    });
+
+    // Each image is a feature group of up to two layers: the actual
+    // preview picture (once generate_preview() has produced one — see
+    // Image.preview_file) stretched across the footprint's own bounds,
+    // plus the dashed outline on top — also the only thing shown at all
+    // for an image with no preview yet.
+    imageLayers = data.images.map(function (image) {
+      var group = L.featureGroup();
+      if (image.preview_url) {
+        L.imageOverlay(image.preview_url, ringBounds(image.geometry), { opacity: 0.9 }).addTo(group);
+      }
+      L.geoJSON(image.geometry, {
+        style: { color: "#D9A441", weight: 2, dashArray: "6 4", fillOpacity: image.preview_url ? 0 : 0.02 },
+      }).addTo(group);
+      return { farmId: image.farm_id, imageId: image.id, layer: group };
+    });
+
+    // Trees are clustered (Leaflet.markercluster) rather than added
+    // individually — a real farm can have thousands, and bare markers
+    // would make the map unusable long before it became visually wrong.
+    treeMarkers = data.trees.map(function (tree) {
+      var coords = tree.geometry.coordinates; // [lon, lat]
+      var indicator = treeIndicatorStyle(tree);
+      var marker = L.circleMarker([coords[1], coords[0]], {
+        radius: 6,
+        color: indicator.color,
+        weight: indicator.weight,
+        dashArray: indicator.dashArray,
+        fillColor: healthColors[tree.health] || healthColors.unknown,
+        fillOpacity: 0.85,
+      });
+      marker.on("click", function () {
+        if (state.planningBlockId === tree.block_id) toggleTreeSelected(tree.id);
+        else selectTree(tree.id);
+      });
+      return {
+        farmId: tree.farm_id, blockId: tree.block_id, treeId: tree.id, marker: marker,
+        indicatorWeight: indicator.weight,
+      };
+    });
+  }
+
+  // selectionMode: null | "harvest_plan" | "mark_harvested" | "mark_fertilized"
+  // — which tree-selection flow is currently active for planningBlockId
+  // (see startTreeSelection() below). The marker click handler above only
+  // ever checks planningBlockId, so it stays generic across all three modes.
+  var state = {
+    farmId: null, blockId: null, treeId: null,
+    planningBlockId: null, selectionMode: null, selectedTreeIds: {},
+    // Which overlapping image (if any) to display for a given block, keyed
+    // by block id — chosen from the block panel's imagery picker (see
+    // renderImageryPickerSection()) instead of always stacking every
+    // matching image on top of each other. Undefined until a block's panel
+    // has actually initialized a default (see selectBlock()).
+    selectedImageByBlock: {},
+  };
+
+  // Any in-progress map interaction that isn't part of `state` — a
+  // boundary being drawn, a tree marker being placed — and needs its own
+  // teardown before the panel/map moves on to something else (a
+  // different selection, a successful save, an explicit cancel). Exactly
+  // one of these is ever active at a time.
+  var interactiveMode = null;
+
+  function exitInteractiveModes() {
+    if (interactiveMode && interactiveMode.cleanup) interactiveMode.cleanup();
+    interactiveMode = null;
+  }
+
+  // Which image (if any) should currently be shown on the map for this
+  // block. Defaults to the first entry in processed_image_ids — real
+  // ImageProcessingRun history for this block, newest-run-first (see
+  // _build_farm_map_data()), not a footprint-overlap guess — until the
+  // Manager explicitly picks a different one (or "None") from
+  // renderImageryPickerSection(), at which point state.selectedImageByBlock
+  // remembers the explicit choice (including an explicit "none").
+  function selectedImageForBlock(blockId) {
+    if (Object.prototype.hasOwnProperty.call(state.selectedImageByBlock, blockId)) {
+      return state.selectedImageByBlock[blockId];
+    }
+    var block = blocksById[blockId];
+    var processed = block ? block.processed_image_ids : [];
+    return processed && processed.length ? processed[0] : null;
+  }
+
+  // Built fresh per render, not precomputed alongside imageLayers in
+  // buildLayers() — the same Image can have a different clipped_images
+  // entry per block (persist_clipped_block_imagery() runs once per
+  // ImageProcessingRun, i.e. once per image-x-block pair), so there's no
+  // single "the" clipped layer for an image the way there is for the
+  // whole-image entries in imageLayers. Returns null (never a partial
+  // layer) if this block has no successful clip for the picked image yet
+  // — renderMap() now shows nothing at all in that case (see its own
+  // updated comment) rather than falling back to the whole-image overlay,
+  // since that fallback was itself a source of one block's imagery
+  // visually spilling into another's.
+  function clippedLayerFor(blockId, imageId) {
+    var block = blocksById[blockId];
+    var match = block && block.clipped_images
+      ? block.clipped_images.filter(function (c) { return c.image_id === imageId; })[0]
+      : null;
+    if (!match) return null;
+    var group = L.featureGroup();
+    L.imageOverlay(match.preview_url, ringBounds(match.geometry), { opacity: 0.9 }).addTo(group);
+    return { farmId: block.farm_id, imageId: imageId, layer: group };
+  }
+
+  function renderMap() {
+    clearCurrentMapLayers();
+
+    currentBlockLayers = blockLayers.filter(function (e) {
+      if (state.blockId) return e.blockId === state.blockId;
+      return !state.farmId || e.farmId === state.farmId;
+    });
+    if (state.blockId) {
+      // Block level: show only the one image the panel's imagery picker
+      // has selected for this block (if any) instead of every overlapping
+      // image stacking on top of each other — see
+      // renderImageryPickerSection() and selectedImageForBlock(). Prefers
+      // the block-scoped physically-clipped version (clippedLayerFor —
+      // see persist_clipped_block_imagery()) over the whole image's own
+      // footprint/preview, so this block's view doesn't show pixels that
+      // belong to a neighboring block.
+      //
+      // Update: no longer falls back to the whole-image overlay when no
+      // clip exists yet — reported directly, with real data: a Pix4D
+      // flight's footprint legitimately overlaps several blocks (B4 and
+      // B5 here), and only B4 had actually been processed against it: B5
+      // had never been processed against this image at all, yet picking
+      // it for B5 still fell back to the WHOLE unclipped image, visually
+      // spilling into B4's territory — exactly the overlap this feature
+      // exists to prevent, just for the "not processed here yet" case
+      // instead of the "processing failed" case the fallback was
+      // originally written for. Showing nothing until a real clip exists
+      // is correct either way: a block that was never processed against
+      // an image has no real per-block imagery to show, and the whole
+      // image was never actually block-scoped to begin with.
+      var pickedImageId = selectedImageForBlock(state.blockId);
+      var clippedLayer = pickedImageId ? clippedLayerFor(state.blockId, pickedImageId) : null;
+      currentImageLayers = clippedLayer ? [clippedLayer] : [];
+    } else {
+      currentImageLayers = state.farmId
+        ? imageLayers.filter(function (e) { return e.farmId === state.farmId; })
+        : imageLayers;
+    }
+    var visibleTrees = treeMarkers.filter(function (e) {
+      if (state.blockId) return e.blockId === state.blockId;
+      return !state.farmId || e.farmId === state.farmId;
+    });
+
+    currentBlockLayers.forEach(function (e) {
+      var isSelected = e.blockId === state.blockId;
+      e.layer.setStyle({ weight: isSelected ? 3 : 2, fillOpacity: isSelected ? 0.25 : 0.05 });
+      e.layer.addTo(map);
+    });
+    currentImageLayers.forEach(function (e) { e.layer.addTo(map); });
+
+    currentClusterGroup = L.markerClusterGroup({ maxClusterRadius: 40 });
+    visibleTrees.forEach(function (e) {
+      var isPlanning = state.planningBlockId === e.blockId;
+      var isChecked = !!state.selectedTreeIds[e.treeId];
+      var isSelectedTree = e.treeId === state.treeId;
+      e.marker.setStyle({
+        radius: isSelectedTree || isChecked ? 8 : 6,
+        // Selection bumps the indicator ring's own weight by 1 rather than
+        // overriding it outright — an overdue tree still reads as overdue
+        // once selected, it just gets a slightly heavier ring on top.
+        weight: isSelectedTree || isChecked ? e.indicatorWeight + 1 : e.indicatorWeight,
+        fillOpacity: isPlanning && !isChecked ? 0.4 : 0.85,
+      });
+      currentClusterGroup.addLayer(e.marker);
+    });
+    currentClusterGroup.addTo(map);
+
+    var boundsSources = currentBlockLayers.map(function (e) { return e.layer; })
+      .concat(currentImageLayers.map(function (e) { return e.layer; }));
+    if (visibleTrees.length) boundsSources.push(currentClusterGroup);
+    if (boundsSources.length) {
+      map.fitBounds(L.featureGroup(boundsSources).getBounds().pad(0.15));
+    } else {
+      map.setView([0, 0], 2);
+    }
+  }
+
+  function repopulateBlockOptions(selectedFarmId) {
+    var options = ['<option value="">All blocks</option>'];
+    data.blocks
+      .filter(function (b) { return !selectedFarmId || b.farm_id === selectedFarmId; })
+      .forEach(function (b) { options.push('<option value="' + b.id + '">' + b.name + "</option>"); });
+    blockSelect.innerHTML = options.join("");
+  }
+
+  farmSelect.addEventListener("change", function () { selectFarm(farmSelect.value || null); });
+  blockSelect.addEventListener("change", function () {
+    if (blockSelect.value) selectBlock(blockSelect.value);
+    else selectFarm(state.farmId);
+  });
+  if (uploadImageryBtn) uploadImageryBtn.addEventListener("click", startImageUpload);
+
+  function selectFarm(farmId) {
+    exitInteractiveModes();
+    state.farmId = farmId; state.blockId = null; state.treeId = null;
+    state.planningBlockId = null; state.selectionMode = null;
+    farmSelect.value = farmId || "";
+    repopulateBlockOptions(farmId);
+    blockSelect.value = "";
+    renderMap();
+    renderPanel();
+  }
+
+  function selectBlock(blockId) {
+    var block = blocksById[blockId];
+    if (!block) return;
+    exitInteractiveModes();
+    state.farmId = block.farm_id; state.blockId = blockId; state.treeId = null;
+    state.planningBlockId = null; state.selectionMode = null;
+    farmSelect.value = state.farmId;
+    repopulateBlockOptions(state.farmId);
+    blockSelect.value = blockId;
+    renderMap();
+    renderPanel();
+  }
+
+  function selectTree(treeId) {
+    var tree = treesById[treeId];
+    if (!tree) return;
+    exitInteractiveModes();
+    state.farmId = tree.farm_id; state.blockId = tree.block_id; state.treeId = treeId;
+    state.planningBlockId = null; state.selectionMode = null;
+    farmSelect.value = state.farmId;
+    repopulateBlockOptions(state.farmId);
+    blockSelect.value = state.blockId;
+    renderMap();
+    renderPanel();
+  }
+
+  function clearSelection() {
+    exitInteractiveModes();
+    state.farmId = null; state.blockId = null; state.treeId = null;
+    state.planningBlockId = null; state.selectionMode = null;
+    farmSelect.value = "";
+    repopulateBlockOptions(null);
+    blockSelect.value = "";
+    renderMap();
+    renderPanel();
+  }
+
+  // The one thing every successful write below does: swap in the fresh
+  // payload the server just computed, rebuild every index/layer from it,
+  // then land the panel back on whatever's still relevant ("focus" — a
+  // block/tree/farm id, sent back by the view that just saved). This is
+  // deliberately a full data refresh rather than patching one item in
+  // place — this app's scale doesn't call for anything cleverer, and one
+  // rule ("a save = a fresh farm_map_data") can't drift from what
+  // actually happened server-side the way hand-patched client state could.
+  function refreshData(newData, focus) {
+    data = newData;
+    buildIndexes();
+    buildLayers();
+    applyFocus(focus);
+  }
+
+  function applyFocus(focus) {
+    if (focus && focus.type === "tree" && treesById[focus.id]) {
+      selectTree(focus.id);
+    } else if (focus && focus.type === "block" && blocksById[focus.id]) {
+      selectBlock(focus.id);
+      if (focus.then === "boundary") startBoundaryEdit(blocksById[focus.id]);
+    } else if (focus && focus.type === "farm" && farmsById[focus.id]) {
+      selectFarm(focus.id);
+    } else {
+      clearSelection();
+    }
+  }
+
+  // Generalized entry/exit for every "select several trees, then do
+  // something" flow — harvest-plan tree checklist (visual reference only)
+  // plus the two new mark-harvested/mark-fertilized actions below. One
+  // shared pair rather than three near-duplicates, since the selection
+  // mechanics (click a marker, check a box, or lasso — see
+  // renderTreeSelectionChecklist()/startLassoSelect() below) are
+  // identical across all three; only what happens on confirm differs.
+  function startTreeSelection(blockId, mode) {
+    exitInteractiveModes();
+    state.planningBlockId = blockId;
+    state.selectionMode = mode;
+    state.selectedTreeIds = {};
+    renderMap();
+    renderPanel();
+  }
+
+  function cancelTreeSelection() {
+    exitInteractiveModes(); // in case a lasso drag was mid-flight
+    state.planningBlockId = null;
+    state.selectionMode = null;
+    state.selectedTreeIds = {};
+    renderMap();
+    renderPanel();
+  }
+
+  function toggleTreeSelected(treeId) {
+    if (state.selectedTreeIds[treeId]) delete state.selectedTreeIds[treeId];
+    else state.selectedTreeIds[treeId] = true;
+    renderMap();
+    renderPanel();
+  }
+
+  // --- Generic in-panel form open/submit/cancel — every write action
+  // below (block add/edit, tree add/edit, harvest plan add) is a GET (to
+  // fetch the form fragment) followed by this same bind/submit/re-render
+  // dance. Block delete uses it too, even though it has no real "form
+  // fields" beyond a confirm button — same fragment-in-panel shape. ---
+
+  function openForm(heading, breadcrumbItems, html, opts) {
+    opts = opts || {};
+    panelEl.innerHTML = "";
+    if (breadcrumbItems) panelEl.appendChild(breadcrumb(breadcrumbItems));
+    if (heading) panelEl.appendChild(el("h2", { class: "panel-heading", text: heading }));
+    var wrap = el("div", {});
+    wrap.innerHTML = html;
+    panelEl.appendChild(wrap);
+    function rerender(newHtml) { openForm(heading, breadcrumbItems, newHtml, opts); }
+    bindPanelForm(wrap, rerender, opts);
+    if (opts.afterRender) opts.afterRender();
+  }
+
+  function bindPanelForm(container, rerender, opts) {
+    var cancelEl = container.querySelector("[data-panel-cancel]");
+    if (cancelEl) {
+      cancelEl.addEventListener("click", function (e) {
+        e.preventDefault();
+        exitInteractiveModes();
+        (opts.onCancel || renderPanel)();
+      });
+    }
+    var form = container.querySelector("[data-panel-form]");
+    if (!form) return;
+    form.addEventListener("submit", function (e) {
+      e.preventDefault();
+      var submitBtn = form.querySelector('button[type="submit"]');
+      if (submitBtn) submitBtn.disabled = true;
+      var formData = new FormData(form);
+      postJson(form.getAttribute("action"), formData).then(function (json) {
+        if (submitBtn) submitBtn.disabled = false;
+        if (json.ok) {
+          exitInteractiveModes();
+          showFlash(json.message, "success");
+          refreshData(json.farm_map_data, json.focus);
+        } else {
+          showFlash(json.message, "error");
+          rerender(json.html);
+        }
+      });
+    });
+  }
+
+  // --- Tree placement — a draggable marker on the shared map, used by
+  // both "Add tree" and "Edit tree." Lives outside the generic form
+  // machinery above because it has to survive a failed submit (the
+  // marker/click-listener stay put; only the form fragment gets
+  // re-rendered) and because the hidden lat/lng inputs it writes into
+  // belong to whichever form fragment currently happens to be in the
+  // panel — synced explicitly, not assumed. ---
+
+  var treePlacement = null; // { lat, lng, marker } while an add/edit-tree form is open
+
+  function syncTreePlacementInputs() {
+    if (!treePlacement) return;
+    var latInput = panelEl.querySelector('[name="lat"]');
+    var lngInput = panelEl.querySelector('[name="lng"]');
+    if (latInput) latInput.value = treePlacement.lat != null ? treePlacement.lat : "";
+    if (lngInput) lngInput.value = treePlacement.lng != null ? treePlacement.lng : "";
+  }
+
+  function placeTreeMarker(lat, lng) {
+    if (!treePlacement) return;
+    if (treePlacement.marker) map.removeLayer(treePlacement.marker);
+    var marker = L.marker([lat, lng], { draggable: true }).addTo(map);
+    marker.on("dragend", function () {
+      var pos = marker.getLatLng();
+      treePlacement.lat = pos.lat; treePlacement.lng = pos.lng;
+      syncTreePlacementInputs();
+    });
+    treePlacement.marker = marker;
+    treePlacement.lat = lat; treePlacement.lng = lng;
+    syncTreePlacementInputs();
+  }
+
+  function startTreePlacementMode(existingLatLng) {
+    treePlacement = { lat: null, lng: null, marker: null };
+    if (existingLatLng) placeTreeMarker(existingLatLng[0], existingLatLng[1]);
+    function onMapClick(e) { placeTreeMarker(e.latlng.lat, e.latlng.lng); }
+    map.on("click", onMapClick);
+    interactiveMode = {
+      type: "place-tree",
+      cleanup: function () {
+        map.off("click", onMapClick);
+        if (treePlacement && treePlacement.marker) map.removeLayer(treePlacement.marker);
+        treePlacement = null;
+      },
+    };
+  }
+
+  // --- Lasso multi-select — freehand-drag select for whichever tree
+  // checklist is currently open (renderTreeSelectionChecklist() below),
+  // added per direct feedback: "add lasso tool to select multiple tree at
+  // once in the leaflet panel." Deliberately a raw mousedown/mousemove/
+  // mouseup drag on the map itself (map.dragging disabled for the
+  // duration) rather than Leaflet.draw's click-to-place-vertices polygon
+  // tool — a real drag lasso is what "lasso" means in every other tool
+  // that has one (image editors, spreadsheets), and boundary editing
+  // above already shows precise click-a-vertex polygons are the right
+  // tool for a *boundary*, not a quick "grab everything under here"
+  // selection. No extra library: point-in-polygon is a small enough
+  // ray-casting check to write directly (pointInPolygon() below) rather
+  // than pull in a Leaflet plugin for one function. Additive, not
+  // exclusive — trees already checked stay checked; a lasso just adds
+  // whatever falls inside this pass, so a Manager can lasso a few
+  // clusters in sequence, or lasso then fine-tune with individual clicks.
+
+  function pointInPolygon(latlng, ring) {
+    var x = latlng.lng, y = latlng.lat;
+    var inside = false;
+    for (var i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      var xi = ring[i].lng, yi = ring[i].lat;
+      var xj = ring[j].lng, yj = ring[j].lat;
+      var crosses = (yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi;
+      if (crosses) inside = !inside;
+    }
+    return inside;
+  }
+
+  function startLassoSelect(blockId) {
+    exitInteractiveModes();
+    map.dragging.disable();
+    mapEl.classList.add("lasso-active");
+
+    var points = [];
+    var active = false;
+    var trail = L.polyline([], { color: "#2F4A38", weight: 2, dashArray: "5 5" }).addTo(map);
+
+    function onDown(e) {
+      active = true;
+      points = [e.latlng];
+      trail.setLatLngs(points);
+    }
+    function onMove(e) {
+      if (!active) return;
+      points.push(e.latlng);
+      trail.setLatLngs(points);
+    }
+    function onUp() {
+      if (!active) return;
+      active = false;
+      var ring = points;
+      trail.setLatLngs([]);
+      if (ring.length > 2) applyLassoSelection(ring, blockId);
+    }
+
+    map.on("mousedown", onDown);
+    map.on("mousemove", onMove);
+    map.on("mouseup", onUp);
+
+    interactiveMode = {
+      type: "lasso",
+      cleanup: function () {
+        map.off("mousedown", onDown);
+        map.off("mousemove", onMove);
+        map.off("mouseup", onUp);
+        map.removeLayer(trail);
+        map.dragging.enable();
+        mapEl.classList.remove("lasso-active");
+      },
+    };
+  }
+
+  function applyLassoSelection(ring, blockId) {
+    var candidates = treeMarkers.filter(function (e) { return e.blockId === blockId; });
+    var count = 0;
+    candidates.forEach(function (e) {
+      if (pointInPolygon(e.marker.getLatLng(), ring)) {
+        if (!state.selectedTreeIds[e.treeId]) count++;
+        state.selectedTreeIds[e.treeId] = true;
+      }
+    });
+    exitInteractiveModes();
+    renderMap();
+    renderPanel();
+    showFlash(
+      count ? "Lasso selected " + count + " tree" + (count === 1 ? "" : "s") + "." : "No trees found inside that shape.",
+      count ? "success" : "info"
+    );
+  }
+
+  // --- Boundary drawing — Leaflet.draw enabled directly on this page's
+  // own map, exactly the tool block_boundary.html's now-superseded
+  // standalone page used, just pointed at the shared map instance and a
+  // fetch() save instead of a real form submit. The farm's other blocks
+  // are drawn dimmed alongside for spatial context (so a Manager can see
+  // they're not drawing over a neighbor) as dedicated one-off layers,
+  // never touching the shared blockLayers/currentBlockLayers arrays —
+  // cleanup here is just "remove these layers and let renderMap() put
+  // the normal view back," never a source of drift for the browse state
+  // machine above. ---
+
+  function startBoundaryEdit(block) {
+    exitInteractiveModes();
+    panelEl.innerHTML = "";
+    panelEl.appendChild(breadcrumb(blockBreadcrumb(block)));
+    panelEl.appendChild(el("h2", { class: "panel-heading", text: (block.has_boundary ? "Edit" : "Draw") + " boundary" }));
+    panelEl.appendChild(el("p", { class: "panel-subheading", text: block.name }));
+    panelEl.appendChild(el("p", { class: "panel-note", text: "Use the polygon tool on the map to draw this block's boundary, or edit the existing one. Other blocks on this farm are shown dimmed for reference only." }));
+
+    var dimmedLayers = [];
+    (blocksByFarm[block.farm_id] || []).forEach(function (b) {
+      if (b.id === block.id || !b.geometry) return;
+      var layer = L.geoJSON(b.geometry, { style: { color: "#8A8578", weight: 1, fillOpacity: 0.05, dashArray: "3 3" } });
+      layer.bindPopup(b.name);
+      layer.addTo(map);
+      dimmedLayers.push(layer);
+    });
+
+    var drawnItems = new L.FeatureGroup().addTo(map);
+    if (block.geometry) {
+      L.geoJSON(block.geometry, { style: { color: "#2F4A38", weight: 2, fillOpacity: 0.15 } })
+        .eachLayer(function (l) { drawnItems.addLayer(l); });
+    }
+
+    var drawControl = new L.Control.Draw({
+      // position: topright, not the Leaflet.draw default (topleft) — same
+      // reasoning as the zoom control above: topleft is where the floating
+      // panel lives in the full-page layout. Added later than the zoom/
+      // layers controls (this control only exists while boundary editing
+      // is active), so it naturally stacks below both of them.
+      position: "topright",
+      edit: { featureGroup: drawnItems, remove: true },
+      draw: { polygon: true, polyline: false, rectangle: false, circle: false, marker: false, circlemarker: false },
+    });
+    map.addControl(drawControl);
+
+    function onCreated(e) {
+      drawnItems.clearLayers(); // one boundary per block — a newly drawn polygon replaces any previous one
+      drawnItems.addLayer(e.layer);
+    }
+    map.on(L.Draw.Event.CREATED, onCreated);
+
+    function save() {
+      var layers = drawnItems.getLayers();
+      if (!layers.length) {
+        showFlash("Draw a boundary polygon before saving.", "error");
+        return;
+      }
+      var formData = new FormData();
+      formData.append("geometry", JSON.stringify(layers[0].toGeoJSON().geometry));
+      formData.append("csrfmiddlewaretoken", CSRF_TOKEN);
+      postJson(buildUrl(data.urls.block_boundary, block.id), formData).then(function (json) {
+        if (json.ok) {
+          exitInteractiveModes();
+          showFlash(json.message, "success");
+          refreshData(json.farm_map_data, json.focus);
+        } else {
+          showFlash(json.message || "Couldn't save that boundary.", "error");
+        }
+      });
+    }
+
+    panelEl.appendChild(el("div", { class: "panel-actions" }, [
+      actionButton("Save boundary", save, "primary-button-small"),
+      actionButton("Cancel", function () { exitInteractiveModes(); selectBlock(block.id); }),
+    ]));
+
+    var boundsSources = dimmedLayers.concat(drawnItems.getLayers().length ? [drawnItems] : []);
+    if (boundsSources.length) {
+      try {
+        map.fitBounds(L.featureGroup(boundsSources).getBounds().pad(0.2));
+      } catch (err) { /* no valid bounds among these layers — leave the current view alone */ }
+    }
+
+    interactiveMode = {
+      type: "boundary",
+      cleanup: function () {
+        map.off(L.Draw.Event.CREATED, onCreated);
+        map.removeControl(drawControl);
+        map.removeLayer(drawnItems);
+        dimmedLayers.forEach(function (l) { map.removeLayer(l); });
+        renderMap(); // restores the normal filtered view/styling
+      },
+    };
+  }
+
+  // --- Write-action entry points — each fetches its form fragment (or,
+  // for delete, its confirmation fragment) via AJAX GET and opens it in
+  // the panel via openForm(); tree add/edit additionally starts
+  // placement mode on the shared map first. ---
+
+  function blockBreadcrumb(block) {
+    var farm = farmsById[block.farm_id];
+    return [
+      { label: "All farms", onClick: clearSelection },
+      { label: farm ? farm.name : "Farm", onClick: function () { selectFarm(block.farm_id); } },
+      { label: block.name, onClick: function () { selectBlock(block.id); } },
+    ];
+  }
+
+  function treeBreadcrumb(tree) {
+    var items = blockBreadcrumb(blocksById[tree.block_id] || { id: tree.block_id, farm_id: tree.farm_id, name: "Block" });
+    items.push({ label: tree.name, onClick: function () { selectTree(tree.id); } });
+    return items;
+  }
+
+  function startBlockAdd(farmId) {
+    exitInteractiveModes();
+    var url = data.urls.block_add + "?farm=" + encodeURIComponent(farmId);
+    getJson(url).then(function (json) {
+      var farm = farmsById[farmId];
+      openForm("Add block", [
+        { label: "All farms", onClick: clearSelection },
+        { label: farm ? farm.name : "Farm", onClick: function () { selectFarm(farmId); } },
+      ], json.html, { onCancel: function () { selectFarm(farmId); } });
+    });
+  }
+
+  function startBlockEdit(block) {
+    exitInteractiveModes();
+    getJson(buildUrl(data.urls.block_edit, block.id)).then(function (json) {
+      openForm("Edit block", blockBreadcrumb(block), json.html, { onCancel: function () { selectBlock(block.id); } });
+    });
+  }
+
+  function startBlockDelete(block) {
+    exitInteractiveModes();
+    getJson(buildUrl(data.urls.block_delete, block.id)).then(function (json) {
+      openForm("Delete block", blockBreadcrumb(block), json.html, { onCancel: function () { selectBlock(block.id); } });
+    });
+  }
+
+  function startTreeAdd(block) {
+    exitInteractiveModes();
+    getJson(buildUrl(data.urls.tree_add, block.id)).then(function (json) {
+      startTreePlacementMode(null);
+      openForm("Add tree", blockBreadcrumb(block), json.html, {
+        onCancel: function () { selectBlock(block.id); },
+        afterRender: syncTreePlacementInputs,
+      });
+    });
+  }
+
+  function startTreeEdit(tree) {
+    exitInteractiveModes();
+    getJson(buildUrl(data.urls.tree_edit, tree.id)).then(function (json) {
+      var existing = json.existing_point
+        ? [json.existing_point.coordinates[1], json.existing_point.coordinates[0]]
+        : null;
+      startTreePlacementMode(existing);
+      openForm("Edit tree", treeBreadcrumb(tree), json.html, {
+        onCancel: function () { selectTree(tree.id); },
+        afterRender: syncTreePlacementInputs,
+      });
+    });
+  }
+
+  function removeTree(tree) {
+    if (!window.confirm("Mark “" + tree.name + "” as removed? This can be undone later from Edit tree.")) return;
+    var formData = new FormData();
+    formData.append("csrfmiddlewaretoken", CSRF_TOKEN);
+    postJson(buildUrl(data.urls.tree_remove, tree.id), formData).then(function (json) {
+      if (json.ok) {
+        showFlash(json.message, "success");
+        refreshData(json.farm_map_data, json.focus);
+      } else {
+        showFlash(json.message || "Couldn't remove that tree.", "error");
+      }
+    });
+  }
+
+  function startHarvestPlanForm(block) {
+    exitInteractiveModes();
+    getJson(buildUrl(data.urls.harvest_plan_add, block.id)).then(function (json) {
+      openForm("Add harvest plan", blockBreadcrumb(block), json.html, { onCancel: function () { selectBlock(block.id); } });
+    });
+  }
+
+  // Fertilizer's counterpart to startHarvestPlanForm above — added after
+  // direct feedback asking where the fertilizer process was on this page
+  // (it simply hadn't been built yet). No tree-selection step: unlike
+  // Harvest, Fertilizer was never asked to have one, and the Fertilizer
+  // model itself has no tree-level scoping field (see FertilizerPlanForm's
+  // own docstring in apps/dashboard/forms.py) — so this goes straight to
+  // the form, block-level only.
+  function startFertilizerPlanForm(block) {
+    exitInteractiveModes();
+    getJson(buildUrl(data.urls.fertilizer_plan_add, block.id)).then(function (json) {
+      openForm("Add fertilizer plan", blockBreadcrumb(block), json.html, { onCancel: function () { selectBlock(block.id); } });
+    });
+  }
+
+  // --- Imagery upload — the toolbar's "Upload imagery" button opens a
+  // farm + file picker right here in the side panel (no more link out to
+  // imagery_list.html's own page, per the same feedback that drove the
+  // upload-confirm rewrite above), reusing the exact chunked/resumable
+  // upload endpoints that page's own JS already called — same
+  // resumeKeyFor()/getOrCreateSession()/uploadFile() logic, just renamed
+  // to avoid colliding with this page's own identifiers and pointed at
+  // this panel's own progress bar instead of that page's form. Once the
+  // upload completes, pollUploadStatus() below repeatedly calls
+  // FarmMapView's AJAX GET (?upload_image=<id>) — no page reload — until
+  // georeferencing finishes, then hands off to showUploadConfirm(). ---
+
+  function startImageUpload() {
+    exitInteractiveModes();
+    openImageUploadForm();
+  }
+
+  function setUploadProgress(fill, label, pct, text) {
+    fill.style.width = pct + "%";
+    label.textContent = text || pct + "%";
+  }
+
+  // Renders (and re-renders, on farm change) the block checklist inside
+  // openImageUploadForm() below — direct feedback was "when upload image
+  // choose farm and block so there are no two step anymore," so block
+  // selection now happens right here, upfront, instead of after
+  // georeferencing finishes (see pollUploadStatus()'s own updated
+  // docstring for how that connects through). Only blocks with a drawn
+  // boundary are offered — same constraint ImageConfirmBlocksView's own
+  // backend already enforces (a boundary-less block can never actually be
+  // processed), so offering one here would just be a checkbox guaranteed
+  // to fail once submitted.
+  function renderUploadBlockChecklist(container, farmId) {
+    container.innerHTML = "";
+    if (!farmId) {
+      container.appendChild(el("p", { class: "panel-note", text: "Choose a farm to see its blocks." }));
+      return;
+    }
+    var blocksForFarm = data.blocks.filter(function (b) { return b.farm_id === farmId && b.has_boundary; });
+    if (!blocksForFarm.length) {
+      container.appendChild(el("p", { class: "panel-note", text: "No blocks with a boundary drawn yet on this farm — draw one before uploading imagery for it." }));
+      return;
+    }
+    var list = el("ul", { class: "tree-checklist" });
+    blocksForFarm.forEach(function (block) {
+      var checkbox = el("input", { type: "checkbox", name: "upload_block_id", value: block.id });
+      list.appendChild(el("li", {}, [el("label", {}, [checkbox, document.createTextNode(block.name)])]));
+    });
+    container.appendChild(list);
+  }
+
+  function openImageUploadForm() {
+    panelEl.innerHTML = "";
+    panelEl.appendChild(el("h2", { class: "panel-heading", text: "Upload imagery" }));
+    panelEl.appendChild(el("p", { class: "panel-subheading", text: "Georeferencing runs automatically after upload, then processing starts right away against whichever block(s) you pick below — no separate confirm step." }));
+
+    var form = el("form", { class: "stacked-form" });
+
+    var farmField = el("select", { id: "upload-farm-select", name: "farm", required: "required" });
+    if (!state.farmId) farmField.appendChild(el("option", { value: "", text: "Choose a farm" }));
+    data.farms.forEach(function (farm) {
+      farmField.appendChild(el("option", { value: farm.id, text: farm.name }));
+    });
+    if (state.farmId) farmField.value = state.farmId;
+
+    var blockChecklistWrap = el("div", { id: "upload-block-checklist" });
+    renderUploadBlockChecklist(blockChecklistWrap, farmField.value || "");
+    farmField.addEventListener("change", function () {
+      renderUploadBlockChecklist(blockChecklistWrap, farmField.value);
+    });
+
+    var fileField = el("input", { type: "file", id: "upload-file-input", name: "raw_file", required: "required" });
+    var capturedField = el("input", { type: "datetime-local", id: "upload-captured-input", name: "captured_at" });
+
+    var progressFill = el("div", { class: "upload-progress-fill", id: "upload-progress-fill" });
+    var progressTrack = el("div", { class: "upload-progress-track" }, [progressFill]);
+    var progressLabel = el("span", { class: "upload-progress-label", id: "upload-progress-label", text: "0%" });
+    var progressWrap = el("div", { class: "upload-progress", id: "upload-progress" }, [progressTrack, progressLabel]);
+    progressWrap.hidden = true;
+
+    [
+      el("label", { for: "upload-farm-select", text: "Farm" }), farmField,
+      el("label", { text: "Process against block(s)" }), blockChecklistWrap,
+      el("label", { for: "upload-file-input", text: "Image file" }), fileField,
+      el("label", { for: "upload-captured-input", text: "Captured at (optional)" }), capturedField,
+      progressWrap,
+    ].forEach(function (node) { form.appendChild(node); });
+
+    var submitBtn = el("button", { type: "submit", class: "primary-button primary-button-inline", text: "Upload" });
+    form.appendChild(el("div", { class: "panel-actions" }, [
+      submitBtn,
+      actionButton("Cancel", function () { renderPanel(); }),
+    ]));
+    panelEl.appendChild(form);
+
+    form.addEventListener("submit", function (e) {
+      e.preventDefault();
+      if (!farmField.value) {
+        showFlash("Choose a farm before uploading.", "error");
+        return;
+      }
+      var selectedBlockIds = Array.prototype.slice
+        .call(blockChecklistWrap.querySelectorAll('input[type="checkbox"]:checked'))
+        .map(function (checkbox) { return checkbox.value; });
+      if (!selectedBlockIds.length) {
+        showFlash("Choose at least one block to process this image against.", "error");
+        return;
+      }
+      if (!fileField.files.length) {
+        showFlash("Choose a file to upload.", "error");
+        return;
+      }
+      submitBtn.disabled = true;
+      submitBtn.textContent = "Uploading…";
+      progressWrap.hidden = false;
+      setUploadProgress(progressFill, progressLabel, 0, "Preparing…");
+      uploadImageFile(fileField.files[0], farmField.value, capturedField.value, progressFill, progressLabel)
+        .then(function (result) {
+          showFlash("Upload complete — georeferencing…", "success");
+          pollUploadStatus(result.image_id, selectedBlockIds);
+        })
+        .catch(function (err) {
+          showFlash(
+            (err && err.message ? err.message : String(err)) + " — your progress is saved; try uploading again to resume.",
+            "error"
+          );
+          submitBtn.disabled = false;
+          submitBtn.textContent = "Upload";
+        });
+    });
+  }
+
+  // Name + size + lastModified is a good-enough fingerprint for "is this
+  // the same file I was mid-upload of" — same reasoning imagery_list.html's
+  // own matching helper already documents.
+  function resumeKeyFor(file) {
+    return "pv-upload:" + file.name + ":" + file.size + ":" + file.lastModified;
+  }
+
+  async function getOrCreateUploadSession(file, farmId, capturedAt, totalChunks) {
+    var key = resumeKeyFor(file);
+    var existingId = window.localStorage.getItem(key);
+    if (existingId) {
+      var statusResp = await fetch("/dashboard/imagery/uploads/" + existingId + "/", {
+        headers: { "X-CSRFToken": CSRF_TOKEN },
+      });
+      if (statusResp.ok) {
+        var statusData = await statusResp.json();
+        if (statusData.status !== "complete" && statusData.total_chunks === totalChunks) {
+          return { sessionId: existingId, received: statusData.received_chunk_indexes, resumed: true };
+        }
+      }
+      window.localStorage.removeItem(key); // stale, mismatched, or already-finished — start clean
+    }
+
+    var createResp = await fetch("/dashboard/imagery/uploads/", {
+      method: "POST",
+      headers: { "X-CSRFToken": CSRF_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        farm: farmId, filename: file.name, total_chunks: totalChunks, captured_at: capturedAt || null,
+      }),
+    });
+    if (!createResp.ok) throw new Error("Could not start the upload (status " + createResp.status + ").");
+    var createData = await createResp.json();
+    window.localStorage.setItem(key, createData.session_id);
+    return { sessionId: createData.session_id, received: [], resumed: false };
+  }
+
+  async function uploadImageFile(file, farmId, capturedAt, progressFill, progressLabel) {
+    var chunkSize = data.upload_chunk_size_bytes;
+    var totalChunks = Math.max(1, Math.ceil(file.size / chunkSize));
+    var session = await getOrCreateUploadSession(file, farmId, capturedAt, totalChunks);
+    var receivedSet = {};
+    session.received.forEach(function (i) { receivedSet[i] = true; });
+    if (session.resumed) {
+      setUploadProgress(progressFill, progressLabel, Math.round((session.received.length / totalChunks) * 100), "Resuming upload…");
+    }
+
+    for (var i = 0; i < totalChunks; i++) {
+      if (receivedSet[i]) continue; // already on the server from a previous attempt
+      var start = i * chunkSize;
+      var chunk = file.slice(start, Math.min(start + chunkSize, file.size));
+      var chunkResp = await fetch(
+        "/dashboard/imagery/uploads/" + session.sessionId + "/chunks/" + i + "/",
+        { method: "POST", headers: { "X-CSRFToken": CSRF_TOKEN }, body: chunk }
+      );
+      if (!chunkResp.ok) {
+        throw new Error("Chunk " + (i + 1) + " of " + totalChunks + " failed (status " + chunkResp.status + ").");
+      }
+      receivedSet[i] = true;
+      setUploadProgress(progressFill, progressLabel, Math.round((Object.keys(receivedSet).length / totalChunks) * 100));
+    }
+
+    var completeResp = await fetch("/dashboard/imagery/uploads/" + session.sessionId + "/complete/", {
+      method: "POST", headers: { "X-CSRFToken": CSRF_TOKEN },
+    });
+    if (!completeResp.ok) {
+      throw new Error((await completeResp.text()) || "Could not finish the upload.");
+    }
+    window.localStorage.removeItem(resumeKeyFor(file));
+    return await completeResp.json(); // {"image_id": "..."} — see CompleteUploadSessionView
+  }
+
+  // Once georeferencing finishes, starts processing directly against the
+  // block(s) chosen back in openImageUploadForm() — no footprint/checklist
+  // confirm screen in between. ImageConfirmBlocksView's own backend never
+  // required spatial overlap in the first place (only "same farm, has a
+  // boundary" — see BUILD_STATUS.md's matching entry), so pre-picking
+  // blocks before the footprint is even known is a client-side UX
+  // decision, not something the server needed to change for. On failure
+  // (e.g. a picked block's boundary got removed in the meantime), falls
+  // back to showUploadConfirm() so the Manager can still pick different
+  // blocks by hand rather than being stuck with a silently-lost upload.
+  function startProcessingForPreselectedBlocks(imageId, blockIds, confirmDataFallback) {
+    panelEl.innerHTML = "";
+    panelEl.appendChild(el("h2", { class: "panel-heading", text: "Starting processing…" }));
+
+    var formData = new FormData();
+    blockIds.forEach(function (blockId) { formData.append("block_id", blockId); });
+    formData.append("csrfmiddlewaretoken", CSRF_TOKEN);
+    postJson(buildUrl(data.urls.imagery_confirm_blocks, imageId), formData).then(function (json) {
+      if (json.ok) {
+        showFlash(json.message, "success");
+        refreshData(json.farm_map_data, json.focus);
+      } else {
+        showFlash((json.message || "Couldn't start processing automatically.") + " Choose blocks below instead.", "error");
+        if (confirmDataFallback) {
+          showUploadConfirm(confirmDataFallback);
+        } else {
+          renderPanel();
+        }
+      }
+    });
+  }
+
+  // Polls FarmMapView's own AJAX GET (added specifically for this —
+  // see FarmMapView.get()'s _is_ajax() branch) every few seconds until
+  // georeferencing finishes or fails, entirely without a page reload.
+  // `blockIds`, when present, are the block(s) already chosen back in
+  // openImageUploadForm() — processing starts against them automatically
+  // the moment georeferencing finishes (startProcessingForPreselectedBlocks
+  // above). Without them (a direct ?upload_image=<id> landing that never
+  // went through that form — a bookmark, or the full-page upload fallback,
+  // which still only asks for a farm), falls back to the older
+  // footprint/checklist confirm step (showUploadConfirm()) since there's
+  // nothing pre-chosen to act on.
+  function pollUploadStatus(imageId, blockIds) {
+    panelEl.innerHTML = "";
+    panelEl.appendChild(el("h2", { class: "panel-heading", text: "Georeferencing…" }));
+    panelEl.appendChild(el("p", { class: "panel-note", text: "This usually takes a few seconds. This page will update on its own once it's ready — no need to reload." }));
+
+    function poll() {
+      getJson(data.urls.farm_map + "?upload_image=" + encodeURIComponent(imageId)).then(function (json) {
+        var info = json.upload_confirm_image;
+        if (!info || info.georeference_status === "pending") {
+          setTimeout(poll, 3000);
+          return;
+        }
+        if (info.georeference_status === "done") {
+          data = json.farm_map_data;
+          buildIndexes();
+          buildLayers();
+          if (blockIds && blockIds.length) {
+            startProcessingForPreselectedBlocks(imageId, blockIds, data.upload_confirm);
+          } else {
+            showUploadConfirm(data.upload_confirm);
+          }
+        } else {
+          panelEl.innerHTML = "";
+          panelEl.appendChild(el("div", { class: "flash flash-error", text: "Georeferencing failed: " + (info.georeference_error || "unknown error") }));
+          panelEl.appendChild(el("div", { class: "panel-actions" }, [
+            actionButton("Back to map", function () { renderPanel(); }),
+          ]));
+        }
+      });
+    }
+    poll();
+  }
+
+  // --- Panel rendering for the non-form (browsing) states ---
+
+  function renderFarmListPanel() {
+    panelEl.innerHTML = "";
+    panelEl.appendChild(el("h2", { class: "panel-heading", text: "Farms" }));
+    panelEl.appendChild(el("p", { class: "panel-subheading", text: "Select a farm to see its blocks." }));
+    if (!data.farms.length) {
+      panelEl.appendChild(el("p", { class: "panel-empty", text: "No farms in your scope yet." }));
+      return;
+    }
+    var list = el("ul", { class: "panel-list" });
+    data.farms.forEach(function (farm) {
+      var count = (blocksByFarm[farm.id] || []).length;
+      var btn = el("button", { type: "button", class: "panel-list-button" }, [
+        el("span", { text: farm.name }),
+        el("span", { class: "panel-list-meta", text: count + (count === 1 ? " block" : " blocks") }),
+      ]);
+      btn.addEventListener("click", function () { selectFarm(farm.id); });
+      list.appendChild(el("li", {}, [btn]));
+    });
+    panelEl.appendChild(list);
+  }
+
+  function renderFarmDetailPanel() {
+    var farm = farmsById[state.farmId];
+    panelEl.innerHTML = "";
+    panelEl.appendChild(breadcrumb([{ label: "All farms", onClick: clearSelection }]));
+    panelEl.appendChild(el("h2", { class: "panel-heading", text: farm ? farm.name : "Farm" }));
+    var blocks = blocksByFarm[state.farmId] || [];
+    panelEl.appendChild(el("p", { class: "panel-subheading", text: blocks.length + (blocks.length === 1 ? " block" : " blocks") }));
+    panelEl.appendChild(el("div", { class: "panel-actions" }, [
+      actionButton("+ Add block", function () { startBlockAdd(state.farmId); }, "primary-button-small"),
+    ]));
+    if (!blocks.length) {
+      panelEl.appendChild(el("p", { class: "panel-empty", text: "No blocks yet on this farm." }));
+      return;
+    }
+    var list = el("ul", { class: "panel-list" });
+    blocks.forEach(function (block) {
+      var btn = el("button", { type: "button", class: "panel-list-button" }, [
+        el("span", { text: block.name }),
+        el("span", { class: "panel-list-meta", text: block.tree_count + (block.tree_count === 1 ? " tree" : " trees") }),
+      ]);
+      btn.addEventListener("click", function () { selectBlock(block.id); });
+      list.appendChild(el("li", {}, [btn]));
+    });
+    panelEl.appendChild(list);
+  }
+
+  // Shared by renderHarvestPlanningSection() and renderMarkTreesSection()
+  // below — the lasso button, select-all/clear shortcuts, and the actual
+  // checkbox list are identical across every "select several trees"
+  // flow; only the panel-actions button below it differs per flow.
+  function renderTreeSelectionChecklist(block) {
+    var trees = treesByBlock[block.id] || [];
+    if (!trees.length) {
+      panelEl.appendChild(el("p", { class: "panel-empty", text: "No active trees in this block to select." }));
+      return;
+    }
+    var lassoing = interactiveMode && interactiveMode.type === "lasso";
+    panelEl.appendChild(el("div", { class: "panel-actions" }, [
+      actionButton(
+        lassoing ? "Drag on the map… (click to cancel)" : "Lasso select on map",
+        function () {
+          if (lassoing) { exitInteractiveModes(); renderPanel(); }
+          else startLassoSelect(block.id);
+        }
+      ),
+      actionButton("Select all", function () {
+        trees.forEach(function (t) { state.selectedTreeIds[t.id] = true; });
+        renderMap(); renderPanel();
+      }),
+      actionButton("Clear selection", function () {
+        state.selectedTreeIds = {};
+        renderMap(); renderPanel();
+      }),
+    ]));
+    var list = el("ul", { class: "tree-checklist" });
+    trees.forEach(function (tree) {
+      var checkbox = el("input", { type: "checkbox" });
+      checkbox.checked = !!state.selectedTreeIds[tree.id];
+      checkbox.addEventListener("change", function () { toggleTreeSelected(tree.id); });
+      list.appendChild(el("li", {}, [el("label", {}, [checkbox, document.createTextNode(tree.name)])]));
+    });
+    panelEl.appendChild(list);
+  }
+
+  function renderHarvestPlanningSection(block) {
+    panelEl.appendChild(el("p", { class: "panel-note", text: "Check the trees you're planning to harvest — click them on the map, check them below, or drag a lasso around a group. This is a visual reference only for now; the plan itself is created for the whole block." }));
+    renderTreeSelectionChecklist(block);
+    var selectedCount = Object.keys(state.selectedTreeIds).length;
+    panelEl.appendChild(el("div", { class: "panel-actions" }, [
+      actionButton(
+        "Create harvest plan" + (selectedCount ? " (" + selectedCount + " selected)" : ""),
+        function () { startHarvestPlanForm(block); },
+        "primary-button-small"
+      ),
+      actionButton("Cancel", cancelTreeSelection),
+    ]));
+  }
+
+  // Four "select trees, then confirm one action" flows share this section
+  // and submit function — two completion actions (record harvest/
+  // fertilizer directly, Manager-only shortcut for MarkTreesHarvestedView/
+  // MarkTreesFertilizedView) and, new this round, two stage-1 assignment
+  // actions (flag trees as needing harvest/fertilizer for the assigned PIC
+  // Block user to complete in the field app — MarkTreesNeedHarvestView/
+  // MarkTreesNeedFertilizeView). See Tree.harvest_marked_at's help_text
+  // (apps/trees/models.py) for the full two-stage workflow. `needsDate`
+  // is what tells them apart in this UI: completion records *when* the
+  // work happened (defaults to today, editable), assignment is just "now."
+  var MARK_MODE_CONFIG = {
+    mark_harvested: { verb: "harvested", url: "trees_mark_harvested", needsDate: true, noun: "harvest" },
+    mark_fertilized: { verb: "fertilized", url: "trees_mark_fertilized", needsDate: true, noun: "fertilizer" },
+    mark_need_harvest: { verb: "needing harvest", url: "trees_mark_need_harvest", needsDate: false, noun: "harvest" },
+    mark_need_fertilize: { verb: "needing fertilizer", url: "trees_mark_need_fertilize", needsDate: false, noun: "fertilizer" },
+  };
+
+  function renderMarkTreesSection(block, mode) {
+    var cfg = MARK_MODE_CONFIG[mode];
+    var intervalDays = cfg.noun === "harvest" ? block.effective_harvest_interval_days : block.effective_fertilizer_interval_days;
+    var noteText = cfg.needsDate
+      ? "Select the trees you just " + cfg.verb + " — click them on the map, check them below, or drag a lasso around a group — then confirm. Current interval for this block: every " + intervalDays + " days."
+      : "Select the trees that need " + cfg.noun + " — click them on the map, check them below, or drag a lasso around a group — then confirm. The PIC Block user assigned to this block will see these as a to-do in the field app.";
+    panelEl.appendChild(el("p", { class: "panel-note", text: noteText }));
+    renderTreeSelectionChecklist(block);
+
+    var dateInput = null;
+    if (cfg.needsDate) {
+      dateInput = el("input", { type: "date", name: "date" });
+      dateInput.value = new Date().toISOString().slice(0, 10);
+      panelEl.appendChild(el("label", { text: "Date", style: "display:block;margin-top:8px;" }));
+      panelEl.appendChild(dateInput);
+    }
+
+    var selectedCount = Object.keys(state.selectedTreeIds).length;
+    panelEl.appendChild(el("div", { class: "panel-actions", style: "margin-top:10px;" }, [
+      actionButton(
+        "Mark " + selectedCount + " tree" + (selectedCount === 1 ? "" : "s") + " " + cfg.verb,
+        function () { submitMarkTrees(block, mode, dateInput ? dateInput.value : null); },
+        "primary-button-small"
+      ),
+      actionButton("Cancel", cancelTreeSelection),
+    ]));
+  }
+
+  // Single-tree shortcut for the tree detail panel (renderTreeDetailPanel()
+  // below) — a Manager looking at one already-"marked" tree shouldn't have
+  // to go back to the block panel and re-select it from a checklist just
+  // to complete it. Reuses the same completion endpoints as the bulk flow
+  // (mark_harvested/mark_fertilized), just with a one-tree FormData built
+  // directly rather than going through state.selectedTreeIds.
+  function quickMarkTreeDone(tree, block, mode) {
+    var cfg = MARK_MODE_CONFIG[mode];
+    var formData = new FormData();
+    formData.append("tree_ids", tree.id);
+    formData.append("date", new Date().toISOString().slice(0, 10));
+    formData.append("csrfmiddlewaretoken", CSRF_TOKEN);
+    postJson(buildUrl(data.urls[cfg.url], block.id), formData).then(function (json) {
+      if (json.ok) {
+        showFlash(json.message, "success");
+        refreshData(json.farm_map_data, json.focus);
+      } else {
+        showFlash(json.message || "Couldn't save that.", "error");
+      }
+    });
+  }
+
+  function submitMarkTrees(block, mode, dateValue) {
+    var treeIds = Object.keys(state.selectedTreeIds);
+    if (!treeIds.length) { showFlash("Select at least one tree first.", "error"); return; }
+    var cfg = MARK_MODE_CONFIG[mode];
+    var url = data.urls[cfg.url];
+    var formData = new FormData();
+    treeIds.forEach(function (id) { formData.append("tree_ids", id); });
+    if (dateValue) formData.append("date", dateValue);
+    formData.append("csrfmiddlewaretoken", CSRF_TOKEN);
+    postJson(buildUrl(url, block.id), formData).then(function (json) {
+      if (json.ok) {
+        exitInteractiveModes();
+        state.planningBlockId = null;
+        state.selectionMode = null;
+        showFlash(json.message, "success");
+        refreshData(json.farm_map_data, json.focus);
+      } else {
+        showFlash(json.message || "Couldn't save that.", "error");
+      }
+    });
+  }
+
+  // Lets a Manager pick which one uploaded image displays on the map for
+  // this block, from the images actually PROCESSED against it
+  // (block.processed_image_ids — real ImageProcessingRun history, see
+  // _build_farm_map_data()) — never an image merely reached by its
+  // footprint, reported directly: "uploaded image should only sign into
+  // chosen block." Without this picker, every processed image would just
+  // stack on top of each other at block level, which gets unreadable once
+  // a block has more than one.
+  function renderImageryPickerSection(block) {
+    var processed = block.processed_image_ids || [];
+    panelEl.appendChild(el("p", { class: "panel-subheading", text: "Imagery on map", style: "margin-top:14px;" }));
+    if (!processed.length) {
+      panelEl.appendChild(el("p", { class: "panel-empty", text: "No imagery processed against this block yet." }));
+      return;
+    }
+    var current = selectedImageForBlock(block.id);
+    var list = el("ul", { class: "panel-list" });
+
+    function optionButton(label, imageId, metaText) {
+      var isSelected = current === imageId;
+      var btn = el("button", {
+        type: "button",
+        class: "panel-list-button" + (isSelected ? " selected" : ""),
+      }, [
+        el("span", { text: label }),
+        el("span", { class: "panel-list-meta", text: metaText || "" }),
+      ]);
+      btn.addEventListener("click", function () {
+        state.selectedImageByBlock[block.id] = imageId;
+        renderMap();
+        renderPanel();
+      });
+      return btn;
+    }
+
+    list.appendChild(el("li", {}, [optionButton("None (hide imagery)", null)]));
+    processed.forEach(function (imageId) {
+      var image = imagesById[imageId];
+      if (!image) return;
+      var label = image.captured_at ? new Date(image.captured_at).toLocaleDateString() : "Undated upload";
+      // Every entry here has a real ImageProcessingRun against this block
+      // (processed_image_ids guarantees that much) — but the clip-persist
+      // step can still have failed for it (run.clip_persist_error —
+      // best-effort, never blocks the run itself). renderMap() shows
+      // nothing on the map for a pick with no successful clip (see its
+      // own docstring), so this tells the Manager why, right where
+      // they're picking it, rather than leaving an unexplained blank map.
+      var hasClip = (block.clipped_images || []).some(function (c) { return c.image_id === imageId; });
+      var metaText = hasClip ? "" : "Processed, but no clipped preview yet";
+      list.appendChild(el("li", {}, [optionButton(label, imageId, metaText)]));
+    });
+    panelEl.appendChild(list);
+  }
+
+  function renderBlockDetailPanel() {
+    var block = blocksById[state.blockId];
+    var farm = farmsById[state.farmId];
+    panelEl.innerHTML = "";
+    panelEl.appendChild(breadcrumb([
+      { label: "All farms", onClick: clearSelection },
+      { label: farm ? farm.name : "Farm", onClick: function () { selectFarm(state.farmId); } },
+    ]));
+    panelEl.appendChild(el("h2", { class: "panel-heading", text: block.name }));
+    panelEl.appendChild(el("p", { class: "panel-subheading", text: block.has_boundary ? "Boundary drawn" : "No boundary drawn yet" }));
+
+    panelEl.appendChild(el("div", { class: "detail-list" }, [
+      detailRow("Commodity", block.commodity || "—"),
+      detailRow("Area", block.area ? block.area + " ha" : "—"),
+      detailRow("Planting year", block.year || "—"),
+      detailRow("PIC Block", block.pic_name || "—"),
+      detailRow("Active trees", String(block.tree_count)),
+    ]));
+
+    renderImageryPickerSection(block);
+
+    // Yield history — surfaces ActualHarvest rows that were already being
+    // recorded by the harvest-logging pipeline (apps/operations/models.py)
+    // but had no dashboard visibility until now; see
+    // _recent_yield_by_block() in views.py. Read-only, bounded to the 10
+    // most recent per block.
+    panelEl.appendChild(el("p", { class: "panel-subheading", text: "Yield history", style: "margin-top:14px;" }));
+    if (block.recent_yield && block.recent_yield.length) {
+      var yieldList = el("ul", { class: "panel-list" });
+      block.recent_yield.forEach(function (entry) {
+        yieldList.appendChild(el("li", { class: "panel-list-button" }, [
+          el("span", { text: new Date(entry.date).toLocaleDateString() }),
+          el("span", { class: "panel-list-meta", text: "Qty " + entry.quantity }),
+        ]));
+      });
+      panelEl.appendChild(yieldList);
+    } else {
+      panelEl.appendChild(el("p", { class: "panel-empty", text: "No harvest yield recorded for this block yet." }));
+    }
+
+    panelEl.appendChild(el("div", { class: "panel-actions" }, [
+      actionButton(block.has_boundary ? "Edit boundary" : "Draw boundary", function () { startBoundaryEdit(block); }, "primary-button-small"),
+      actionButton("Edit block", function () { startBlockEdit(block); }),
+      el("a", { href: buildUrl(data.urls.imagery_block, block.id), class: "secondary-button", text: "Imagery" }),
+      actionButton("Delete block", function () { startBlockDelete(block); }),
+    ]));
+
+    if (state.planningBlockId === block.id && state.selectionMode === "harvest_plan") {
+      renderHarvestPlanningSection(block);
+    } else if (state.planningBlockId === block.id && state.selectionMode) {
+      renderMarkTreesSection(block, state.selectionMode);
+    } else {
+      panelEl.appendChild(el("p", { class: "panel-subheading", text: "Harvest", style: "margin-top:14px;" }));
+      panelEl.appendChild(el("div", { class: "panel-actions" }, [
+        actionButton("Plan harvest — select trees", function () { startTreeSelection(block.id, "harvest_plan"); }, "primary-button-small"),
+        actionButton("Mark trees needing harvest", function () { startTreeSelection(block.id, "mark_need_harvest"); }),
+        actionButton("Record harvest directly", function () { startTreeSelection(block.id, "mark_harvested"); }),
+      ]));
+      panelEl.appendChild(el("p", { class: "panel-subheading", text: "Fertilizer", style: "margin-top:14px;" }));
+      panelEl.appendChild(el("div", { class: "panel-actions" }, [
+        actionButton("Plan fertilizer application", function () { startFertilizerPlanForm(block); }, "primary-button-small"),
+        actionButton("Mark trees needing fertilizer", function () { startTreeSelection(block.id, "mark_need_fertilize"); }),
+        actionButton("Record fertilizer directly", function () { startTreeSelection(block.id, "mark_fertilized"); }),
+      ]));
+    }
+
+    // <details>/<summary> instead of always-expanded — a block with a real
+    // farm's worth of trees (dozens to hundreds, per the cluster counts on
+    // the map itself) turned this into a long scroll every time, reported
+    // directly as "make it drop down so it will be more neat." Collapsed
+    // by default (no `open` attribute); native disclosure behavior, no
+    // extra JS needed for the expand/collapse itself.
+    var treesSection = el("details", { class: "panel-collapsible", style: "margin-top:20px;" });
+    treesSection.appendChild(el("summary", { class: "panel-heading" }, [
+      document.createTextNode("Trees (" + ((treesByBlock[block.id] || []).length) + ")"),
+    ]));
+    treesSection.appendChild(el("div", { class: "panel-actions" }, [
+      actionButton("+ Add tree", function () { startTreeAdd(block); }, "primary-button-small"),
+    ]));
+
+    var trees = treesByBlock[block.id] || [];
+    if (!trees.length) {
+      treesSection.appendChild(el("p", { class: "panel-empty", text: "No active trees recorded in this block yet." }));
+    } else {
+      var list = el("ul", { class: "panel-list" });
+      trees.forEach(function (tree) {
+        var btn = el("button", { type: "button", class: "panel-list-button" }, [
+          el("span", { text: tree.name }),
+          el("span", { class: "panel-list-meta", text: tree.health_display }),
+        ]);
+        btn.addEventListener("click", function () { selectTree(tree.id); });
+        list.appendChild(el("li", {}, [btn]));
+      });
+      treesSection.appendChild(list);
+    }
+    panelEl.appendChild(treesSection);
+  }
+
+  function renderTreeDetailPanel() {
+    var tree = treesById[state.treeId];
+    var block = blocksById[state.blockId];
+    var farm = farmsById[state.farmId];
+    panelEl.innerHTML = "";
+    panelEl.appendChild(breadcrumb([
+      { label: "All farms", onClick: clearSelection },
+      { label: farm ? farm.name : "Farm", onClick: function () { selectFarm(state.farmId); } },
+      { label: block ? block.name : "Block", onClick: function () { selectBlock(state.blockId); } },
+    ]));
+    panelEl.appendChild(el("h2", { class: "panel-heading", text: tree.name }));
+    panelEl.appendChild(el("div", { class: "detail-list" }, [
+      detailRow("Health", tree.health_display),
+      detailRow("Source", tree.source_display),
+      detailRow("Harvest", formatIntervalDetail(
+        tree.last_harvested_at, tree.harvest_stage, block ? block.effective_harvest_interval_days : "?",
+        tree.harvest_marked_at, tree.harvest_marked_by_name
+      )),
+      detailRow("Fertilizer", formatIntervalDetail(
+        tree.last_fertilized_at, tree.fertilizer_stage, block ? block.effective_fertilizer_interval_days : "?",
+        tree.fertilizer_marked_at, tree.fertilizer_marked_by_name
+      )),
+    ]));
+
+    // Quick single-tree completion — only shown when there's actually a
+    // pending stage-1 flag on this tree (see quickMarkTreeDone() above).
+    var quickActions = [];
+    if (tree.harvest_stage === "marked" && block) {
+      quickActions.push(actionButton(
+        "Mark harvested (today)", function () { quickMarkTreeDone(tree, block, "mark_harvested"); }, "primary-button-small"
+      ));
+    }
+    if (tree.fertilizer_stage === "marked" && block) {
+      quickActions.push(actionButton(
+        "Mark fertilized (today)", function () { quickMarkTreeDone(tree, block, "mark_fertilized"); }, "primary-button-small"
+      ));
+    }
+    if (quickActions.length) {
+      panelEl.appendChild(el("div", { class: "panel-actions" }, quickActions));
+    }
+
+    panelEl.appendChild(el("div", { class: "panel-actions" }, [
+      actionButton("Edit tree", function () { startTreeEdit(tree); }, "primary-button-small"),
+      actionButton("Mark removed", function () { removeTree(tree); }, "link-button-danger"),
+    ]));
+
+    renderTreeHealthHistory(tree.id);
+  }
+
+  // On-demand tree health-by-date history — surfaces TreeHealthClassification
+  // rows (apps/imagery/models.py) already recorded by the detect+classify
+  // pipeline but never shown anywhere before. Fetched separately rather than
+  // baked into the main farm_map_data payload — see TreeHealthHistoryView's
+  // docstring in views.py for why (that payload refetches after every write
+  // action and a farm can have far more trees than blocks).
+  function renderTreeHealthHistory(treeId) {
+    var container = el("div", {}, [
+      el("h2", { class: "panel-heading", text: "Health history", style: "margin-top:20px;" }),
+      el("p", { class: "panel-empty", text: "Loading…" }),
+    ]);
+    panelEl.appendChild(container);
+    getJson(buildUrl(data.urls.tree_health_history, treeId)).then(function (json) {
+      if (state.treeId !== treeId) return; // user navigated to a different tree before this resolved
+      container.innerHTML = "";
+      container.appendChild(el("h2", { class: "panel-heading", text: "Health history", style: "margin-top:20px;" }));
+      if (!json.history || !json.history.length) {
+        container.appendChild(el("p", { class: "panel-empty", text: "No drone-based health assessments recorded yet for this tree." }));
+        return;
+      }
+      var list = el("ul", { class: "panel-list" });
+      json.history.forEach(function (entry) {
+        var confidencePct = Math.round(entry.confidence * 100);
+        var meta = confidencePct + "%" + (entry.reviewed ? " · reviewed" : "");
+        list.appendChild(el("li", { class: "panel-list-button" }, [
+          el("span", { text: new Date(entry.date).toLocaleDateString() + " — " + entry.label_display }),
+          el("span", { class: "panel-list-meta", text: meta }),
+        ]));
+      });
+      container.appendChild(list);
+    });
+  }
+
+  function renderPanel() {
+    if (state.treeId) renderTreeDetailPanel();
+    else if (state.blockId) renderBlockDetailPanel();
+    else if (state.farmId) renderFarmDetailPanel();
+    else renderFarmListPanel();
+  }
+
+  // Restore context after a fresh page load or bookmark (?farm=/?block=/
+  // ?tree=) — read once, not kept in sync with browser history afterward
+  // (true client-side URL state was considered and explicitly deferred
+  // as a bigger, separate lift than warranted here — see BUILD_STATUS.md).
+  var params = new URLSearchParams(window.location.search);
+  var initialTree = params.get("tree");
+  var initialBlock = params.get("block");
+  var initialFarm = params.get("farm");
+
+  buildIndexes();
+  buildLayers();
+  repopulateBlockOptions(null);
+  if (data.upload_confirm) {
+    var preselectBlocks = params.getAll("preselect_block");
+    if (preselectBlocks.length) {
+      // Reached via the Imagery list page's own "Process against
+      // block(s)" checklist (ImageListUploadView.post()'s matching
+      // ?preselect_block=<id> query params) — skip the manual
+      // overlap-suggested confirm screen and go straight into processing,
+      // the same startProcessingForPreselectedBlocks() path
+      // openImageUploadForm()'s in-panel checklist already uses, just fed
+      // from the URL instead of an in-page JS variable since this is a
+      // real navigation between two different pages.
+      startProcessingForPreselectedBlocks(data.upload_confirm.image.id, preselectBlocks, data.upload_confirm);
+    } else {
+      // Reached via a bare ?upload_image=<id> on a fresh page load/
+      // bookmark whose georeferencing was already done by the time the
+      // page loaded — the same showUploadConfirm() the in-page upload
+      // flow's own poll calls once its upload finishes (see
+      // pollUploadStatus() above).
+      showUploadConfirm(data.upload_confirm);
+    }
+  } else if (initialTree && treesById[initialTree]) {
+    selectTree(initialTree);
+  } else if (initialBlock && blocksById[initialBlock]) {
+    selectBlock(initialBlock);
+  } else if (initialFarm && farmsById[initialFarm]) {
+    selectFarm(initialFarm);
+  } else {
+    renderMap();
+    renderPanel();
+  }
+})();
+</script>
+{% endif %}
+{% endblock %}

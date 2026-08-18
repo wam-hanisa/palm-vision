@@ -1,0 +1,69 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Harvest batches{% endblock %}
+{% block page_title %}Harvest batches &amp; due-diligence export{% endblock %}
+{% block content %}
+<nav class="subnav">
+  <a href="{% url 'dashboard:compliance-documents' %}">Documents</a>
+  <a href="{% url 'dashboard:compliance-batches' %}" class="active">Batches &amp; export</a>
+  <a href="{% url 'dashboard:compliance-baselines' %}">Deforestation baselines</a>
+  <a href="{% url 'dashboard:compliance-audits' %}">Audits</a>
+  <a href="{% url 'dashboard:compliance-grievances' %}">Grievances</a>
+</nav>
+
+{% if export_result %}
+<section class="panel">
+  <h2 class="section-heading">Due-diligence package — batch {{ export_batch_id }}</h2>
+  <p class="panel-note">Exported. This block: {{ export_result.farm_block.name }} ({{ export_result.farm_block.area_hectares|default:"—" }} ha).</p>
+  <table class="data-table">
+    <tbody>
+      <tr><th>Period</th><td>{{ export_result.period_start }} – {{ export_result.period_end }}</td></tr>
+      <tr><th>Total quantity</th><td>{{ export_result.total_quantity }}</td></tr>
+      <tr><th>Total weight (kg)</th><td>{{ export_result.total_weight_kg }}</td></tr>
+      <tr><th>Deforestation baseline</th>
+        <td>
+          {% if export_result.deforestation_baseline %}
+            {{ export_result.deforestation_baseline.status }}
+          {% else %}
+            <span class="tag tag-warning">No baseline recorded</span>
+          {% endif %}
+        </td>
+      </tr>
+      <tr><th>Requires GeoJSON polygon (EUDR &ge;4ha rule)</th>
+        <td>{{ export_result.plot_geometry.properties.requires_geojson_polygon_per_eudr_4ha_rule|yesno:"Yes,No" }}</td></tr>
+      <tr><th>Generated at</th><td>{{ export_result.generated_at }}</td></tr>
+    </tbody>
+  </table>
+  <p class="panel-note">Risk assessment, supplier, and HS code are not yet collected by this system and are left blank in the filed package.</p>
+</section>
+{% endif %}
+
+<section>
+  <h2 class="section-heading">Batches</h2>
+  {% if not batches %}
+    <p class="empty-state">No harvest batches yet.</p>
+  {% else %}
+    <table class="data-table">
+      <thead><tr><th>Block</th><th>Period</th><th>Export status</th><th></th></tr></thead>
+      <tbody>
+        {% for batch in batches %}
+        <tr>
+          <td>{{ batch.farm_block.name }} — {{ batch.farm_block.farm.name }}</td>
+          <td>{{ batch.period_start }} – {{ batch.period_end }}</td>
+          <td>
+            {% if batch.export_status == "exported" %}<span class="tag tag-success">Exported</span>
+            {% else %}<span class="tag tag-warning">Draft</span>{% endif %}
+          </td>
+          <td>
+            <form method="post" class="inline-form">
+              {% csrf_token %}
+              <input type="hidden" name="batch_id" value="{{ batch.id }}">
+              <button type="submit" class="link-button-accent">Export due-diligence package</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</section>
+{% endblock %}

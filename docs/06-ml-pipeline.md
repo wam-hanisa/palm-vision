@@ -32,7 +32,13 @@ Block-scoping has two distinct layers, both required:
 
 **Belt-and-suspenders check:** every resulting detection's GPS point is also validated against the block polygon with a PostGIS `within` lookup before being persisted, catching any clipping edge artifacts.
 
-**Model:** a real-time object detector such as YOLOv8 (or Faster R-CNN, more accurate but slower), fine-tuned on labeled bounding boxes around palm tree crowns. Needs its own labeled dataset — separate from classification labels.
+**Current state: a real trained model, not a downloaded pretrained one.** `apps/imagery/ml/detection.py`'s `_load_real_detector()` loads a Faster R-CNN (ResNet50-FPN-v2, via `torchvision.models.detection`), single foreground class ("oilpalm"), trained by the project owner directly through the sibling `palm-vision-ml` project's `tree_health_pipeline` on the Roboflow "tree-detection" dataset (197,332 boxes across 2,724 images). One fold of a configured 5-fold cross-validation actually ran (6 epochs; `max_folds=1` stopped the run after fold 0, so this is validated on one train/val split, not full k-fold — worth knowing before trusting the numbers below as more than a single-split estimate). Held-out metrics from that fold: detection precision 0.989, recall 0.961 (mean per-image), tree-count MAE 6.11 versus a naive-baseline MAE of 11.10. These are the model's own held-out numbers on data drawn from the source dataset — not yet confirmed against this project's own farm imagery.
+
+**This supersedes the project's earlier recommendation of a downloaded Roboflow YOLO model** (Oil Palm Tree Crown Detection from Aerial Image, YOLOv11n) — that model was never actually wired in (`DETECTION_MODEL_PATH` stayed unset the entire time it was the documented recommendation), and `apps/imagery/ml/detection.py`'s loader no longer understands the Ultralytics checkpoint format at all; it's specifically built around this project's own Faster R-CNN checkpoint shape.
+
+**Tiling is load-bearing, not an optimization.** This model was trained on tiles around 1024×1024px (the source dataset's own median image size) — a real block-clipped orthomosaic region is typically much larger. `_load_real_detector()` ports the training pipeline's own tiling design (`ingestion.py`'s `OrthomosaicLoader.tile_generator()`: 1024px tiles, 128px overlap) for the already-in-memory clipped array, then applies a world-coordinate NMS pass (ported from `crown_detection.py`'s `merge_detections_world_nms()`) to undo the double-counting that overlapping tiles would otherwise cause for any crown straddling a tile seam. Skipping tiling isn't a smaller/simpler version of this feature — it either silently destroys small-object detail via the model's internal downsampling, or reproduces the CUDA out-of-memory crash actually hit once during this model's own training (its own post-training evaluation step ran the model directly against a full, untiled image and crashed — see BUILD_STATUS.md's matching update for the traceback).
+
+**A real coordinate-reprojection bug, fixed while wiring this in, not left for later.** A detector's contract is `(clipped_array, transform, crs) -> list of (lon, lat, confidence)` in true EPSG:4326 coordinates. `transform * (px, py)` only ever produces a point in the raster's own native CRS (UTM meters, for a projected orthomosaic) — the previous YOLO-based loader fed that straight into the contract unreprojected, silently wrong for any raster not already in EPSG:4326, despite this function's own docstring always promising geographic coordinates. Never exercised end-to-end before now (no detector was ever actually configured), but fixed here — see `_reproject_point_to_lonlat()` — rather than carried forward into the first detector that actually runs for real.
 
 ### Matching against the existing tree registry
 
@@ -53,36 +59,24 @@ Tree.objects.filter(
 
 **Edge case:** a detection near a soft-deleted (`status=removed`) tree's old location should be flagged `ambiguous` ("possible regrowth"), not auto-matched to the dead record or auto-created as new — that's a human judgment call.
 
-### Function 2 — classify health (ResNet-18)
+### Function 2 — classify health (real trained ResNet-18, 10-channel input)
 
-Runs on the cropped patch for each `matched` detection (and any `new_candidate` once confirmed) — not the whole image. A 3-class classifier (healthy/small/yellow) is exactly what ResNet-18 is suited to; ~11M parameters, CPU-inference-viable at this volume, transfer learning from ImageNet weights.
+Runs on the cropped patch for each `matched` detection (and any `new_candidate` once confirmed) — not the whole image.
 
-Illustrative inference shape (not tested, just the pattern — detection follows the same "load model once, run inference, write a result row" shape):
+**Current state: a real from-scratch-trained model, not a sketch or an adapter.** `apps/imagery/ml/classification.py`'s `_load_real_classifier()` loads `trained_models/oil_palm_health_classifier.pth` — a ResNet-18 the project owner trained directly (via the sibling `palm-vision-ml` project's `tree_health_pipeline`) on the full 352,551-box Roboflow "Oil-Palm-Health" dataset (CC BY 4.0), with a tile-ID-grouped 80/20 spatial split and class-weighted loss for the dataset's ~413:1 class imbalance. Validation metrics embedded in the checkpoint itself (18 epochs): accuracy 0.957, macro F1 0.806, against a 0.288-accuracy/0.089-macro-F1 majority-class baseline for the same split. These are the model's own numbers on data drawn from the source dataset — not yet confirmed against this project's own farm imagery (see BUILD_STATUS.md's matching update for what's still open).
 
-```python
-import torch
-from torchvision import models, transforms
-from PIL import Image
+**The input contract is genuinely different from a plain RGB classifier, and every part of it matters:**
 
-model = models.resnet18(weights=None)
-model.fc = torch.nn.Linear(model.fc.in_features, 3)
-model.load_state_dict(torch.load("palm_health_resnet18.pt", map_location="cpu"))
-model.eval()
+- **10 input channels**: RGB + 7 RGB-derived vegetation indices (VARI, GLI, ExG, ExGR, NGRDI, MGRVI, RGBVI — `apps/imagery/ml/vegetation_indices.py`, a faithful port of the training pipeline's own module) stacked in that exact order. The first conv layer's weights are shaped `(64, 10, 7, 7)`, not `(64, 3, 7, 7)` — feeding this model plain RGB would silently corrupt every prediction, not just reduce accuracy.
+- **96×96 patches** (the checkpoint's own `patch_size` field, trusted at load time over any hardcoded constant).
+- **Normalization**: RGB channels divided by 255.0 (uint8 assumed); VI channels are raw index values with NaN/Inf replaced by 0.0. No ImageNet mean/std normalization on either.
+- **Why RGB-only VIs, not NDVI/NDRE**: this project's drone imagery has no near-infrared or red-edge band, so the standard reflectance-based stress indices are not computable — see `vegetation_indices.py`'s own module docstring for the full domain-constraint explanation. These seven are a weaker, visible-light proxy for greenness, useful as auxiliary CNN input features, not a stress diagnostic on their own.
 
-preprocess = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-])
+**5-class model, 3-class app schema — a deliberate product decision.** The checkpoint classifies into 5 classes (HEALTHY, SMALL, YELLOW, DEAD, GRASS — the real class distribution measured directly from the source dataset's own annotations), but `Tree.current_health`/`TreeHealthClassification.HEALTH_CHOICES` only keeps three stored values: healthy/unknown/yellow. SMALL predictions map to `unknown` (an explicit mapping, not a fall-through — the model's real confidence is kept) rather than being kept as their own "small" label — asked directly, after this doc's original healthy/small/yellow scheme shipped. DEAD/GRASS predictions still route to human review — never silently forced into one of the three real labels, the same "unmapped class routes to review" convention the classifier's predecessor already established. See `apps/imagery/ml/classification.py`'s module docstring for the full reasoning and `_HEALTH_LABEL_MAP`. This is revisitable — the model already produces a dead-palm signal, it's just not surfaced as app data yet.
 
-def classify_tree_crop(crop: Image.Image) -> tuple[str, float]:
-    labels = ["healthy", "small", "yellow"]
-    x = preprocess(crop).unsqueeze(0)
-    with torch.no_grad():
-        probs = torch.softmax(model(x), dim=1)[0]
-    idx = int(probs.argmax())
-    return labels[idx], float(probs[idx])
-```
+**History, briefly** (see BUILD_STATUS.md for the full account): this section originally sketched an untested ResNet-18 shape close to today's real one. Between that sketch and today's real model, this function was temporarily backed by an adapted Roboflow YOLO *detector* (its highest-confidence box's class, reinterpreted as a classification label) — a stopgap chosen only because no compatible pretrained crop classifier existed publicly at the time, and no from-scratch model had been trained yet. That adapter is gone; the function above is what's actually running now.
+
+**Two real fixes for this project's own imagery, found against real Jonggol farm data, not the source dataset's held-out split**: (1) **Exposure/color normalization** — a per-channel brightness/color-balance mismatch between Jonggol's Pix4D-processed orthomosaic and the training data's own reference level pushed every crop to a spurious "SMALL" verdict at 100% confidence; `apps/imagery/ml/classification.py`'s `normalize_exposure()` corrects it, opt-in via `settings.CLASSIFICATION_NORMALIZE_EXPOSURE` (enabled for this deployment specifically, since unconditionally applying it regresses accuracy on in-distribution imagery). (2) **Ground-sample-distance normalization** — the same class of bug `_native_gsd_m()`/`DETECTION_TARGET_GSD_M` fixed for detection above, but never applied to classification: `crop_patch()` always cropped a fixed 96 NATIVE pixels straight out of the clipped array regardless of its real resolution, so at Jonggol's ~1.843cm/pixel that patch covered only ~1.77m of real ground — close-up leaf/frond texture, not a crown. `classification_native_patch_size_px()`/`CLASSIFICATION_TARGET_GSD_M` (≈15cm/pixel, derived the same way from the health-condition dataset's own ~43px median crown box) scales the native crop window so it covers roughly the same real-world ground the training patches did, before the existing resize-to-96×96 step. See `classification.py`'s own module docstring for both fixes' full writeups.
 
 ### Full pipeline sequence
 
@@ -96,9 +90,9 @@ def classify_tree_crop(crop: Image.Image) -> tuple[str, float]:
 
 No global/bare map view for reviewing imagery or triggering detection. Every screen in this pipeline (upload, review queue, detection results) is reached by navigating Farm Block → Imagery → Image — the block is always already selected before any map or detection action is available.
 
-## Labeling data — the real bottleneck, not the model
+## Labeling data — the real bottleneck for detection; addressed for classification
 
-The detector needs bounding boxes drawn around trees in sample images; the classifier needs individual crops tagged with true health status. Neither exists yet — the original app only ever captured block-level counts. As a rough starting estimate (not a guarantee — depends on how visually distinct the health classes are and how cluttered canopies are for detection), transfer learning with ResNet-18 often gets usable classification results from a few hundred labeled crops per class; the detector typically needs more. Plan on: the review-queue UI doubling as the labeling interface (confirming/correcting during normal operation *is* the labeling process), and treating early deployed models as decision-support flagging candidates for human confirmation, not an autonomous replacement, until validated over at least one full season.
+The detector still needs bounding boxes drawn around trees in sample images — no trained crown detector exists yet (see Function 1's update above; `trained_models/crown_detector_run/` has a training attempt in progress but no completed weights). The classifier's original gap (individual crops tagged with true health status) is now addressed, though not with this project's own field labels — the real trained model (Function 2 above) learned from the source Roboflow dataset's 352,551 externally-labeled boxes, not from this plantation's own confirmed/corrected detections. That's still a real gap worth tracking: the review-queue UI doubling as a labeling interface (confirming/correcting during normal operation *is* the labeling process) is how this project's *own* label data accumulates over time, and would be the basis for ever retraining on this plantation's specific conditions rather than the source dataset's. Treat the current deployed classifier as decision-support flagging for human confirmation, not an autonomous replacement, until validated over at least one full season against this project's own imagery.
 
 ## Where this runs
 

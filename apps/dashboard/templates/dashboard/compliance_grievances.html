@@ -1,0 +1,71 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Grievances{% endblock %}
+{% block page_title %}Grievances{% endblock %}
+{% block content %}
+<nav class="subnav">
+  <a href="{% url 'dashboard:compliance-documents' %}">Documents</a>
+  <a href="{% url 'dashboard:compliance-batches' %}">Batches &amp; export</a>
+  <a href="{% url 'dashboard:compliance-baselines' %}">Deforestation baselines</a>
+  <a href="{% url 'dashboard:compliance-audits' %}">Audits</a>
+  <a href="{% url 'dashboard:compliance-grievances' %}" class="active">Grievances</a>
+</nav>
+
+<section class="panel">
+  <h2 class="section-heading">Log a grievance</h2>
+  <form method="post" class="stacked-form">
+    {% csrf_token %}
+    {% if form.non_field_errors %}<div class="flash flash-error">{{ form.non_field_errors.0 }}</div>{% endif %}
+
+    <label for="{{ form.farm.id_for_label }}">Farm</label>
+    {{ form.farm }}
+    {% if form.farm.errors %}<div class="field-error">{{ form.farm.errors.0 }}</div>{% endif %}
+
+    <label for="{{ form.date_reported.id_for_label }}">Date reported</label>
+    {{ form.date_reported }}
+    {% if form.date_reported.errors %}<div class="field-error">{{ form.date_reported.errors.0 }}</div>{% endif %}
+
+    <label for="{{ form.description.id_for_label }}">Description</label>
+    {{ form.description }}
+    {% if form.description.errors %}<div class="field-error">{{ form.description.errors.0 }}</div>{% endif %}
+
+    <button type="submit" class="primary-button primary-button-inline">Log grievance</button>
+  </form>
+</section>
+
+<section>
+  <h2 class="section-heading">Grievances on file</h2>
+  {% if not grievances %}
+    <p class="empty-state">No grievances logged yet.</p>
+  {% else %}
+    <table class="data-table">
+      <thead><tr><th>Farm</th><th>Reported</th><th>Description</th><th>Status</th><th>Update</th></tr></thead>
+      <tbody>
+        {% for grievance in grievances %}
+        <tr>
+          <td>{{ grievance.farm.name }}</td>
+          <td>{{ grievance.date_reported }}</td>
+          <td>{{ grievance.description|truncatechars:80 }}</td>
+          <td>
+            {% if grievance.status == "resolved" %}<span class="tag tag-success">Resolved</span>
+            {% elif grievance.status == "investigating" %}<span class="tag tag-warning">Investigating</span>
+            {% else %}<span class="tag tag-danger">Open</span>{% endif %}
+          </td>
+          <td>
+            <form method="post" action="{% url 'dashboard:compliance-grievance-update' grievance.id %}" class="inline-form">
+              {% csrf_token %}
+              <select name="status">
+                {% for value, label in status_choices %}
+                <option value="{{ value }}" {% if value == grievance.status %}selected{% endif %}>{{ label }}</option>
+                {% endfor %}
+              </select>
+              <input type="text" name="resolution_notes" value="{{ grievance.resolution_notes }}" placeholder="Resolution notes">
+              <button type="submit" class="link-button-accent">Save</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</section>
+{% endblock %}

@@ -1,10 +1,13 @@
-from django.db.models import Q
 from rest_framework import viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from .models import Farm, FarmBlock, UserFarmRole
+from apps.common.permissions import user_role_on_farm
+from apps.common.scoping import scoped_farm_blocks, scoped_farms
+
+from .models import FarmBlock, UserFarmRole
 from .serializers import (
     FarmBlockGeoSerializer,
     FarmBlockSerializer,
@@ -28,11 +31,7 @@ class FarmViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        user = self.request.user
-        if user.is_superuser:
-            return Farm.objects.all()
-        farm_ids = UserFarmRole.objects.filter(user=user).values_list("farm_id", flat=True)
-        return Farm.objects.filter(id__in=farm_ids)
+        return scoped_farms(self.request.user)
 
 
 class FarmBlockViewSet(viewsets.ModelViewSet):
@@ -42,20 +41,37 @@ class FarmBlockViewSet(viewsets.ModelViewSet):
     sees all.' (PIC Block scoping here is actually via FarmBlock.pic, the
     more precise block-level assignment — see apps/common/permissions.py
     docstring for why.)
+
+    Creating/editing a block is a Manager/Super-Admin action, same reasoning
+    as everywhere else state-changing endpoints in this project check the
+    actor's role server-side (CLAUDE.md) — a PIC Block user can be *assigned*
+    to a block, but assigning blocks isn't the same as defining them. This
+    was a real gap until now: get_queryset() scoped *reads* correctly, but
+    nothing checked write access on create/update, and `farm` on create was
+    validated only for existence, not for whether the requester manages it.
     """
 
     serializer_class = FarmBlockSerializer
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
+        return scoped_farm_blocks(self.request.user, queryset=FarmBlock.objects.select_related("farm", "pic"))
+
+    def _require_manager_or_superadmin_for_farm(self, farm):
         user = self.request.user
-        qs = FarmBlock.objects.select_related("farm", "pic")
         if user.is_superuser:
-            return qs
-        managed_farm_ids = UserFarmRole.objects.filter(
-            user=user, role=UserFarmRole.ROLE_MANAGER
-        ).values_list("farm_id", flat=True)
-        return qs.filter(Q(pic=user) | Q(farm_id__in=managed_farm_ids))
+            return
+        if farm is None or user_role_on_farm(user, farm) != UserFarmRole.ROLE_MANAGER:
+            raise PermissionDenied("Only a Manager or Super Admin can create or edit farm blocks.")
+
+    def perform_create(self, serializer):
+        self._require_manager_or_superadmin_for_farm(serializer.validated_data.get("farm"))
+        serializer.save()
+
+    def perform_update(self, serializer):
+        farm = serializer.validated_data.get("farm", serializer.instance.farm)
+        self._require_manager_or_superadmin_for_farm(farm)
+        serializer.save()
 
     @action(detail=True, methods=["get"])
     def geojson(self, request, pk=None):

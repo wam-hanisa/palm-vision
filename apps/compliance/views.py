@@ -7,7 +7,6 @@ writes require Manager or Super Admin, checked server-side, never trusted
 from the client — the same non-negotiable rule CLAUDE.md states for
 approvals elsewhere in this app.
 """
-from django.contrib.gis.geos import GEOSGeometry
 from django.db.models import Q
 from django.utils import timezone
 from rest_framework import viewsets
@@ -19,6 +18,7 @@ from rest_framework.response import Response
 from apps.common.permissions import user_role_on_farm
 from apps.farms.models import UserFarmRole
 
+from . import services
 from .models import (
     AuditResult,
     ChecklistItem,
@@ -252,85 +252,11 @@ class HarvestBatchViewSet(viewsets.ModelViewSet):
     def export_due_diligence(self, request, pk=None):
         batch = self.get_object()
         _require_manager_or_superadmin_for_farm(request.user, batch.farm_block.farm)
-
-        block = batch.farm_block
-        batch.recompute_totals()
-
-        if not block.boundary:
-            raise ValidationError(
-                "This block has no boundary polygon — a due-diligence export requires one "
-                "(EUDR filing needs the plot geometry)."
-            )
-
-        boundary_geojson = _geometry_to_6dp_geojson(block.boundary)
-
         try:
-            baseline = block.deforestation_baseline
-            baseline_payload = {
-                "status": baseline.status,
-                "cutoff_date": baseline.cutoff_date,
-                "source": baseline.source,
-                "verified_at": baseline.verified_at,
-            }
-        except DeforestationBaseline.DoesNotExist:
-            baseline_payload = None
-
-        requires_geojson_polygon = bool(block.area and block.area >= 4)
-
-        package = {
-            "harvest_batch_id": str(batch.id),
-            "farm_block": {
-                "id": str(block.id),
-                "name": block.name,
-                "area_hectares": block.area,
-            },
-            "period_start": batch.period_start,
-            "period_end": batch.period_end,
-            "total_quantity": batch.total_quantity,
-            "total_weight_kg": batch.total_weight_kg,
-            "plot_geometry": {
-                "type": "Feature",
-                "geometry": boundary_geojson,
-                "properties": {"requires_geojson_polygon_per_eudr_4ha_rule": requires_geojson_polygon},
-            },
-            "deforestation_baseline": baseline_payload,
-            # Placeholder fields — docs/07-compliance.md notes these need
-            # supplier-chain data this system doesn't collect yet; left
-            # explicit and null rather than fabricated, so a compliance
-            # officer completing the filing knows exactly what's missing.
-            "risk_assessment": None,
-            "supplier": None,
-            "hs_code": None,
-            "generated_at": timezone.now(),
-        }
-
-        batch.export_status = HarvestBatch.EXPORT_STATUS_EXPORTED
-        batch.save(update_fields=["export_status", "updated_at"])
+            package = services.assemble_due_diligence_package(batch)
+        except services.DueDiligenceExportRefused as exc:
+            raise ValidationError(str(exc))
         return Response(package)
-
-
-def _geometry_to_6dp_geojson(geometry: GEOSGeometry):
-    """Formats a GEOS geometry's coordinates to 6 decimal places (~11cm
-    precision at the equator) for the due-diligence GeoJSON output —
-    docs/07-compliance.md's "6-decimal coordinate precision" requirement.
-    This controls output formatting; it does not (and cannot reliably)
-    validate that the original survey capture had that much real-world
-    precision — a stored float can always be *formatted* to 6dp regardless
-    of its actual source accuracy, so this is a formatting guarantee, not
-    a data-quality guarantee. That distinction matters and is not something
-    to gloss over in a compliance-facing export.
-    """
-    import json as _json
-
-    raw = _json.loads(geometry.geojson)
-
-    def _round_coords(coords):
-        if isinstance(coords[0], (list, tuple)):
-            return [_round_coords(c) for c in coords]
-        return [round(c, 6) for c in coords]
-
-    raw["coordinates"] = _round_coords(raw["coordinates"])
-    return raw
 
 
 class GrievanceRecordViewSet(viewsets.ModelViewSet):

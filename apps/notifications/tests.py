@@ -19,8 +19,13 @@ from rest_framework import status
 from apps.compliance.models import ComplianceDocument
 from apps.imagery.models import Image, ImageProcessingRun, TreeDetection, TreeHealthClassification
 from apps.imagery.services import run_processing
-from apps.notifications.models import Notification, NotificationCategory, NotificationPreference
-from apps.notifications.services import notify
+from apps.notifications.models import (
+    Notification,
+    NotificationCategory,
+    NotificationDedupState,
+    NotificationPreference,
+)
+from apps.notifications.services import notify, notify_with_snooze
 from apps.notifications.tasks import (
     check_approvals_pending,
     check_compliance_expiry,
@@ -66,6 +71,84 @@ def test_notify_respects_email_disabled_preference(manager):
     notify(manager, NotificationCategory.APPROVAL_PENDING, "Title", "Body")
     assert Notification.objects.filter(user=manager).exists()
     assert len(mail.outbox) == 0
+
+
+# --- notify_with_snooze() -------------------------------------------------
+
+@pytest.mark.django_db
+def test_notify_with_snooze_fires_on_first_call(manager):
+    result = notify_with_snooze(
+        manager, NotificationCategory.REVIEW_BACKLOG, dedup_key="review-backlog:block-1",
+        title="Title", message="Body",
+    )
+    assert result is not None
+    assert Notification.objects.filter(user=manager).count() == 1
+    assert len(mail.outbox) == 1
+
+
+@pytest.mark.django_db
+def test_notify_with_snooze_skips_repeat_within_window(settings, manager):
+    settings.NOTIFICATION_SNOOZE_DAYS = 3
+    notify_with_snooze(
+        manager, NotificationCategory.REVIEW_BACKLOG, dedup_key="review-backlog:block-1",
+        title="Title", message="Body",
+    )
+    mail.outbox.clear()
+
+    result = notify_with_snooze(
+        manager, NotificationCategory.REVIEW_BACKLOG, dedup_key="review-backlog:block-1",
+        title="Title (still true)", message="Body",
+    )
+    assert result is None
+    assert Notification.objects.filter(user=manager).count() == 1  # not a second row
+    assert len(mail.outbox) == 0  # email not re-sent either — see notify_with_snooze's docstring
+
+
+@pytest.mark.django_db
+def test_notify_with_snooze_fires_again_after_window(settings, manager):
+    settings.NOTIFICATION_SNOOZE_DAYS = 3
+    notify_with_snooze(
+        manager, NotificationCategory.REVIEW_BACKLOG, dedup_key="review-backlog:block-1",
+        title="Title", message="Body",
+    )
+    NotificationDedupState.objects.filter(
+        user=manager, category=NotificationCategory.REVIEW_BACKLOG, dedup_key="review-backlog:block-1",
+    ).update(last_fired_at=timezone.now() - datetime.timedelta(days=4))
+    mail.outbox.clear()
+
+    result = notify_with_snooze(
+        manager, NotificationCategory.REVIEW_BACKLOG, dedup_key="review-backlog:block-1",
+        title="Title", message="Body",
+    )
+    assert result is not None
+    assert Notification.objects.filter(user=manager).count() == 2
+    assert len(mail.outbox) == 1
+
+
+@pytest.mark.django_db
+def test_notify_with_snooze_ignores_in_app_disabled_users_when_deduping(manager):
+    """The dedup state is tracked independently of Notification rows
+    specifically so this case works: a user with in-app delivery disabled
+    for a category never gets a Notification row at all, so deriving the
+    snooze window from "is there a recent Notification row" would always
+    say "never fired" for them and re-send the email every single call.
+    """
+    NotificationPreference.objects.create(
+        user=manager, category=NotificationCategory.REVIEW_BACKLOG, in_app_enabled=False, email_enabled=True
+    )
+    notify_with_snooze(
+        manager, NotificationCategory.REVIEW_BACKLOG, dedup_key="review-backlog:block-1",
+        title="Title", message="Body",
+    )
+    assert not Notification.objects.filter(user=manager).exists()  # confirms the setup: no row ever created
+    mail.outbox.clear()
+
+    result = notify_with_snooze(
+        manager, NotificationCategory.REVIEW_BACKLOG, dedup_key="review-backlog:block-1",
+        title="Title", message="Body",
+    )
+    assert result is None
+    assert len(mail.outbox) == 0  # correctly snoozed despite no Notification row ever existing
 
 
 # --- check_compliance_expiry ---------------------------------------------
@@ -174,6 +257,29 @@ def test_review_backlog_notifies_manager_above_threshold(settings, manager, farm
         )
     check_review_backlog()
     assert Notification.objects.filter(user=manager, category=NotificationCategory.REVIEW_BACKLOG).exists()
+
+
+@pytest.mark.django_db
+def test_review_backlog_does_not_renotify_within_snooze_window(settings, manager, farm_role_manager, block_a):
+    """A still-open backlog shouldn't produce a fresh Notification every
+    time this Beat check happens to run — see notify_with_snooze().
+    """
+    settings.REVIEW_BACKLOG_THRESHOLD = 2
+    settings.NOTIFICATION_SNOOZE_DAYS = 3
+    image = Image.objects.create(farm=block_a.farm, uploaded_by=manager, raw_file="imagery/raw/x.tif")
+    run = ImageProcessingRun.objects.create(image=image, farm_block=block_a, triggered_by=manager)
+    for _ in range(3):
+        TreeDetection.objects.create(
+            processing_run=run,
+            detected_location=Point(101.4410, 0.5310, srid=4326),
+            detection_confidence=0.9,
+            match_status=TreeDetection.MATCH_NEW_CANDIDATE,
+        )
+    check_review_backlog()
+    assert Notification.objects.filter(user=manager, category=NotificationCategory.REVIEW_BACKLOG).count() == 1
+
+    check_review_backlog()  # same still-open backlog, run again the "next day"
+    assert Notification.objects.filter(user=manager, category=NotificationCategory.REVIEW_BACKLOG).count() == 1
 
 
 # --- check_approvals_pending ----------------------------------------------

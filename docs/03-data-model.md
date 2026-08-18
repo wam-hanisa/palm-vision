@@ -91,7 +91,7 @@ erDiagram
     TREE_HEALTH_CLASSIFICATION {
         uuid id
         fk tree_detection_id
-        string health_label "healthy / small / yellow"
+        string health_label "healthy / unknown / yellow"
         float confidence
         boolean reviewed
         fk reviewed_by

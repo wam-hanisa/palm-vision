@@ -1,0 +1,19 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Add fertilizer plan{% endblock %}
+{% block page_title %}Add fertilizer plan — “{{ farm_block.name }}”{% endblock %}
+{% block content %}
+{% comment %}
+Direct-URL fallback — the Farm Map page itself now opens this same form
+inline in its side panel (FertilizerPlanCreateView's AJAX branch).
+_partials/fertilizer_plan_form.html is the one copy of the actual field
+markup both surfaces render.
+{% endcomment %}
+<section class="panel">
+  {% include "dashboard/_partials/fertilizer_plan_form.html" %}
+  <p class="panel-note">
+    This plan is created for the whole block “{{ farm_block.name }}” —
+    Fertilizer has no tree-level scoping in this build, only Harvest does
+    (and even that is block-level only for now — see BUILD_STATUS.md).
+  </p>
+</section>
+{% endblock %}

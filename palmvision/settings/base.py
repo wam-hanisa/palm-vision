@@ -42,6 +42,7 @@ INSTALLED_APPS = [
     "apps.reporting",
     "apps.notifications",
     # Phase 8: polish & pre-deployment hardening — no new apps expected
+    "apps.dashboard",  # office dashboard — server-rendered, session-auth UI for Manager/Super Admin
 ]
 
 MIDDLEWARE = [
@@ -78,6 +79,13 @@ WSGI_APPLICATION = "palmvision.wsgi.application"
 ASGI_APPLICATION = "palmvision.asgi.application"
 
 AUTH_USER_MODEL = "users.User"
+
+# --- Office dashboard session auth (apps/dashboard/) — distinct from the
+# JWT API's SIMPLE_JWT settings above and from /admin/'s own login. See
+# apps/dashboard/forms.py for who's actually allowed to sign in here.
+LOGIN_URL = "dashboard:login"
+LOGIN_REDIRECT_URL = "dashboard:home"
+LOGOUT_REDIRECT_URL = "dashboard:login"
 
 # Only needed if GDAL/GEOS aren't discoverable via the system's normal
 # library search path — the Dockerfile installs them as proper system
@@ -189,7 +197,27 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.reporting.tasks.run_scheduled_reports",
         "schedule": crontab(hour=5, minute=0),
     },
+    "apply-storage-lifecycle": {
+        "task": "apps.imagery.tasks.apply_storage_lifecycle_task",
+        "schedule": crontab(hour=4, minute=0),
+    },
+    # Every 15 minutes, not a once-a-day crontab like the others above —
+    # this recovers processing runs abandoned by a killed worker process
+    # (see services.mark_stale_processing_runs_failed()'s docstring for the
+    # real incident this was built from); the whole point is surfacing
+    # that within a reasonable time, not once a day.
+    "mark-stale-processing-runs-failed": {
+        "task": "apps.imagery.tasks.mark_stale_processing_runs_failed_task",
+        "schedule": timedelta(minutes=15),
+    },
 }
+
+# How long an ImageProcessingRun can sit in a non-terminal status (Clipping/
+# Detecting/Classifying) before mark_stale_processing_runs_failed() gives up
+# on it and marks it Failed — see that function's docstring. Real drone
+# orthomosaics vary a lot in size; this is a starting-point default, not a
+# researched number.
+IMAGE_PROCESSING_STALE_AFTER_MINUTES = int(os.environ.get("IMAGE_PROCESSING_STALE_AFTER_MINUTES", "60"))
 
 # --- Email (docs/12-security-ops.md § Alerting & Notifications) ---
 EMAIL_BACKEND = os.environ.get("EMAIL_BACKEND", "django.core.mail.backends.console.EmailBackend")
@@ -207,19 +235,107 @@ TREE_HEALTH_ANOMALY_MIN_INCREASE = int(os.environ.get("TREE_HEALTH_ANOMALY_MIN_I
 STALLED_SYNC_DAYS = int(os.environ.get("STALLED_SYNC_DAYS", 3))
 REVIEW_BACKLOG_THRESHOLD = int(os.environ.get("REVIEW_BACKLOG_THRESHOLD", 20))
 APPROVAL_PENDING_DAYS = int(os.environ.get("APPROVAL_PENDING_DAYS", 3))
+# Minimum days between repeat notifications for the same still-true
+# condition (stalled sync, review backlog, pending approval) — see
+# apps/notifications/services.py's notify_with_snooze().
+NOTIFICATION_SNOOZE_DAYS = int(os.environ.get("NOTIFICATION_SNOOZE_DAYS", 3))
 
 # --- Domain-specific config ---
 # Fallback tree-matching distance threshold in meters, used when a FarmBlock
 # doesn't set its own tree_match_threshold_m. See docs/06-ml-pipeline.md.
 TREE_MATCH_DEFAULT_THRESHOLD_M = float(os.environ.get("TREE_MATCH_DEFAULT_THRESHOLD_M", 3.0))
 
+# Fallback cross-tile crown-detection NMS IoU threshold, used when a
+# FarmBlock doesn't set its own crown_detection_iou_threshold — see
+# apps/imagery/ml/detection.py's _world_nms()/DETECTION_TILE_NMS_IOU_THRESHOLD
+# (0.3, the value this defaults to — carried over from the training
+# pipeline's own default, not independently tuned here either).
+CROWN_DETECTION_DEFAULT_IOU_THRESHOLD = float(os.environ.get("CROWN_DETECTION_DEFAULT_IOU_THRESHOLD", 0.3))
+
+# Fallback ground sample distance (meters/pixel) crown detection resamples
+# to before tiling, used when a FarmBlock doesn't set its own
+# detection_target_gsd_m — see apps/imagery/ml/detection.py's
+# DETECTION_TARGET_GSD_M and its module docstring's "Ground-sample-distance
+# normalization" section for the real, measured problem this addresses
+# (this project's own imagery came in 2-5x finer than the crown detector's
+# training data, causing it to fire on individual fronds instead of whole
+# crowns). 0.06 = 6cm/px — a starting estimate from the training data's own
+# annotated crown sizes, not yet validated against this project's imagery.
+DETECTION_DEFAULT_TARGET_GSD_M = float(os.environ.get("DETECTION_DEFAULT_TARGET_GSD_M", 0.06))
+
+# Fallback harvest/fertilizer cycle lengths (days), used when a FarmBlock
+# doesn't set its own harvest_interval_days/fertilizer_interval_days — drives
+# the per-tree overdue/due-soon indicator on the Farm Map (Tree.harvest_status()/
+# fertilizer_status()). Defaults are typical oil-palm rotation lengths, not a
+# verified figure for any specific plantation — every block can (and in
+# practice should) override these via its own edit form; see
+# FarmBlock.effective_harvest_interval_days()/effective_fertilizer_interval_days().
+HARVEST_DEFAULT_INTERVAL_DAYS = int(os.environ.get("HARVEST_DEFAULT_INTERVAL_DAYS", 14))
+FERTILIZER_DEFAULT_INTERVAL_DAYS = int(os.environ.get("FERTILIZER_DEFAULT_INTERVAL_DAYS", 120))
+
+# Chunk size for the office dashboard's chunked/resumable imagery upload —
+# see apps/imagery/models.py's ImageUploadSession. 8MB balances request
+# overhead (too small = too many round trips) against resume granularity
+# (too large = more re-sent data if a chunk fails partway) for a typical
+# office-WiFi upload of a real, hundreds-of-MB-to-few-GB orthomosaic.
+IMAGE_UPLOAD_CHUNK_SIZE_BYTES = int(os.environ.get("IMAGE_UPLOAD_CHUNK_SIZE_BYTES", 8 * 1024 * 1024))
+
+# Each chunk is sent as a raw request body (imagery_list.html's chunked-
+# upload JS: `body: chunk`, no multipart wrapper — see UploadChunkView in
+# apps/dashboard/views.py, which reads it via request.body). Django's
+# *default* DATA_UPLOAD_MAX_MEMORY_SIZE is 2.5MB — well under the 8MB
+# chunk size above — and accessing request.body on a request whose
+# Content-Length exceeds that limit raises RequestDataTooBig *before any
+# view code runs at all*, which Django turns into an unconditional
+# HttpResponseBadRequest (400). In practice this meant chunk 1 of every
+# chunked upload failed immediately with a 400 — confirmed live, not
+# hypothetical (see BUILD_STATUS.md). Derived from the chunk size, with
+# headroom, rather than a second independently-configured constant, so the
+# two settings can't drift apart again the way they just did — if
+# IMAGE_UPLOAD_CHUNK_SIZE_BYTES is ever raised via its own env var, this
+# stays ahead of it automatically.
+DATA_UPLOAD_MAX_MEMORY_SIZE = IMAGE_UPLOAD_CHUNK_SIZE_BYTES + (2 * 1024 * 1024)
+
 # Paths to trained model weights — apps/imagery/ml/detection.py and
 # classification.py fall back to a stub (no detections / always-low-
-# confidence) when these are unset, which is the expected state until real
-# labeled data and trained weights exist. See docs/06-ml-pipeline.md
-# § Labeling data — the real bottleneck, not the model.
+# confidence) when these are unset. DETECTION_MODEL_PATH: still the
+# expected (unset) state — no trained crown detector exists yet, see
+# docs/06-ml-pipeline.md § Labeling data. CLASSIFICATION_MODEL_PATH: a real
+# trained model exists now (trained_models/oil_palm_health_classifier.pth,
+# defaulted in .env.example) — see classification.py's own module
+# docstring for the full model/provenance writeup.
 DETECTION_MODEL_PATH = os.environ.get("DETECTION_MODEL_PATH", "")
 CLASSIFICATION_MODEL_PATH = os.environ.get("CLASSIFICATION_MODEL_PATH", "")
+
+# apps/imagery/ml/classification.py's normalize_exposure() — a real,
+# ml-repo-verified fix for a per-channel color-balance mismatch between a
+# given deployment's real orthomosaic imagery and the classifier's training
+# data. Default False, matching the ml-repo's own infer_health.HealthClassifier
+# default: unconditionally applying this measurably regresses accuracy on
+# in-distribution imagery, so it must only be turned on for a deployment
+# whose own imagery has been independently confirmed to need it (see
+# classification.py's module docstring) — not a blanket default every
+# deployment should inherit.
+CLASSIFICATION_NORMALIZE_EXPOSURE = os.environ.get("CLASSIFICATION_NORMALIZE_EXPOSURE", "false").lower() == "true"
+
+# docs/12-security-ops.md § Image storage lifecycle & cost policy — see
+# apps/imagery/services.py's apply_storage_lifecycle().
+IMAGE_STORAGE_COLD_TIER_DAYS = int(os.environ.get("IMAGE_STORAGE_COLD_TIER_DAYS", 90))
+
+# Longest edge, in pixels, of the downsampled preview PNG generate_preview()
+# produces — see apps/imagery/services.py. 1024 is comfortably enough
+# detail for the office dashboard's map panel (docs/06-ml-pipeline.md step
+# 4) without needing a real tile pyramid.
+IMAGE_PREVIEW_MAX_DIMENSION_PX = int(os.environ.get("IMAGE_PREVIEW_MAX_DIMENSION_PX", 1024))
+
+# Cloud Optimized GeoTIFF re-encoding — see convert_to_cog() in
+# apps/imagery/services.py, GDAL's native COG driver (no extra dependency
+# beyond the rasterio/GDAL this project already requires). 512 and DEFLATE
+# are GDAL's own COG driver defaults — made configurable here rather than
+# hardcoded purely for consistency with every other imagery-pipeline knob
+# in this file, not because either is expected to need tuning often.
+IMAGE_COG_BLOCKSIZE = int(os.environ.get("IMAGE_COG_BLOCKSIZE", 512))
+IMAGE_COG_COMPRESSION = os.environ.get("IMAGE_COG_COMPRESSION", "DEFLATE")
 
 # Days before ComplianceDocument.expiry_date that a document's computed
 # status flips from 'valid' to 'expiring_soon'. docs/12-security-ops.md's
