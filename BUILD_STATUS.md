@@ -621,6 +621,91 @@ ruff) that doesn't need a live database, or new tests that follow the
 exact same "not yet run against live Postgres" caveat every other test in
 this project has had until the user runs them for real.
 
+## Phase 4 — browser verification (the run this file kept asking for)
+
+The PWA has now been **run in a real browser** (Chromium via Playwright, at
+390x844 and 1440x900) against live Postgres/PostGIS with `seed_demo_data`,
+including real GPS coordinates inside Block A and real offline simulation.
+This closes the "not yet confirmed in an actual browser" caveat above for
+everything except Background Sync (which needs a real device).
+
+Note on how it was run: `docker compose up` was **not** usable in that
+environment — Docker Hub's blob CDN was blocked by egress policy, so no
+base images could be pulled. PostgreSQL 16 + PostGIS 3.4 were installed
+natively and Django was run directly instead. The application code paths
+exercised are identical; only the container boundary differs.
+
+**Six real bugs were found this way. All six are fixed.** Every one of them
+was invisible to `manage.py check`, to `node --check`, and to the existing
+test suite — they only appear when the DOM is actually rendered and
+interacted with, which is exactly what this file predicted ("I'd expect the
+first real bugs to show up in `pwa/js/app.js`'s DOM rendering/event-wiring
+code").
+
+1. **A tree created offline vanished from the block screen.** `blockScreen()`
+   filtered on `t.status === "active"`, but the optimistic local write stored
+   the request payload, which has no server-assigned `status`. Verified in
+   IndexedDB: the record was present with `status: undefined` and correctly
+   queued in the outbox, but the list still read "Trees (4)" and omitted it.
+   A field worker would have concluded the entry was lost and re-added it,
+   producing duplicates on sync. Fixed with `isActiveRecord()` (absent status
+   counts as active) plus a visible "Queued" pill so the record's real state
+   is legible.
+2. **The sync chip froze permanently after its first update.** `render()`
+   emitted `<div id="sync-chip">` as a wrapper, but `updateSyncChip()`
+   replaced it via `outerHTML` with markup carrying no id — so every
+   subsequent `getElementById` returned null and the function silently
+   no-opped. Confirmed live: forcing `syncing` then `idle` left the chip
+   reading "Syncing…" forever. `renderSyncChip()` now emits the id itself.
+   Offline also takes precedence over "syncing" in the label, since a sync
+   cannot be in progress with no connection.
+3. **Tapping a tree did nothing.** `.tree-item` rendered with
+   `cursor: pointer` and a `data-tree-id`, but only `.block-item` was ever
+   wired up. Added the missing handler and the tree-detail screen it needed
+   as a destination — which also gives tree-level logging a route that
+   doesn't depend on standing within 15m of the tree.
+4. **A failed login wiped the typed username.** `showError()` re-renders from
+   a template, destroying anything held only in the DOM. Now preserved in
+   `state.loginUsername`.
+5. **`.screen-header` reversed the visual order** on every screen whose back
+   button preceded the `<h1>`, flinging titles to the right edge; at 390px
+   the back link also collapsed onto two lines on the harvest/fertilizer
+   forms.
+6. **The proximity prompt was shredded by flexbox.** Its children were bare
+   text nodes, so `justify-content: space-between` treated each text run as
+   its own flex item and tore the sentence into three widely-spaced
+   fragments. Copy now lives in a single element.
+
+**Accessibility, measured on rendered pixels rather than read off the
+palette table.** Six text/background pairs failed WCAG AA: muted text
+3.47:1 on cream and 3.14:1 on card, danger 4.24:1, warning-fg 3.84:1,
+white-on-moss 3.63:1 (the sync chip — the one element that must stay
+readable in direct sun), and white-on-clay at exactly 4.50:1. The *surface*
+palette in `docs/09-design-system.md` is unchanged; the text tokens derived
+from it were each darkened by the minimum amount that clears 4.5:1 against
+every background they actually sit on. `input:focus` no longer sets
+`outline: none`. All PWA tap targets already passed (>=48px) and still do.
+
+**Design-system drift corrected.** The specified humanist sans was never
+actually loaded — `app.css` named `"Public Sans", "Inter"` with no
+`@font-face` anywhere, so every screen silently rendered in a system
+fallback. Public Sans is now vendored as a 26KB variable woff2 in
+`pwa/fonts/` and precached by the service worker, rather than linked from
+the Google Fonts CDN, which would fall back to a system font in exactly the
+offline case this PWA exists for. Amber was also being used for "You are
+here" — a neutral locational fact — against the doc's rule that the accent
+means "needs attention" and nothing else; that now uses the primary green.
+Empty states ("no blocks", "no trees", "block not cached") were bare muted
+text, one of them an `<li class="muted">` inside the record list; they now
+have a real dashed-surface treatment.
+
+**Still not done for Phase 4:** the numeric steppers
+`docs/09-design-system.md` calls for ("big numeric steppers instead of small
+text inputs") — deliberately deferred to its own pass at the project
+owner's direction, since it is a feature build rather than a fix and it
+touches the same form layout. Also still open: a Leaflet map view, tree
+editing, and real icon art.
+
 ## Known gaps in what's built (not blockers, but don't forget these)
 
 - **FK write-scope validation is incomplete.** No viewset validates that a
