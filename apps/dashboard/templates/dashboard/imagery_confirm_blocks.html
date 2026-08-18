@@ -1,4 +1,5 @@
 {% extends "dashboard/base.html" %}
+{% load static %}
 {% block title %}Confirm blocks{% endblock %}
 {% block page_title %}Confirm which block(s) to process{% endblock %}
 {% block content %}
@@ -51,8 +52,8 @@ blocks a farm has.
 </section>
 
 {{ confirm_data|json_script:"confirm-data" }}
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<link rel="stylesheet" href="{% static 'dashboard/vendor/leaflet/leaflet.css' %}">
+<script src="{% static 'dashboard/vendor/leaflet/leaflet.js' %}"></script>
 <script>
 (function () {
   var data = JSON.parse(document.getElementById("confirm-data").textContent);

@@ -1,4 +1,5 @@
 {% extends "dashboard/base.html" %}
+{% load static %}
 {% block title %}Farm Map{% endblock %}
 {% block page_title %}Farm Map{% endblock %}
 {% block body_class %}farm-map-fullpage{% endblock %}
@@ -99,10 +100,25 @@ driven by client-side state rather than separate server-rendered pages:
   both entry points (initial page load and the in-page upload's own
   poll) so there's exactly one implementation of this step.
 {% endcomment %}
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/MarkerCluster.css">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/MarkerCluster.Default.css">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css">
+{% comment %}
+Leaflet and its two plugins are served from this project's own static files,
+not from cdnjs. CLAUDE.md's local-first ground rule means the Farm Map — the
+dashboard's single most important screen — has to render on a machine with
+no internet reachability, and a CDN <link> silently degrades it to the
+"Leaflet failed to load" no-op path below. Pinned copies live in
+apps/dashboard/static/dashboard/vendor/leaflet/ (leaflet 1.9.4,
+leaflet.markercluster 1.5.3, leaflet-draw 1.0.4 — the same versions the CDN
+URLs requested).
+
+The basemap TILES are a separate question and remain remote (see the
+tileLayer calls below): tiles are imagery that genuinely cannot be bundled,
+so the map degrades to boundaries-on-blank-background without a connection
+rather than failing outright.
+{% endcomment %}
+<link rel="stylesheet" href="{% static 'dashboard/vendor/leaflet/leaflet.css' %}">
+<link rel="stylesheet" href="{% static 'dashboard/vendor/leaflet/MarkerCluster.css' %}">
+<link rel="stylesheet" href="{% static 'dashboard/vendor/leaflet/MarkerCluster.Default.css' %}">
+<link rel="stylesheet" href="{% static 'dashboard/vendor/leaflet/leaflet.draw.css' %}">
 
 {% comment %}
 Full-page, Google-Maps-style layout: #farm-map fills the entire content
@@ -139,23 +155,23 @@ scripted.
     <div class="map-legend-group"><span class="legend-swatch" style="background:#6B8F71;"></span> Healthy tree</div>
     <div class="map-legend-group"><span class="legend-swatch" style="background:#B85C4A;"></span> Yellowing</div>
     <div class="map-legend-group"><span class="legend-swatch" style="background:#8A8578;"></span> Unknown health</div>
-    <div class="map-legend-group"><span class="legend-swatch legend-swatch-ring" style="border-color:#3B6FA0;"></span> Needs action (marked by a Manager)</div>
-    <div class="map-legend-group"><span class="legend-swatch legend-swatch-ring" style="border-color:#C0392B;"></span> Harvest/fertilizer overdue</div>
-    <div class="map-legend-group"><span class="legend-swatch legend-swatch-ring" style="border-color:#D9A441;"></span> Due soon</div>
-    <div class="map-legend-group"><span class="legend-swatch legend-swatch-ring legend-swatch-ring-dashed" style="border-color:#8A8578;"></span> Never recorded</div>
+    <div class="map-legend-group"><span class="legend-swatch legend-swatch-ring legend-swatch-ring-thick" style="border-color:#3B6FA0;"></span> Needs action (marked by a Manager)</div>
+    <div class="map-legend-group"><span class="legend-swatch legend-swatch-ring legend-swatch-ring-dashed" style="border-color:#C0392B;"></span> Harvest/fertilizer overdue</div>
+    <div class="map-legend-group"><span class="legend-swatch legend-swatch-ring legend-swatch-ring-dotted" style="border-color:#D9A441;"></span> Due soon</div>
+    <div class="map-legend-group"><span class="legend-swatch legend-swatch-ring legend-swatch-ring-sparse" style="border-color:#8A8578;"></span> Never recorded</div>
     <div class="map-legend-group"><span class="legend-swatch legend-swatch-ring" style="border-color:#1F7A8C;"></span> OK (within interval)</div>
   </div>
 </div>
 
 {{ farm_map_data|json_script:"farm-map-data" }}
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/leaflet.markercluster.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+<script src="{% static 'dashboard/vendor/leaflet/leaflet.js' %}"></script>
+<script src="{% static 'dashboard/vendor/leaflet/leaflet.markercluster.js' %}"></script>
+<script src="{% static 'dashboard/vendor/leaflet/leaflet.draw.js' %}"></script>
 <script>
 (function () {
   var mapEl = document.getElementById("farm-map");
-  if (!mapEl || typeof L === "undefined") return; // Leaflet failed to load off the CDN
+  if (!mapEl || typeof L === "undefined") return; // Leaflet failed to load
 
   var data = JSON.parse(document.getElementById("farm-map-data").textContent);
   var panelEl = document.getElementById("farm-map-panel");
@@ -460,10 +476,20 @@ scripted.
     var overdue = tree.harvest_stage === "overdue" || tree.fertilizer_stage === "overdue";
     var dueSoon = tree.harvest_stage === "due_soon" || tree.fertilizer_stage === "due_soon";
     var neverRecorded = tree.harvest_stage === "never" && tree.fertilizer_stage === "never";
-    if (marked) return { color: "#3B6FA0", weight: 3, dashArray: null };
-    if (overdue) return { color: "#C0392B", weight: 3, dashArray: null };
-    if (dueSoon) return { color: "#D9A441", weight: 2, dashArray: null };
-    if (neverRecorded) return { color: "#8A8578", weight: 2, dashArray: "2 3" };
+    // Each stage carries a distinct stroke PATTERN as well as a distinct
+    // hue, so the ring is readable without colour vision. Previously only
+    // "never recorded" had a non-colour cue (its dash); "overdue" (red) and
+    // "due soon" (amber) were both solid strokes separated by 1px of weight
+    // — red-vs-amber is exactly the pair protanopia and deuteranopia
+    // collapse, and those two states mean "act now" versus "act this week."
+    // Pattern vocabulary, coarse enough to survive a 14px marker:
+    //   solid thick (4) = needs action   long dash = overdue
+    //   short dash      = due soon       sparse dots = never recorded
+    //   solid thin (2)  = ok
+    if (marked) return { color: "#3B6FA0", weight: 4, dashArray: null };
+    if (overdue) return { color: "#C0392B", weight: 3, dashArray: "6 3" };
+    if (dueSoon) return { color: "#D9A441", weight: 3, dashArray: "2 3" };
+    if (neverRecorded) return { color: "#8A8578", weight: 2, dashArray: "1 6" };
     return { color: "#1F7A8C", weight: 2, dashArray: null };
   }
 

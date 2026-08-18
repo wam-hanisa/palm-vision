@@ -1,4 +1,5 @@
 {% extends "dashboard/base.html" %}
+{% load static %}
 {% block title %}{% if is_create %}Add tree{% else %}Edit tree{% endif %}{% endblock %}
 {% block page_title %}{% if is_create %}Add tree — {{ farm_block.name }}{% else %}Edit tree — {{ farm_block.name }}{% endif %}{% endblock %}
 {% block content %}
@@ -22,8 +23,8 @@ clicked again.
 </section>
 
 {{ tree_map_data|json_script:"tree-map-data" }}
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<link rel="stylesheet" href="{% static 'dashboard/vendor/leaflet/leaflet.css' %}">
+<script src="{% static 'dashboard/vendor/leaflet/leaflet.js' %}"></script>
 <script>
 (function () {
   var data = JSON.parse(document.getElementById("tree-map-data").textContent);

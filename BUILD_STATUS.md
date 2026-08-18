@@ -705,6 +705,83 @@ owner's direction, since it is a feature build rather than a fix and it
 touches the same form layout. Also still open: a Leaflet map view, tree
 editing, and real icon art.
 
+## Office dashboard — first browser-verified UI pass
+
+The dashboard shipped on `main` has now been run in a real browser
+(Chromium, 1440x900 and 390x844) against live PostGIS, covering every
+screen: overview, farms, Farm Map in all four drill-down states (no
+selection → farm → block → tree), imagery, all five compliance screens,
+reports, and notifications.
+
+**Front-end code no longer loads from a CDN.** Leaflet, its markercluster
+and draw plugins, and Chart.js were all pulled from `cdnjs.cloudflare.com`,
+with basemap tiles from OpenStreetMap/ArcGIS. On a machine that can't reach
+cdnjs, the Farm Map — the dashboard's most important screen — hit its own
+`typeof L === "undefined"` guard and rendered as an empty panel over blank
+space, and all three overview charts rendered as blank boxes. Both failed
+silently with a 200 response. This is exactly what CLAUDE.md's local-first
+rule exists to prevent, and it was also an undeclared external dependency
+of the kind CLAUDE.md says to flag rather than add. All four libraries are
+now pinned copies under `apps/dashboard/static/dashboard/vendor/` at the
+same versions the CDN URLs requested. Two tests in `apps/dashboard/tests.py`
+guard this: the files must exist and be non-empty, and no dashboard template
+may carry a live CDN `<script>`/`<link>`. Basemap *tiles* remain remote by
+necessity — imagery can't be bundled — so with no connection the map now
+degrades to boundaries on a blank background rather than failing outright.
+
+**The specified typeface is now actually delivered.** `style.css` documented
+a deliberate decision to stay on a system stack rather than take an internet
+dependency for a webfont — sound reasoning, but the effect was that no
+screen on either surface ever rendered in Public Sans or Inter. Vendoring
+the font same-origin satisfies both constraints at once. The two surfaces
+also disagreed on stack order (dashboard led with Inter, PWA with Public
+Sans), so the same machine could render them in different typefaces; both
+now lead with Public Sans.
+
+**Accessibility, measured on rendered pixels.** Every muted-text style on
+every dashboard screen failed WCAG AA — 3.14:1 on card fills and 3.47:1 on
+the page background, at 12-14px. Same root cause as the PWA: the surface
+palette in docs/09-design-system.md used directly as small text. The
+dashboard now carries the identical corrected text tokens as the PWA. Also
+fixed: no focus styling existed at all, leaving the browser default black
+ring effectively invisible against the dark sidebar where log-out and every
+nav item live; the log-out control was a 43x15 hit area; the compliance
+sub-nav pills were 30px tall; the map's farm/block selects were 31px; and
+Leaflet's own zoom buttons were 30x30 (its stylesheet loads after ours, so
+the override needed a compound `.leaflet-touch.leaflet-container` selector,
+not a descendant one).
+
+**Colourblind fallback on the tree markers.** Harvest/fertilizer stage is
+drawn as the marker's ring. Only "never recorded" had a non-colour cue (a
+dash); "overdue" (red) and "due soon" (amber) were both solid strokes
+differing by 1px of weight — red-versus-amber is precisely the pair
+protanopia and deuteranopia collapse, and those two states mean "act now"
+versus "act this week." Each stage now carries a distinct stroke pattern as
+well as a hue (solid-thick / long-dash / short-dash / sparse-dots /
+solid-thin), and the legend swatches mirror the patterns so the vocabulary
+is learnable from the legend. Health *fill* colour (green/red/grey) is still
+colour-only — noted, not fixed; it would need a different marker shape per
+state, which is a larger change.
+
+**Layout bugs.** The Farm Map's floating panel is 380px wide with a
+non-wrapping toolbar, so "Upload imagery" ran past the panel edge and was
+clipped by its `overflow: hidden`; the toolbar now wraps. The panel and
+legend also carried `box-shadow`, against docs/09-design-system.md's
+explicit "flat surfaces, no drop shadows or gradients" — replaced with a 1px
+border, which they do need since they float over the map. Every dashboard
+screen also pushed the whole *page* sideways at phone width (up to 904px
+against a 390px viewport) because `.shell` is a flex row with a fixed 240px
+sidebar that never collapsed; the sidebar now stacks below 720px and wide
+tables scroll inside their own container instead of dragging the body.
+
+**PWA fixes carried across the merge.** `main` rewrote `pwa/js/app.js`
+(adding a map screen, tree detail, and tree editing) without the earlier
+audit's fixes, so three were re-applied on top of the newer code: the
+offline-created tree still filtered out of the block list by
+`status === "active"`, the sync chip still losing its `id` on first update
+and freezing, and the failed login still wiping the typed username. `main`'s
+own new "Sync now" button was 36px tall in a gloves-first UI and is now 44px.
+
 ## Known gaps in what's built (not blockers, but don't forget these)
 
 **Update — FK write-scope validation: fixed.** The gap below (no viewset

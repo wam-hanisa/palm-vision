@@ -10,9 +10,11 @@ this aims at for the dashboard specifically: can a Manager sign in, see
 correctly-scoped data, and can a PIC Block user (who has no dashboard
 journey per docs/10-user-journeys.md) not get in at all.
 """
+import pathlib
 import numpy as np
 import pytest
 import rasterio
+from django.conf import settings
 from django.contrib.gis.geos import Point
 from django.core.files import File
 from django.urls import reverse
@@ -1712,3 +1714,48 @@ def test_ajax_write_actions_still_enforce_scope(client, manager, farm_role_manag
     )
     assert response.status_code == 404  # not in this manager's scoped FarmBlockViewSet queryset at all
     assert FarmBlock.objects.filter(id=other_block.id).exists()
+
+
+# --- Vendored front-end assets -------------------------------------------
+# The dashboard's Leaflet/Chart.js/webfont assets are served from this app's
+# own static files rather than a CDN (CLAUDE.md's local-first rule). Nothing
+# else would catch a regression here: if a URL breaks, the Farm Map silently
+# falls back to its "Leaflet failed to load" no-op and renders an empty box,
+# and the page still returns 200.
+
+def _dashboard_static(*parts):
+    return pathlib.Path(settings.BASE_DIR, "apps", "dashboard", "static", "dashboard", *parts)
+
+
+def test_vendored_frontend_assets_exist_on_disk():
+    for rel in [
+        ("vendor", "leaflet", "leaflet.js"),
+        ("vendor", "leaflet", "leaflet.css"),
+        ("vendor", "leaflet", "leaflet.draw.js"),
+        ("vendor", "leaflet", "leaflet.draw.css"),
+        ("vendor", "leaflet", "leaflet.markercluster.js"),
+        ("vendor", "leaflet", "MarkerCluster.css"),
+        ("vendor", "leaflet", "MarkerCluster.Default.css"),
+        ("vendor", "chartjs", "chart.umd.js"),
+        ("fonts", "public-sans-latin.woff2"),
+    ]:
+        path = _dashboard_static(*rel)
+        assert path.exists(), f"missing vendored asset: {path}"
+        assert path.stat().st_size > 0, f"empty vendored asset: {path}"
+
+
+def test_no_dashboard_template_loads_frontend_code_from_a_cdn():
+    """A CDN <script>/<link> makes the map and charts depend on internet
+    reachability, which CLAUDE.md's local-first rule rules out. Prose inside
+    {% comment %} blocks explaining the decision is fine; live tags are not.
+    """
+    template_dir = pathlib.Path(settings.BASE_DIR, "apps", "dashboard", "templates", "dashboard")
+    offenders = []
+    for path in template_dir.rglob("*.html"):
+        for lineno, line in enumerate(path.read_text().splitlines(), 1):
+            stripped = line.strip()
+            if not (stripped.startswith("<script") or stripped.startswith("<link")):
+                continue
+            if "cdnjs.cloudflare.com" in line or "unpkg.com" in line or "fonts.googleapis.com" in line:
+                offenders.append(f"{path.name}:{lineno}")
+    assert not offenders, f"CDN-loaded front-end code found at: {offenders}"

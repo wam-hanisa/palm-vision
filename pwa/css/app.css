@@ -278,7 +278,10 @@ input:focus, select:focus { border-color: var(--primary); }
 .unsynced-banner button {
   background: var(--primary);
   color: white;
-  min-height: 36px;
+  /* Was 36px. This sits in the field PWA, used with gloves, where 44px is
+     the floor — every other control here already clears it via the base
+     button rule's min-height: 48px; this one overrode it. */
+  min-height: 44px;
   padding: 0.3rem 0.8rem;
   font-size: 0.85rem;
   flex-shrink: 0;

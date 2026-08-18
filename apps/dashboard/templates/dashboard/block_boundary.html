@@ -1,4 +1,5 @@
 {% extends "dashboard/base.html" %}
+{% load static %}
 {% block title %}Draw boundary{% endblock %}
 {% block page_title %}Draw boundary — {{ farm_block.name }}{% endblock %}
 {% block content %}
@@ -24,10 +25,10 @@ added to drawnItems, never editable.
 </section>
 
 {{ boundary_data|json_script:"boundary-data" }}
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+<link rel="stylesheet" href="{% static 'dashboard/vendor/leaflet/leaflet.css' %}">
+<link rel="stylesheet" href="{% static 'dashboard/vendor/leaflet/leaflet.draw.css' %}">
+<script src="{% static 'dashboard/vendor/leaflet/leaflet.js' %}"></script>
+<script src="{% static 'dashboard/vendor/leaflet/leaflet.draw.js' %}"></script>
 <script>
 (function () {
   var data = JSON.parse(document.getElementById("boundary-data").textContent);
