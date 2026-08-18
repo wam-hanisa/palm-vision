@@ -1,0 +1,17 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Notifications{% endblock %}
+{% block page_title %}Notifications{% endblock %}
+{% block content %}
+{% if not notifications %}
+  <p class="empty-state">No notifications yet.</p>
+{% endif %}
+<ul class="notification-list">
+  {% for note in notifications %}
+  <li class="notification-item{% if not note.read %} notification-unread{% endif %}">
+    <div class="notification-title">{{ note.title }}</div>
+    <div class="notification-message">{{ note.message }}</div>
+    <div class="notification-meta">{{ note.get_category_display }} · {{ note.created_at }}</div>
+  </li>
+  {% endfor %}
+</ul>
+{% endblock %}

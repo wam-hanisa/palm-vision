@@ -1,0 +1,23 @@
+{% extends "dashboard/base.html" %}
+{% block title %}{% if is_create %}Add block{% else %}Edit block{% endif %}{% endblock %}
+{% block page_title %}{% if is_create %}Add block{% else %}Edit “{{ farm_block.name }}”{% endif %}{% endblock %}
+{% block content %}
+{% comment %}
+Direct-URL fallback — the Farm Map page itself now opens this same form
+inline in its side panel (FarmBlockCreateView/FarmBlockUpdateView's AJAX
+branch) instead of navigating here. _partials/block_form.html is the one
+copy of the actual field markup both surfaces render.
+{% endcomment %}
+<section class="panel">
+  {% include "dashboard/_partials/block_form.html" %}
+  <p class="panel-note">
+    {% if is_create %}
+      Boundary isn't set here — after creating the block, you'll draw its
+      boundary on a map.
+    {% else %}
+      To change this block's boundary, use the boundary editor from the
+      <a href="{% url 'dashboard:farms' %}">Farm Map</a>.
+    {% endif %}
+  </p>
+</section>
+{% endblock %}

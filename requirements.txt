@@ -13,20 +13,25 @@ gunicorn>=22.0
 # Imagery / ML pipeline (docs/06-ml-pipeline.md) — Phase 5.
 # rasterio ships its own bundled GDAL wheel; no extra system packages needed
 # for it specifically (the Dockerfile's gdal-bin/libgdal-dev are for
-# GeoDjango, not rasterio). torch/torchvision/ultralytics are CPU-inference
-# viable at this volume per docs/06-ml-pipeline.md and are only actually
-# imported when DETECTION_MODEL_PATH/CLASSIFICATION_MODEL_PATH are set to a
-# real weights file — see apps/imagery/ml/*.py — so local dev without
-# trained weights never pays their import cost at runtime, only at install.
+# GeoDjango, not rasterio).
 rasterio>=1.3
 Pillow>=10.3
 numpy>=1.24
-# Uncomment once real trained weights exist — these are large downloads and
-# not needed to exercise the pipeline's clip/match/status-transition logic
-# against the stub models:
-# torch>=2.3
-# torchvision>=0.18
-# ultralytics>=8.2
+# torch/torchvision — real trained checkpoints now exist for BOTH
+# DETECTION_MODEL_PATH (apps/imagery/ml/detection.py, a torchvision Faster
+# R-CNN) and CLASSIFICATION_MODEL_PATH (apps/imagery/ml/classification.py,
+# a torchvision-backboned ResNet-18) — see each module's own docstring for
+# provenance. ultralytics/YOLO is no longer used by this project at all.
+# --extra-index-url below is PyTorch's own documented way to get the
+# CPU-only wheel instead of the default PyPI wheel, which bundles several
+# GB of CUDA runtime libraries this project has no use for — none of the
+# docker-compose.yml services request GPU passthrough, so CPU inference is
+# what actually runs regardless. Both models are mounted read-only from the
+# sibling palm-vision-ml repo, not downloaded by any script in this repo —
+# see .env.example and docker-compose.yml.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.6
+torchvision>=0.21
 
 # Reporting exports (docs/08-reporting.md) — Phase 7.
 # WeasyPrint needs native Pango/cairo/gdk-pixbuf libraries, not just the pip

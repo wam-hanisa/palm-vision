@@ -1,0 +1,309 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Imagery{% endblock %}
+{% block page_title %}Imagery{% endblock %}
+{% block content %}
+{{ blocks_by_farm|json_script:"blocks-by-farm-data" }}
+<section class="panel">
+  <h2 class="section-heading">Upload a new image</h2>
+  <p class="panel-subheading">Georeferencing runs automatically after upload. Pick block(s) below and processing starts right away against them once it finishes — no separate confirm step. Leave none checked to decide later instead.</p>
+  <form method="post" enctype="multipart/form-data" class="stacked-form" id="upload-form">
+    {% csrf_token %}
+    {% if form.non_field_errors %}<div class="flash flash-error">{{ form.non_field_errors.0 }}</div>{% endif %}
+    <label for="{{ form.farm.id_for_label }}">Farm</label>
+    {{ form.farm }}
+    {% if form.farm.errors %}<div class="field-error">{{ form.farm.errors.0 }}</div>{% endif %}
+
+    <label>Process against block(s)</label>
+    <div id="upload-block-checklist"></div>
+
+    <label for="{{ form.raw_file.id_for_label }}">Image file</label>
+    {{ form.raw_file }}
+    {% if form.raw_file.errors %}<div class="field-error">{{ form.raw_file.errors.0 }}</div>{% endif %}
+
+    <label for="{{ form.captured_at.id_for_label }}">Captured at (optional)</label>
+    {{ form.captured_at }}
+
+    <div class="upload-progress" id="upload-progress" hidden>
+      <div class="upload-progress-track"><div class="upload-progress-fill" id="upload-progress-fill"></div></div>
+      <span class="upload-progress-label" id="upload-progress-label">0%</span>
+    </div>
+
+    <button type="submit" class="primary-button primary-button-inline" id="upload-submit">Upload</button>
+  </form>
+</section>
+
+<script>
+(function () {
+  // Chunked/resumable upload — apps/imagery/models.py's ImageUploadSession.
+  // Real drone orthomosaics run hundreds of MB to a few GB; slicing the
+  // file client-side (File.slice()) and sending it as separate requests
+  // means a dropped connection only costs the current chunk, not the
+  // whole upload, and a browser reload/crash can resume from wherever it
+  // left off (session id + received-chunk state kept in localStorage,
+  // confirmed against the server rather than trusted blindly on resume).
+  var form = document.getElementById("upload-form");
+  if (!form) return;
+
+  // "Process against block(s)" checklist — mirrors farm_map.html's own
+  // renderUploadBlockChecklist() (same blocksForFarm-has-boundary filter,
+  // same markup shape) so the two upload entry points look and behave the
+  // same. Deliberately OUTSIDE the fetch()-availability gate below: this
+  // needs no fetch, and the plain-form fallback path (no JS chunked
+  // upload) still submits these as ordinary `block_id` checkboxes in the
+  // POST body — ImageListUploadView.post() reads them the same way either
+  // path gets there.
+  var blocksByFarmEl = document.getElementById("blocks-by-farm-data");
+  var blocksByFarm = blocksByFarmEl ? JSON.parse(blocksByFarmEl.textContent) : {};
+  var farmSelect = form.querySelector('select[name="farm"]');
+  var blockChecklistWrap = document.getElementById("upload-block-checklist");
+
+  function renderBlockChecklist(farmId) {
+    blockChecklistWrap.innerHTML = "";
+    var blocksForFarm = (farmId && blocksByFarm[farmId]) || [];
+    if (!farmId) {
+      blockChecklistWrap.appendChild(Object.assign(document.createElement("p"), {
+        className: "panel-note", textContent: "Choose a farm to see its blocks.",
+      }));
+      return;
+    }
+    if (!blocksForFarm.length) {
+      blockChecklistWrap.appendChild(Object.assign(document.createElement("p"), {
+        className: "panel-note",
+        textContent: "No blocks with a boundary drawn yet on this farm — draw one before uploading imagery for it.",
+      }));
+      return;
+    }
+    var list = document.createElement("ul");
+    list.className = "tree-checklist";
+    blocksForFarm.forEach(function (block) {
+      var checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.name = "block_id";
+      checkbox.value = block.id;
+      var label = document.createElement("label");
+      label.appendChild(checkbox);
+      label.appendChild(document.createTextNode(block.name));
+      var li = document.createElement("li");
+      li.appendChild(label);
+      list.appendChild(li);
+    });
+    blockChecklistWrap.appendChild(list);
+  }
+
+  if (farmSelect && blockChecklistWrap) {
+    renderBlockChecklist(farmSelect.value);
+    farmSelect.addEventListener("change", function () { renderBlockChecklist(farmSelect.value); });
+  }
+
+  // Progressive enhancement: if fetch() isn't available, the rest of this
+  // block is skipped and the form above falls back to a single ordinary
+  // multipart POST — the exact synchronous path ImageListUploadView.post()
+  // already handles, unchanged, for small files or older browsers. The
+  // block checklist above still works either way.
+  if (typeof fetch === "undefined") return;
+
+  var progressWrap = document.getElementById("upload-progress");
+  var progressFill = document.getElementById("upload-progress-fill");
+  var progressLabel = document.getElementById("upload-progress-label");
+  var submitButton = document.getElementById("upload-submit");
+  var csrfToken = form.querySelector('[name="csrfmiddlewaretoken"]').value;
+  var CHUNK_SIZE = {{ chunk_size_bytes }};
+  // Lands back on the Farm Map's upload_confirm mode (FarmMapView), the
+  // same map instance the Manager was just browsing — see
+  // ImageListUploadView.post()'s matching redirect for the plain-form
+  // path. Built from the real Django URL reverse tag, not hardcoded, so
+  // this still points at the right place if the URL pattern ever changes.
+  var FARM_MAP_URL = "{% url 'dashboard:farms' %}";
+
+  function setProgress(pct, label) {
+    progressWrap.hidden = false;
+    progressFill.style.width = pct + "%";
+    progressLabel.textContent = label || pct + "%";
+  }
+
+  function resumeKeyFor(file) {
+    // Name + size + lastModified is a good-enough fingerprint for "is this
+    // the same file I was mid-upload of" — not cryptographically exact,
+    // but exact enough that a false match would require picking a
+    // different file with an identical name, byte size, and modified
+    // timestamp, which isn't a realistic accident.
+    return "pv-upload:" + file.name + ":" + file.size + ":" + file.lastModified;
+  }
+
+  async function getOrCreateSession(file, farmId, capturedAt, totalChunks) {
+    var key = resumeKeyFor(file);
+    var existingId = window.localStorage.getItem(key);
+    if (existingId) {
+      var statusResp = await fetch("/dashboard/imagery/uploads/" + existingId + "/", {
+        headers: { "X-CSRFToken": csrfToken },
+      });
+      if (statusResp.ok) {
+        var statusData = await statusResp.json();
+        if (statusData.status !== "complete" && statusData.total_chunks === totalChunks) {
+          return { sessionId: existingId, received: statusData.received_chunk_indexes, resumed: true };
+        }
+      }
+      window.localStorage.removeItem(key); // stale, mismatched, or already-finished — start clean
+    }
+
+    var createResp = await fetch("/dashboard/imagery/uploads/", {
+      method: "POST",
+      headers: { "X-CSRFToken": csrfToken, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        farm: farmId, filename: file.name, total_chunks: totalChunks, captured_at: capturedAt || null,
+      }),
+    });
+    if (!createResp.ok) throw new Error("Could not start the upload (status " + createResp.status + ").");
+    var createData = await createResp.json();
+    window.localStorage.setItem(key, createData.session_id);
+    return { sessionId: createData.session_id, received: [], resumed: false };
+  }
+
+  async function uploadFile(file, farmId, capturedAt) {
+    var totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+    var session = await getOrCreateSession(file, farmId, capturedAt, totalChunks);
+    var receivedSet = {};
+    session.received.forEach(function (i) { receivedSet[i] = true; });
+    if (session.resumed) {
+      setProgress(Math.round((session.received.length / totalChunks) * 100), "Resuming upload…");
+    }
+
+    for (var i = 0; i < totalChunks; i++) {
+      if (receivedSet[i]) continue; // already on the server from a previous attempt
+      var start = i * CHUNK_SIZE;
+      var chunk = file.slice(start, Math.min(start + CHUNK_SIZE, file.size));
+      var chunkResp = await fetch(
+        "/dashboard/imagery/uploads/" + session.sessionId + "/chunks/" + i + "/",
+        { method: "POST", headers: { "X-CSRFToken": csrfToken }, body: chunk }
+      );
+      if (!chunkResp.ok) {
+        throw new Error("Chunk " + (i + 1) + " of " + totalChunks + " failed (status " + chunkResp.status + ").");
+      }
+      receivedSet[i] = true;
+      setProgress(Math.round((Object.keys(receivedSet).length / totalChunks) * 100));
+    }
+
+    var completeResp = await fetch("/dashboard/imagery/uploads/" + session.sessionId + "/complete/", {
+      method: "POST", headers: { "X-CSRFToken": csrfToken },
+    });
+    if (!completeResp.ok) {
+      throw new Error((await completeResp.text()) || "Could not finish the upload.");
+    }
+    window.localStorage.removeItem(resumeKeyFor(file));
+    return await completeResp.json(); // {"image_id": "..."} — see CompleteUploadSessionView
+  }
+
+  form.addEventListener("submit", function (event) {
+    var fileInput = form.querySelector('input[type="file"]');
+    if (!fileInput || !fileInput.files.length) return; // let normal browser validation handle "no file chosen"
+
+    event.preventDefault();
+    var file = fileInput.files[0];
+    var capturedInput = form.querySelector('input[name="captured_at"]');
+    var selectedBlockIds = Array.prototype.slice
+      .call(blockChecklistWrap.querySelectorAll('input[type="checkbox"]:checked'))
+      .map(function (checkbox) { return checkbox.value; });
+
+    submitButton.disabled = true;
+    submitButton.textContent = "Uploading…";
+    setProgress(0, "Preparing…");
+
+    uploadFile(file, farmSelect.value, capturedInput ? capturedInput.value : "")
+      .then(function (result) {
+        // Straight into block selection, same as the plain-form fallback
+        // path (ImageListUploadView.post()) — see FarmMapView's
+        // upload_confirm mode. preselect_block (if any were checked above)
+        // lets FarmMapView's own JS skip straight to
+        // startProcessingForPreselectedBlocks() instead of showing the
+        // manual overlap-suggested checklist — see
+        // ImageListUploadView.post()'s matching query-param handling for
+        // the plain-form fallback path.
+        var redirectUrl = FARM_MAP_URL + "?upload_image=" + encodeURIComponent(result.image_id);
+        selectedBlockIds.forEach(function (blockId) {
+          redirectUrl += "&preselect_block=" + encodeURIComponent(blockId);
+        });
+        window.location.href = redirectUrl;
+      })
+      .catch(function (err) {
+        console.error("Chunked upload failed", err);
+        progressLabel.textContent =
+          (err && err.message ? err.message : String(err)) +
+          " — your progress is saved; click Upload again to resume.";
+        submitButton.disabled = false;
+        submitButton.textContent = "Upload";
+      });
+  });
+})();
+</script>
+
+<section>
+  <h2 class="section-heading">Recent uploads</h2>
+  {% if not images %}
+    <p class="empty-state">No images uploaded yet.</p>
+  {% else %}
+    <table class="data-table">
+      <thead><tr><th>Preview</th><th>Farm</th><th>Blocks</th><th>Uploaded</th><th>Georeference status</th><th>Format</th><th>Storage</th><th>Uploaded by</th><th></th></tr></thead>
+      <tbody>
+        {% for image in images %}
+        <tr>
+          <td>
+            {% if image.preview_file %}<img src="{{ image.preview_file.url }}" alt="" class="image-thumb">
+            {% else %}<span class="muted">—</span>{% endif %}
+          </td>
+          <td>{{ image.farm.name }}</td>
+          <td>
+            {% comment %}
+              processed_block_runs is precomputed in one query by
+              _attach_processed_blocks() (apps/dashboard/views.py) — the
+              real ImageProcessingRun history against each block, not a
+              footprint-overlap guess (see the removed "Overlapping
+              blocks" column this replaces, and the matching Farm Map fix,
+              both in BUILD_STATUS.md): an image's footprint can legitimately
+              reach a block it was never actually processed against.
+            {% endcomment %}
+            {% for run in image.processed_block_runs %}
+              <div>
+                <a href="{% url 'dashboard:imagery-block' block_id=run.farm_block_id %}" class="tag tag-link">{{ run.farm_block.name }}</a>
+                {% if run.status == "ready" %}<span class="tag tag-success">Ready</span>
+                {% elif run.status == "failed" %}<span class="tag tag-danger" title="{{ run.error_message }}">Failed</span>
+                {% else %}<span class="tag tag-warning">{{ run.get_status_display }}</span>{% endif %}
+              </div>
+            {% empty %}
+              <span class="muted">Not processed yet</span>
+            {% endfor %}
+          </td>
+          <td>{{ image.created_at }}</td>
+          <td>
+            {% if image.georeference_status == "done" %}<span class="tag tag-success">Done</span>
+            {% elif image.georeference_status == "failed" %}<span class="tag tag-danger">Failed — {{ image.georeference_error }}</span>
+            {% else %}<span class="tag tag-warning">Pending</span>{% endif %}
+          </td>
+          <td>
+            {% if image.is_cog %}<span class="tag tag-success" title="Internally tiled with baked-in overview levels — see convert_to_cog() in apps/imagery/services.py">COG</span>
+            {% elif image.cog_error %}<span class="tag tag-danger" title="{{ image.cog_error }}">Plain — conversion failed</span>
+            {% else %}<span class="muted">Plain</span>{% endif %}
+          </td>
+          <td>
+            {% if image.storage_tier == "cold" %}<span class="tag" title="Raw file older than the retention window — see docs/12-security-ops.md">Cold</span>
+            {% else %}<span class="muted">Hot</span>{% endif %}
+          </td>
+          <td>{{ image.uploaded_by|default:"—" }}</td>
+          <td>
+            {% comment %}
+              Only real path left, from this page, to "process this image
+              against a block" once the "Overlapping blocks" column (which
+              used to double as that navigation) was removed — reuses
+              ImageConfirmBlocksView as-is (it already handles a
+              still-georeferencing image with its own waiting state, so
+              this is safe to show regardless of georeference_status).
+            {% endcomment %}
+            <a href="{% url 'dashboard:imagery-confirm-blocks' image_id=image.id %}" class="link-button">Process against block(s)</a>
+            <a href="{% url 'dashboard:imagery-delete' image_id=image.id %}" class="link-button-danger">Delete</a>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</section>
+{% endblock %}

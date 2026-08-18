@@ -1,0 +1,22 @@
+{% comment %}
+Harvest plan create form fields — see _partials/block_form.html's comment
+for why this is a shared fragment. Block-level only, deliberately — see
+HarvestPlanForm's own docstring in apps/dashboard/forms.py.
+{% endcomment %}
+<form method="post" class="stacked-form" data-panel-form action="{% url 'dashboard:harvest-plan-add' block_id=farm_block.id %}">
+  {% csrf_token %}
+  {% if form.non_field_errors %}<div class="flash flash-error">{{ form.non_field_errors.0 }}</div>{% endif %}
+
+  <label for="{{ form.assessment_date.id_for_label }}">Assessment date</label>
+  {{ form.assessment_date }}
+  {% if form.assessment_date.errors %}<div class="field-error">{{ form.assessment_date.errors.0 }}</div>{% endif %}
+
+  <label for="{{ form.assessment_quantity.id_for_label }}">Assessed quantity</label>
+  {{ form.assessment_quantity }}
+  {% if form.assessment_quantity.errors %}<div class="field-error">{{ form.assessment_quantity.errors.0 }}</div>{% endif %}
+
+  <div class="panel-actions">
+    <button type="submit" class="primary-button primary-button-inline">Create harvest plan</button>
+    <a href="{% url 'dashboard:farms' %}?block={{ farm_block.id }}" class="secondary-button" data-panel-cancel>Cancel</a>
+  </div>
+</form>

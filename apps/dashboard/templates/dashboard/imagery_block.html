@@ -1,0 +1,70 @@
+{% extends "dashboard/base.html" %}
+{% block title %}{{ farm_block.name }} imagery{% endblock %}
+{% block page_title %}{{ farm_block.farm.name }} — {{ farm_block.name }}{% endblock %}
+{% block content %}
+{% if not farm_block.boundary %}
+  <div class="flash flash-error">
+    This block has no surveyed boundary yet — imagery processing refuses to run against it
+    (never processes an unclipped image).
+    <a href="{% url 'dashboard:block-boundary' block_id=farm_block.id %}">Draw the boundary</a> before triggering a run.
+  </div>
+{% endif %}
+
+<section>
+  <h2 class="section-heading">Images covering this block</h2>
+  {% if not overlapping_images %}
+    <p class="empty-state">No georeferenced images intersect this block's boundary yet. <a href="{% url 'dashboard:imagery' %}">Upload one</a>.</p>
+  {% else %}
+    <table class="data-table">
+      <thead><tr><th>Preview</th><th>Uploaded</th><th>Captured</th><th></th><th></th></tr></thead>
+      <tbody>
+        {% for image in overlapping_images %}
+        <tr>
+          <td>
+            {% if image.preview_file %}<img src="{{ image.preview_file.url }}" alt="" class="image-thumb">
+            {% else %}<span class="muted">—</span>{% endif %}
+          </td>
+          <td>{{ image.created_at }}</td>
+          <td>{{ image.captured_at|default:"—" }}</td>
+          <td>
+            {% if farm_block.boundary %}
+            <form method="post" action="{% url 'dashboard:imagery-process' block_id=farm_block.id image_id=image.id %}" class="inline-form">
+              {% csrf_token %}
+              <button type="submit" class="link-button-accent">Process against this block</button>
+            </form>
+            {% endif %}
+          </td>
+          <td><a href="{% url 'dashboard:imagery-delete' image_id=image.id %}" class="link-button-danger">Delete</a></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</section>
+
+<section>
+  <h2 class="section-heading">Processing runs</h2>
+  {% if not runs %}
+    <p class="empty-state">No processing runs yet for this block.</p>
+  {% else %}
+    <table class="data-table">
+      <thead><tr><th>Started</th><th>Status</th><th>Detected</th><th>New candidates</th><th></th></tr></thead>
+      <tbody>
+        {% for run in runs %}
+        <tr>
+          <td>{{ run.created_at }}</td>
+          <td>
+            {% if run.status == "ready" %}<span class="tag tag-success">Ready</span>
+            {% elif run.status == "failed" %}<span class="tag tag-danger">Failed — {{ run.error_message }}</span>
+            {% else %}<span class="tag tag-warning">{{ run.get_status_display }}{% if run.progress_percent is not None %} — {{ run.progress_percent }}%{% endif %}</span>{% endif %}
+          </td>
+          <td>{{ run.detected_tree_count }}</td>
+          <td>{{ run.new_candidate_count }}</td>
+          <td><a href="{% url 'dashboard:imagery-run' run_id=run.id %}">Review queue</a></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</section>
+{% endblock %}

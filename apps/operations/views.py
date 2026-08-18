@@ -1,5 +1,4 @@
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db.models import Q
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError as DRFValidationError
@@ -8,7 +7,7 @@ from rest_framework.response import Response
 
 from apps.common.mixins import IdempotentUUIDCreateMixin
 from apps.common.permissions import IsSuperAdminOrManager
-from apps.farms.models import UserFarmRole
+from apps.common.scoping import scoped_to_user_blocks as _scoped_to_user_blocks
 
 from .models import ActualFertilizer, ActualHarvest, Fertilizer, FertilizerTree, Harvest, HarvestTree
 from .serializers import (
@@ -21,21 +20,10 @@ from .serializers import (
 )
 from .services import advance_status
 
-
-def _scoped_to_user_blocks(queryset, user, block_field="farm_block"):
-    """Shared queryset scoping: Super Admin sees all; Manager sees plans on
-    farms they manage; PIC Block sees plans on blocks they're assigned to.
-    `block_field` is a lookup path to the FarmBlock relation (differs by
-    model — e.g. 'farm_block' on Harvest, 'harvest__farm_block' on ActualHarvest).
-    """
-    if user.is_superuser:
-        return queryset
-    managed_farm_ids = UserFarmRole.objects.filter(
-        user=user, role=UserFarmRole.ROLE_MANAGER
-    ).values_list("farm_id", flat=True)
-    return queryset.filter(
-        Q(**{f"{block_field}__pic": user}) | Q(**{f"{block_field}__farm_id__in": managed_farm_ids})
-    )
+# _scoped_to_user_blocks is now apps/common/scoping.py's scoped_to_user_blocks
+# (imported under its old local name to keep every call site below
+# unchanged) — centralized so this app's read scoping can't drift from the
+# same function apps/operations/serializers.py's FK write-scoping uses.
 
 
 class HarvestViewSet(viewsets.ModelViewSet):

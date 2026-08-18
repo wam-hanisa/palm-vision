@@ -18,7 +18,7 @@ docker compose exec web pytest -v
 ruff check .                                                # lint — see pyproject.toml
 ```
 
-App: http://localhost:8000/admin/ · API root: http://localhost:8000/api/ · PWA field client: http://localhost:8000/field/
+App: http://localhost:8000/admin/ · API root: http://localhost:8000/api/ · PWA field client: http://localhost:8000/field/ · Office dashboard: http://localhost:8000/dashboard/ (Manager/Super Admin login — see BUILD_STATUS.md for what's built there so far)
 
 Full walkthrough (prerequisites, PostGIS sanity check, offline testing,
 backup/restore drill, common issues): `docs/11-local-development.md`.

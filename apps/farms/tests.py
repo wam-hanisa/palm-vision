@@ -47,6 +47,35 @@ def test_effective_tree_match_threshold_uses_override_when_set(block_a):
     assert block_a.effective_tree_match_threshold_m() == 2.0
 
 
+# --- Harvest/fertilizer interval overrides (per-block, same fallback
+# pattern as tree_match_threshold_m above — see FarmBlock's own docstring) ---
+
+@pytest.mark.django_db
+def test_effective_harvest_interval_falls_back_to_setting(block_a, settings):
+    settings.HARVEST_DEFAULT_INTERVAL_DAYS = 10
+    block_a.harvest_interval_days = None
+    assert block_a.effective_harvest_interval_days() == 10
+
+
+@pytest.mark.django_db
+def test_effective_harvest_interval_uses_override_when_set(block_a):
+    block_a.harvest_interval_days = 21
+    assert block_a.effective_harvest_interval_days() == 21
+
+
+@pytest.mark.django_db
+def test_effective_fertilizer_interval_falls_back_to_setting(block_a, settings):
+    settings.FERTILIZER_DEFAULT_INTERVAL_DAYS = 90
+    block_a.fertilizer_interval_days = None
+    assert block_a.effective_fertilizer_interval_days() == 90
+
+
+@pytest.mark.django_db
+def test_effective_fertilizer_interval_uses_override_when_set(block_a):
+    block_a.fertilizer_interval_days = 180
+    assert block_a.effective_fertilizer_interval_days() == 180
+
+
 # --- API scoping ---
 
 @pytest.mark.django_db
@@ -87,3 +116,47 @@ def test_farm_block_geojson_action_returns_geo_feature(as_manager, block_a):
     assert response.status_code == status.HTTP_200_OK
     assert response.data["type"] == "Feature"
     assert response.data["geometry"]["type"] == "Polygon"
+
+
+# --- FarmBlock create/update permission (BUILD_STATUS.md "Known gaps" — this
+# viewset had get_queryset() scoping for reads but no perform_create()/
+# perform_update() check at all, unlike every other state-changing endpoint
+# in this project. A PIC Block user could previously create a block on any
+# farm by id, or edit one they're merely assigned to, not manage.) ---
+
+def _block_payload(farm):
+    return {
+        "farm": str(farm.id),
+        "name": "New Block",
+        "boundary": {
+            "type": "Polygon",
+            "coordinates": [[[101.4520, 0.5300], [101.4560, 0.5300], [101.4560, 0.5340], [101.4520, 0.5340], [101.4520, 0.5300]]],
+        },
+        "commodity": "Oil Palm",
+        "area": 10.0,
+        "year": 2020,
+    }
+
+
+@pytest.mark.django_db
+def test_manager_can_create_farm_block(as_manager, farm):
+    response = as_manager.post("/api/farm-blocks/", _block_payload(farm), format="json")
+    assert response.status_code == status.HTTP_201_CREATED, response.data
+
+
+@pytest.mark.django_db
+def test_pic_block_cannot_create_farm_block(as_pic_block, farm, block_a):
+    """block_a's own PIC Block user — being *assigned* to a block isn't the
+    same as being allowed to define new ones.
+    """
+    response = as_pic_block.post("/api/farm-blocks/", _block_payload(farm), format="json")
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert not FarmBlock.objects.filter(name="New Block").exists()
+
+
+@pytest.mark.django_db
+def test_pic_block_cannot_edit_their_own_assigned_block(as_pic_block, block_a):
+    response = as_pic_block.patch(f"/api/farm-blocks/{block_a.id}/", {"name": "Renamed"}, format="json")
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    block_a.refresh_from_db()
+    assert block_a.name != "Renamed"

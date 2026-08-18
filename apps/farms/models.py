@@ -70,6 +70,51 @@ class FarmBlock(gis_models.Model):
         blank=True,
         help_text="Overrides TREE_MATCH_DEFAULT_THRESHOLD_M for this block. See docs/06-ml-pipeline.md.",
     )
+    harvest_interval_days = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Overrides HARVEST_DEFAULT_INTERVAL_DAYS for this block — how often trees here are expected "
+            "to be harvested. Drives the per-tree harvest overdue/due-soon indicator on the Farm Map "
+            "(see Tree.harvest_status()). Per-block rather than global, same reasoning as "
+            "tree_match_threshold_m: different blocks/commodities can genuinely run different cycles, "
+            "and this is edited by a Manager/Super Admin right on this block's own edit form rather than "
+            "needing a separate settings screen."
+        ),
+    )
+    fertilizer_interval_days = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Overrides FERTILIZER_DEFAULT_INTERVAL_DAYS for this block — the fertilizer counterpart to "
+            "harvest_interval_days above. Kept as a separate field (not shared with harvest_interval_days) "
+            "since harvest and fertilizer cycles run on very different timescales in practice."
+        ),
+    )
+    crown_detection_iou_threshold = models.FloatField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Overrides CROWN_DETECTION_DEFAULT_IOU_THRESHOLD for this block — how much two crown-detection "
+            "boxes from adjacent orthomosaic tiles must overlap before apps/imagery/ml/detection.py's "
+            "_world_nms() treats them as the same tree rather than two separate ones. Same per-block-override "
+            "reasoning as tree_match_threshold_m above: planting density (and therefore real crown size "
+            "relative to the tiling grid) genuinely differs by block/commodity, so one global constant won't "
+            "fit every block equally well."
+        ),
+    )
+    detection_target_gsd_m = models.FloatField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Overrides DETECTION_DEFAULT_TARGET_GSD_M for this block — the ground sample distance (meters/pixel) "
+            "apps/imagery/ml/detection.py's _load_real_detector() resamples the orthomosaic to before tiling, so "
+            "a real crown appears roughly the pixel size the detector was trained to recognize. Found necessary "
+            "after a real report: this project's own imagery (1.843cm/px) is 2-5x finer than the training data's "
+            "implied GSD, causing the detector to fire on individual fronds instead of whole crowns. Per-block "
+            "since actual crown size (young vs. mature palms, different commodities) genuinely varies."
+        ),
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -111,6 +156,26 @@ class FarmBlock(gis_models.Model):
         from django.conf import settings as django_settings
 
         return self.tree_match_threshold_m or django_settings.TREE_MATCH_DEFAULT_THRESHOLD_M
+
+    def effective_harvest_interval_days(self):
+        from django.conf import settings as django_settings
+
+        return self.harvest_interval_days or django_settings.HARVEST_DEFAULT_INTERVAL_DAYS
+
+    def effective_fertilizer_interval_days(self):
+        from django.conf import settings as django_settings
+
+        return self.fertilizer_interval_days or django_settings.FERTILIZER_DEFAULT_INTERVAL_DAYS
+
+    def effective_crown_detection_iou_threshold(self):
+        from django.conf import settings as django_settings
+
+        return self.crown_detection_iou_threshold or django_settings.CROWN_DETECTION_DEFAULT_IOU_THRESHOLD
+
+    def effective_detection_target_gsd_m(self):
+        from django.conf import settings as django_settings
+
+        return self.detection_target_gsd_m or django_settings.DETECTION_DEFAULT_TARGET_GSD_M
 
     def overlapping_blocks(self, tolerance_ratio=0.01):
         """Returns other blocks on the same farm whose boundary overlaps

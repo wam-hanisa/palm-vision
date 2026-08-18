@@ -1,13 +1,14 @@
 /* Public Sans, vendored as a variable woff2 (latin subset, 26KB) rather than
    linked from the Google Fonts CDN — docs/09-design-system.md asks for a
-   humanist sans, but this app must render correctly with no network at all,
-   so an external stylesheet link would silently fall back to a system font
-   in exactly the offline situation the PWA exists for. Precached by
-   pwa/service-worker.js's APP_SHELL. */
+   humanist sans, but the font-family below had no @font-face anywhere in the
+   project, so every screen silently rendered in a system fallback. A CDN
+   <link> would do the same thing in exactly the offline case this PWA exists
+   for, so the file is served same-origin and precached by the service
+   worker's APP_SHELL. */
 @font-face {
   font-family: "Public Sans";
   font-style: normal;
-  font-weight: 100 900;          /* single variable file covers every weight used */
+  font-weight: 100 900;          /* one variable file covers every weight used */
   font-display: swap;
   src: url("/pwa/fonts/public-sans-latin.woff2") format("woff2");
 }
@@ -23,19 +24,15 @@
   --primary-hover: #3E6049;
   --accent: #D9A441;
   --text: #2B2A25;
-  /* Contrast-corrected text tokens. The values in docs/09-design-system.md
-     are the *surface* palette; used as small text they fell below WCAG AA
-     (measured on a real render: muted 3.47:1 on cream / 3.14:1 on card,
-     danger 4.24:1, warning-fg 3.84:1, white-on-moss 3.63:1). Each token
-     below is the same hue darkened by the minimum amount that clears 4.5:1
-     against every background it actually sits on — the doc's own stated
-     goal is "stays legible outdoors on a phone screen," which those
-     original values did not meet. Surface tokens above are untouched. */
-  /* Dark enough to clear 4.5:1 on every surface it actually lands on, not
-     just the page background: cream 5.6:1, card 5.1:1, row hover 4.7:1,
-     and the darkest case — the neutral health pill at #E2DED0 — 4.55:1. */
-  --text-muted: #656258;         /* was #8A8578 (3.47:1 cream / 3.14:1 card) */
-  --success: #5E7E63;            /* was #6B8F71 — 4.53:1 against white chip text */
+  /* Contrast-corrected TEXT tokens. The values in docs/09-design-system.md
+     are the surface palette; used as small text they failed WCAG AA when
+     measured on a real render — muted 3.47:1 on cream and 3.14:1 on card,
+     danger 4.24:1, warning-fg 3.84:1, white-on-moss 3.63:1 (the sync chip,
+     the one element that must stay readable in direct sun). Each is the
+     same hue darkened by the minimum amount that clears 4.5:1 against every
+     background it actually sits on. Surface tokens above are untouched. */
+  --text-muted: #656258;         /* was #8A8578 — 5.75:1 cream, 5.21:1 card, 4.53:1 pill */
+  --success: #5E7E63;            /* was #6B8F71 — 4.53:1 with white chip text */
   --warning-fg: #816029;         /* was #8F6B2E — 4.54:1 on --warning-bg */
   --warning-bg: #EFE3CE;
   --danger: #A65343;             /* was #B85C4A — 5.04:1 cream, 4.57:1 card */
@@ -62,12 +59,12 @@ h2 { font-size: 1.1rem; color: var(--primary); }
 
 .screen { padding: 1rem 1rem 2rem; max-width: 480px; margin: 0 auto; }
 
-/* Title first and left-aligned; any trailing control (back link, log out)
-   is pushed to the far end by the auto margin rather than by
-   space-between, which previously reversed the visual order on every
-   screen whose back button came first in the DOM. `min-width: 0` +
-   `white-space: nowrap` on the control stop the back link collapsing onto
-   two lines at 390px, which it did on the harvest/fertilizer forms. */
+/* Title first and left-aligned; trailing controls are pushed to the far end
+   by an auto margin rather than by space-between, which previously reversed
+   the visual order on every screen whose back button preceded the <h1> —
+   flinging block and form titles against the right edge. nowrap stops the
+   back link collapsing onto two lines at 390px, which it did on the
+   harvest/fertilizer forms. */
 .screen-header {
   display: flex;
   align-items: baseline;
@@ -75,19 +72,11 @@ h2 { font-size: 1.1rem; color: var(--primary); }
   margin-bottom: 1rem;
 }
 
-.screen-header h1 {
-  flex: 1 1 auto;
-  min-width: 0;
-  order: 1;
-}
-
-.screen-header .btn-text {
-  flex: 0 0 auto;
-  white-space: nowrap;
-}
-
+.screen-header h1 { flex: 1 1 auto; min-width: 0; order: 1; }
+.screen-header .btn-text { flex: 0 0 auto; white-space: nowrap; }
 .screen-header .btn-text--back { order: 0; padding-left: 0; }
-.screen-header .btn-text--end { order: 2; margin-left: auto; }
+.screen-header .btn-text--end,
+.screen-header__actions { order: 2; margin-left: auto; }
 
 button, .btn-text {
   font-size: 1.1rem;
@@ -120,29 +109,54 @@ label {
   color: var(--text);
 }
 
-input {
+input, select {
   font-size: 1.2rem;
   padding: 0.8rem;
   border: 2px solid var(--text-muted);
   border-radius: 0.5rem;
   background: white;
+  font-family: inherit;
+  color: var(--text);
 }
 
 /* Never remove the focus indicator outright — the previous rule set
-   `outline: none` and relied on a border-colour change alone, which is the
-   weakest possible affordance and fails WCAG 2.4.7. */
+   `outline: none` and relied on a border-colour change alone, the weakest
+   possible affordance, failing WCAG 2.4.7. */
 input:focus-visible,
+select:focus-visible,
 button:focus-visible,
-[role="button"]:focus-visible {
+[role="button"]:focus-visible,
+a:focus-visible {
   outline: 3px solid var(--focus-ring);
   outline-offset: 2px;
 }
 
-input:focus { border-color: var(--primary); }
+input:focus, select:focus { border-color: var(--primary); }
 
-/* Equal columns instead of `flex: 1 1 auto`, which sized each button to its
-   own label and produced a ragged row. A trailing odd button spans the full
-   width rather than sitting half-empty next to dead space. */
+/* treeDetailScreen()'s edit form — the "update_location" checkbox reads as
+   a sentence ("Update pin to my current GPS position…"), so it needs the
+   checkbox and its label text side by side, not the stacked
+   label-above-field layout the rest of this file's `label` rule gives
+   text/select inputs. */
+.checkbox-label {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.6rem;
+  font-weight: 500;
+}
+
+.checkbox-label input[type="checkbox"] {
+  width: 1.4rem;
+  height: 1.4rem;
+  flex-shrink: 0;
+  accent-color: var(--primary);
+}
+
+.checkbox-label input[type="checkbox"]:disabled { opacity: 0.5; }
+
+/* Equal columns rather than `flex: 1 1 auto`, which sized each button to its
+   own label and left a ragged row with one button stranded. A trailing odd
+   button spans the full width instead of sitting beside dead space. */
 .action-row {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
@@ -161,12 +175,7 @@ input:focus { border-color: var(--primary); }
   cursor: pointer;
 }
 
-/* "You are here" is a neutral locational fact, not a call to action.
-   docs/09-design-system.md reserves the amber accent for one meaning —
-   "needs attention" — so this uses the primary green instead; previously
-   the current block was the loudest thing on the screen and amber was
-   well on its way to becoming wallpaper. */
-.block-item--here { border: 2px solid var(--primary); }
+.block-item--here { border: 2px solid var(--accent); }
 
 .block-item__name, .tree-item__name { font-weight: 700; font-size: 1.1rem; }
 .block-item__meta, .tree-item__meta { color: var(--text-muted); font-size: 0.95rem; }
@@ -180,15 +189,13 @@ input:focus { border-color: var(--primary); }
   font-weight: 600;
 }
 
-.pill--accent { background: var(--accent); color: var(--text); }   /* needs-attention only */
-.pill--here { background: var(--primary); color: white; }
+.pill--accent { background: var(--accent); color: var(--text); }
 .pill--warning { background: var(--warning-bg); color: var(--warning-fg); }
 
-/* The children here used to be bare text nodes, so `justify-content:
-   space-between` treated each run of text as its own flex item and tore
-   the sentence into three widely-spaced fragments. The copy now lives in
-   a single .proximity-prompt__text element (see app.js) and the container
-   simply stacks. */
+/* The children were bare text nodes, so `justify-content: space-between`
+   treated each run of text as its own flex item and tore the sentence into
+   three widely-spaced fragments. Copy now lives in one
+   .proximity-prompt__text element (see app.js) and the container stacks. */
 .proximity-prompt {
   background: var(--warning-bg);
   color: var(--warning-fg);
@@ -204,6 +211,31 @@ input:focus { border-color: var(--primary); }
 .proximity-prompt__text { margin: 0; }
 
 .proximity-prompt button { background: var(--accent); color: var(--text); min-height: 44px; }
+
+/* Stage-1 "needs harvest/fertilizer" flags a Manager set from the office
+   dashboard — see Tree.harvest_marked_at's help_text (apps/trees/models.py)
+   and app.js's blockScreen()/markBanner(). Reuses .pill--accent so these
+   read as the same "needs attention" visual language as the "You are here"
+   pill already used elsewhere, rather than inventing a new color. */
+.attention-banner { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1rem; }
+.attention-banner .pill { margin-top: 0; }
+
+.tree-item__meta .pill { margin-top: 0; margin-left: 0.4rem; font-size: 0.75rem; }
+
+.mark-banner {
+  background: var(--accent);
+  color: var(--text);
+  border-radius: 0.6rem;
+  padding: 1rem;
+  margin-bottom: 1rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+}
+
+.mark-banner .pill { margin-top: 0; background: transparent; padding: 0; font-weight: 600; }
+.mark-banner button { min-height: 44px; flex-shrink: 0; }
 
 /* Always-visible offline/sync status chip — docs/09-design-system.md is
    explicit this must never be buried in a menu. */
@@ -223,15 +255,93 @@ input:focus { border-color: var(--primary); }
 .sync-chip--syncing { background: var(--primary); }
 .sync-chip--offline { background: var(--danger); }
 
+/* Only rendered when the outbox actually has queued items — see
+   app.js's renderUnsyncedBanner(). More prominent and more explicit than
+   the chip above ("3 items waiting to sync"), plus a manual "Sync now"
+   affordance, since a subtle status chip is easy to stop noticing. */
+.unsynced-banner {
+  position: sticky;
+  top: 1.9rem; /* sits directly under the sync-chip, not overlapping it */
+  z-index: 9;
+  background: var(--warning-bg);
+  color: var(--warning-fg);
+  padding: 0.6rem 0.9rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.unsynced-banner button {
+  background: var(--primary);
+  color: white;
+  min-height: 36px;
+  padding: 0.3rem 0.8rem;
+  font-size: 0.85rem;
+  flex-shrink: 0;
+}
+
+.unsynced-banner button:disabled {
+  background: var(--text-muted);
+}
+
 .screen--login { padding-top: 3rem; text-align: center; }
 .screen--login form { text-align: left; }
 
+.screen-header__actions { display: flex; gap: 0.4rem; }
+
+/* Farm-level offline map (screen--map) — app.js's mapScreen(). A small,
+   custom-drawn SVG of block boundaries plus a live GPS dot; no basemap
+   tile imagery (see mapScreen()'s own comment for why). */
+.map-svg {
+  width: 100%;
+  max-height: 60vh;
+  background: var(--card);
+  border-radius: 0.6rem;
+  margin: 0.75rem 0;
+}
+
+.map-block-shape {
+  fill: rgba(107, 143, 113, 0.35); /* var(--success) at low opacity */
+  stroke: var(--primary);
+  stroke-width: 3;
+  cursor: pointer;
+}
+
+.map-block-shape--here {
+  fill: rgba(217, 164, 65, 0.35); /* var(--accent) at low opacity */
+  stroke: var(--accent);
+}
+
+.map-block-label {
+  fill: var(--text);
+  font-size: 14px;
+  font-weight: 700;
+  pointer-events: none;
+}
+
+.map-user-dot {
+  fill: #2E7BD6;
+  stroke: white;
+  stroke-width: 2;
+}
+
+.map-accuracy-ring {
+  fill: rgba(46, 123, 214, 0.15);
+  stroke: rgba(46, 123, 214, 0.4);
+  stroke-width: 1;
+}
+
+.map-legend-note { font-size: 0.85rem; }
+
 /* --- Empty states -------------------------------------------------------
-   These were previously a bare `<li class="muted">` inside the record list
-   (semantically a list item pretending to be a message) or a loose <p>.
-   They now get their own dashed-outline surface so "nothing here yet" reads
-   as a deliberate state rather than a rendering failure. Dashed border, not
-   a filled card, so an empty block never looks like it contains a record. */
+   Previously bare muted text — one of them an `<li class="muted">` inside
+   the record list, i.e. a list item pretending to be a message. A dashed
+   outline (not a filled card) so an empty block never looks like it holds
+   a record. */
 .empty-state {
   border: 2px dashed #D8D3C4;
   border-radius: 0.6rem;
@@ -249,45 +359,8 @@ input:focus { border-color: var(--primary); }
 
 .empty-state__hint { font-size: 0.95rem; margin: 0; }
 
-/* --- Loading state ------------------------------------------------------ */
 .loading-state {
   padding: 2rem 1rem;
   text-align: center;
   color: var(--text-muted);
-}
-
-/* --- List items as real controls ---------------------------------------
-   .block-item/.tree-item are keyboard-focusable buttons now (role="button"
-   + tabindex in app.js), so they need a hover/active affordance and a
-   focus ring like any other control. */
-.block-item:hover, .tree-item:hover { background: #E8E4D6; }
-
-.tree-item__row {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 0.75rem;
-}
-
-/* Status pill carries a text label as well as a colour, so it stays
-   readable for colourblind users — never colour alone. */
-.pill--health-healthy { background: var(--success); color: white; }
-.pill--health-attention { background: var(--warning-bg); color: var(--warning-fg); }
-.pill--health-unknown { background: #E2DED0; color: var(--text-muted); }
-
-/* Queued-but-unsynced records, so a field worker can see their offline
-   entry landed rather than wondering if it vanished. */
-.pill--queued { background: var(--warning-bg); color: var(--warning-fg); }
-
-.tree-item--pending { border-left: 4px solid var(--accent); }
-
-/* Visually-hidden text for screen readers (used to label the sync chip). */
-.sr-only {
-  position: absolute;
-  width: 1px; height: 1px;
-  padding: 0; margin: -1px;
-  overflow: hidden;
-  clip: rect(0 0 0 0);
-  white-space: nowrap;
-  border: 0;
 }

@@ -1,0 +1,1076 @@
+/*
+ * docs/09-design-system.md — "agriculture modern minimalism." Colors,
+ * densities, and layout principles below are taken directly from that doc's
+ * tables, not invented here. One deliberate deviation, flagged rather than
+ * silently done: the doc suggests "Inter or Public Sans" loaded as a real
+ * font; this stays on a system-font stack instead (no external font file),
+ * since this project's local-dev/offline-first stance (CLAUDE.md) shouldn't
+ * quietly grow a hard dependency on an internet connection just to render
+ * the office dashboard's text. Line icons (also mentioned in that doc) are
+ * built — see .nav-icon below and the <symbol> sprite defined once in
+ * base.html — as small, original stroke-based SVGs rather than an external
+ * icon font, keeping the same no-external-font-dependency reasoning as the
+ * point above.
+ */
+
+:root {
+  --bg: #FAF8F3;
+  --card: #F0EDE2;
+  --primary: #2F4A38;
+  --primary-hover: #3E6049;
+  --accent: #D9A441;
+  --text: #2B2A25;
+  --text-muted: #8A8578;
+  --success: #6B8F71;
+  --warning-bg: #EFE3CE;
+  --warning-text: #8F6B2E;
+  --danger: #B85C4A;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: Inter, "Public Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+a { color: var(--primary); }
+
+.shell {
+  display: flex;
+  min-height: 100vh;
+}
+
+/* --- Sidebar (flat, no shadows/gradients per the layout principles) --- */
+
+.sidebar {
+  width: 240px;
+  flex-shrink: 0;
+  background: var(--primary);
+  color: #FAF8F3;
+  display: flex;
+  flex-direction: column;
+  padding: 24px 0;
+}
+
+.brand {
+  font-weight: 700;
+  font-size: 18px;
+  padding: 0 24px 24px;
+}
+
+.sidebar nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+}
+
+.nav-link {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 24px;
+  color: #E7E4D8;
+  text-decoration: none;
+  font-size: 14px;
+}
+
+.nav-icon {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.nav-soon .nav-icon {
+  opacity: 0.6;
+}
+
+.nav-link.active {
+  background: var(--primary-hover);
+  color: #fff;
+  font-weight: 600;
+}
+
+.nav-link:not(.nav-soon):hover {
+  background: var(--primary-hover);
+}
+
+.nav-soon {
+  color: #8FA093;
+  cursor: default;
+}
+
+.nav-soon em {
+  font-style: normal;
+  font-size: 11px;
+  background: rgba(217, 164, 65, 0.25);
+  color: var(--accent);
+  padding: 1px 6px;
+  border-radius: 999px;
+  margin-left: 6px;
+}
+
+.sidebar-footer {
+  padding: 16px 24px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+  margin-top: 16px;
+}
+
+.user-chip {
+  font-size: 13px;
+  color: #E7E4D8;
+  margin-bottom: 8px;
+}
+
+.link-button {
+  background: none;
+  border: none;
+  color: #E7E4D8;
+  text-decoration: underline;
+  cursor: pointer;
+  padding: 0;
+  font-size: 13px;
+}
+
+/* --- Main content --- */
+
+.content {
+  flex: 1;
+  padding: 32px 40px;
+}
+
+.page-title {
+  font-size: 22px;
+  font-weight: 700;
+  margin: 0 0 20px;
+}
+
+/* --- Metric cards --- */
+
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.metric-card {
+  background: var(--card);
+  border-radius: 6px;
+  padding: 20px;
+}
+
+.metric-card.metric-attention {
+  background: var(--warning-bg);
+}
+
+.metric-value {
+  font-size: 32px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.metric-card.metric-attention .metric-value {
+  color: var(--warning-text);
+}
+
+.metric-label {
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.metric-sub {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.panel-note {
+  color: var(--text-muted);
+  font-size: 13px;
+  max-width: 640px;
+}
+
+/* Sub-nav row across the five Compliance pages (documents, batches,
+   baselines, audits, grievances) — the sidebar only carries one
+   "Compliance" entry (see base.html), so these pages need their own way
+   to jump between each other. */
+.subnav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 18px;
+}
+
+.subnav a {
+  padding: 5px 12px;
+  border-radius: 999px;
+  font-size: 13px;
+  text-decoration: none;
+  color: var(--text-muted);
+  background: var(--card);
+}
+
+.subnav a.active {
+  color: white;
+  background: var(--primary);
+  font-weight: 600;
+}
+
+/* compliance_audits.html — one collapsible <details> per audit, since a
+   full checklist-item breakdown per audit is too much to show flat in one
+   table row alongside every other audit. */
+.audit-details {
+  margin-bottom: 12px;
+}
+
+.audit-details summary {
+  cursor: pointer;
+  padding: 6px 0;
+}
+
+.audit-details table {
+  margin-top: 10px;
+}
+
+/* --- Tables (trimmed to columns people actually scan, per the doc) --- */
+
+.farm-section {
+  margin-bottom: 32px;
+}
+
+.farm-name {
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0 0 10px;
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--card);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.data-table th, .data-table td {
+  text-align: left;
+  padding: 10px 16px;
+  font-size: 13px;
+}
+
+.data-table th {
+  color: var(--text-muted);
+  font-weight: 600;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+}
+
+.data-table tr + tr td {
+  border-top: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+}
+
+/* imagery_list.html's "overlapping blocks" chips — each one links straight
+   to that block's Imagery page, so it needs to read as clickable, unlike
+   the plain status tags above (which are never links). */
+a.tag-link {
+  background: var(--card);
+  border: 1px solid #D8D3C3;
+  color: var(--primary);
+  text-decoration: none;
+  margin-right: 4px;
+}
+
+a.tag-link:hover {
+  background: #E3E0D3;
+}
+
+/* imagery_list.html / imagery_block.html — Image.preview_file thumbnails
+   (apps/imagery/services.py's generate_preview()). */
+.image-thumb {
+  width: 64px;
+  height: 64px;
+  object-fit: cover;
+  border-radius: 4px;
+  display: block;
+}
+
+/* image_delete.html — a bigger version so a Manager can actually see what
+   they're about to permanently delete, not just a 64px row thumbnail. */
+.image-thumb-large {
+  max-width: 400px;
+  width: 100%;
+  border-radius: 6px;
+  margin-bottom: 16px;
+  display: block;
+}
+
+.tag-warning {
+  background: var(--warning-bg);
+  color: var(--warning-text);
+}
+
+.empty-state {
+  color: var(--text-muted);
+  font-size: 14px;
+}
+
+/* --- Notifications --- */
+
+.notification-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.notification-item {
+  background: var(--card);
+  border-radius: 6px;
+  padding: 14px 16px;
+}
+
+.notification-item.notification-unread {
+  border-left: 3px solid var(--accent);
+}
+
+.notification-title {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.notification-message {
+  font-size: 13px;
+  color: var(--text);
+  margin-top: 4px;
+}
+
+.notification-meta {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 6px;
+}
+
+/* --- Flash messages --- */
+
+.flash {
+  padding: 10px 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  margin-bottom: 16px;
+}
+
+.flash-error {
+  background: #F5DEDA;
+  color: var(--danger);
+}
+
+.flash-success {
+  background: #E3ECE4;
+  color: var(--success);
+}
+
+.flash-info {
+  background: var(--card);
+  color: var(--text);
+}
+
+/* --- Login screen --- */
+
+.login-screen {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+}
+
+.login-card {
+  background: var(--card);
+  border-radius: 8px;
+  padding: 36px;
+  width: 340px;
+}
+
+.brand-login {
+  color: var(--primary);
+  font-size: 20px;
+  padding: 0;
+  margin-bottom: 4px;
+}
+
+.login-sub {
+  font-size: 13px;
+  color: var(--text-muted);
+  margin: 0 0 20px;
+}
+
+.login-card label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  margin: 12px 0 4px;
+}
+
+.login-card input {
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid #D8D3C3;
+  border-radius: 4px;
+  font-size: 14px;
+  background: #fff;
+  color: var(--text);
+}
+
+.primary-button {
+  width: 100%;
+  margin-top: 20px;
+  padding: 10px;
+  background: var(--primary);
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.primary-button:hover {
+  background: var(--primary-hover);
+}
+
+/* --- Imagery: upload panel, block detail, review queue --- */
+
+.panel {
+  background: var(--card);
+  border-radius: 6px;
+  padding: 24px;
+  margin-bottom: 32px;
+  max-width: 480px;
+}
+
+/* Found while building the new imagery-confirm-blocks map (below): the
+   base .panel's 480px max-width, correct for the form-shaped panels it
+   was written for, was quietly cramming the 560px-tall #dashboard-map on
+   the existing Map page into a 480px-wide box too — a real pre-existing
+   layout gap, not something new this page introduced. Rather than widen
+   .panel itself (plenty of other panels genuinely want the narrower,
+   more-readable form width), this is an opt-in override for the panels
+   that specifically wrap a map. Applied to both the Map page and the new
+   imagery-confirm-blocks page below. */
+.panel-wide {
+  max-width: none;
+}
+
+.section-heading {
+  font-size: 15px;
+  font-weight: 600;
+  margin: 0 0 14px;
+}
+
+.stacked-form label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  margin: 12px 0 4px;
+}
+
+.stacked-form input, .stacked-form select {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid #D8D3C3;
+  border-radius: 4px;
+  font-size: 14px;
+  background: #fff;
+  color: var(--text);
+}
+
+.field-error {
+  color: var(--danger);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+.field-hint {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin: 2px 0 0;
+}
+
+.upload-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.upload-progress-track {
+  flex: 1;
+  height: 8px;
+  background: #E4DFCF;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.upload-progress-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  transition: width 0.15s ease-out;
+}
+
+.upload-progress-label {
+  font-size: 12px;
+  color: var(--text-muted);
+  min-width: 32px;
+  text-align: right;
+}
+
+.primary-button-inline {
+  width: auto;
+  padding: 8px 20px;
+}
+
+.primary-button-small {
+  padding: 6px 14px;
+  font-size: 13px;
+  background: var(--primary);
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  width: 100%;
+}
+
+.primary-button-small:hover {
+  background: var(--primary-hover);
+}
+
+.secondary-button {
+  padding: 6px 12px;
+  font-size: 13px;
+  background: transparent;
+  color: var(--primary);
+  border: 1px solid var(--primary);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.tag-success {
+  background: #E3ECE4;
+  color: var(--success);
+}
+
+.tag-danger {
+  background: #F5DEDA;
+  color: var(--danger);
+}
+
+.inline-form {
+  margin: 0 0 8px;
+}
+
+.link-button-accent {
+  background: none;
+  border: none;
+  color: var(--primary);
+  text-decoration: underline;
+  cursor: pointer;
+  padding: 0;
+  font-size: 13px;
+}
+
+.link-button-danger {
+  background: none;
+  border: none;
+  color: var(--danger);
+  text-decoration: underline;
+  cursor: pointer;
+  padding: 0;
+  font-size: 12px;
+}
+
+.detection-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 16px;
+}
+
+.detection-card {
+  background: var(--card);
+  border-radius: 6px;
+  padding: 16px;
+}
+
+.detection-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.detection-confidence {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.detection-coords {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 12px;
+  font-family: monospace;
+}
+
+/* The exact crop apps/imagery/services.py's classify_detection() fed the
+   classifier — see TreeHealthClassification.patch_image. object-fit:cover
+   on a fixed square keeps the grid tidy regardless of the source patch's
+   actual (near-square, but not guaranteed exact) pixel dimensions. */
+.detection-thumb {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  object-fit: cover;
+  border-radius: 4px;
+  margin-bottom: 8px;
+  background: #E3E0D3; /* visible while loading, and for the no-patch placeholder */
+}
+
+.detection-thumb-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.detection-classification {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.detection-link-form {
+  display: flex;
+  gap: 6px;
+}
+
+.detection-link-form select {
+  flex: 1;
+  padding: 5px 6px;
+  font-size: 12px;
+  border: 1px solid #D8D3C3;
+  border-radius: 4px;
+}
+
+/* --- Map panel --- */
+
+.map-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  font-size: 13px;
+}
+
+.map-toolbar select {
+  padding: 6px 8px;
+  border: 1px solid #D8D3C3;
+  border-radius: 4px;
+  background: #fff;
+  font-size: 13px;
+  color: var(--text);
+}
+
+#dashboard-map, #confirm-blocks-map {
+  width: 100%;
+  height: 560px;
+  border-radius: 6px;
+  border: 1px solid #D8D3C3;
+  background: var(--card); /* visible while tiles load */
+  margin-bottom: 16px;
+}
+
+.chart-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(280px, 1fr));
+  gap: 24px;
+  margin-top: 8px;
+}
+
+.chart-grid .panel {
+  max-width: none;
+}
+
+.chart-grid canvas {
+  max-height: 320px;
+}
+
+.row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.block-checklist {
+  list-style: none;
+  padding: 0;
+  margin: 16px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.block-checklist label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+}
+
+.map-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  margin-top: 12px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.map-legend-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.legend-swatch {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+.legend-swatch-line {
+  width: 16px;
+  height: 3px;
+  border-radius: 0;
+}
+
+/* Harvest/fertilizer indicator ring swatches — mirrors the stroke drawn
+   around each tree marker on the map itself (see farm_map.html's
+   treeIndicatorStyle()). Unfilled (background transparent), unlike the
+   solid health swatches above, since on the real map this ring sits
+   around the health-colored fill rather than replacing it. */
+.legend-swatch-ring {
+  background: transparent;
+  border-radius: 50%;
+  border: 2px solid;
+}
+
+.legend-swatch-ring-dashed {
+  border-style: dashed;
+}
+
+.map-popup-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.map-popup-link {
+  display: inline-block;
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+/* --- Farm Map: the unified map + contextual management panel that
+   replaced the separate Map / Farms & Blocks / block-trees pages.
+   Google-Maps-style full-page layout: #farm-map fills the entire content
+   area behind everything; the toolbar + drill-down panel float together
+   as one card (.farm-map-float) and the legend floats separately —
+   .farm-map-fullpage (set via farm_map.html's {% block body_class %}) is
+   what turns off .content's normal card/padding chrome to make room. This
+   is the one dashboard page that breaks out of the standard
+   .content/.panel system above — every other page keeps it. */
+
+body.farm-map-fullpage .shell {
+  height: 100vh;
+}
+
+body.farm-map-fullpage .content {
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  /* Positioning context for #farm-map-flash below — without this, its
+     position:absolute would resolve against the viewport (including the
+     sidebar's width) instead of just this content area. */
+  position: relative;
+}
+
+body.farm-map-fullpage .page-title {
+  display: none;
+}
+
+body.farm-map-fullpage .flash {
+  margin: 12px 16px 0;
+}
+
+/* AJAX action feedback (farm_map.html's flashHost) — floats centered over
+   the map instead of sitting in normal document flow, since there's no
+   normal document flow left to sit in. */
+#farm-map-flash:not(:empty) {
+  position: absolute;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1100;
+  max-width: min(600px, calc(100% - 32px));
+}
+
+/* The georeferencing-pending/failed states (no map to show yet) need
+   .content's padding back — see farm_map.html's own comment on this
+   wrapper for why. */
+.farm-map-waiting {
+  padding: 32px 40px;
+}
+
+.farm-map-shell {
+  position: relative;
+  flex: 1;
+  min-height: 0; /* let the flex child actually shrink to fill, not overflow */
+}
+
+#farm-map {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  background: var(--card);
+}
+
+/* Lasso multi-select mode (farm_map.html's startLassoSelect()) — swaps
+   the cursor to crosshair for the duration of the drag so it's clear the
+   map has switched out of its normal pan behavior. */
+#farm-map.lasso-active,
+#farm-map.lasso-active .leaflet-container {
+  cursor: crosshair;
+}
+
+/* The floating toolbar + drill-down panel card — top-left, like Google
+   Maps' own search+results panel. bottom:16px (not a fixed height) so it
+   naturally fills the available vertical space and lets .farm-map-panel's
+   own overflow-y:auto do the scrolling, rather than a hardcoded max-height
+   fighting against however tall the browser window actually is. */
+.farm-map-float {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  bottom: 16px;
+  width: 380px;
+  max-width: calc(100% - 32px);
+  background: var(--card);
+  border-radius: 8px;
+  box-shadow: 0 2px 16px rgba(43, 42, 37, 0.22);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  z-index: 1000;
+}
+
+.farm-map-float .map-toolbar {
+  padding: 16px 16px 0;
+  margin-bottom: 12px;
+  flex-shrink: 0;
+}
+
+.farm-map-panel {
+  flex: 1;
+  padding: 0 20px 20px;
+  overflow-y: auto;
+}
+
+/* The legend floats bottom-right, out of the way of the main panel on the
+   left — small and unobtrusive, matching Google Maps' own bottom-corner
+   attribution/legend placement. */
+.map-legend {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  max-width: 280px;
+  background: var(--card);
+  padding: 12px 16px;
+  border-radius: 8px;
+  box-shadow: 0 2px 16px rgba(43, 42, 37, 0.22);
+  z-index: 1000;
+}
+
+.panel-breadcrumb {
+  font-size: 12px;
+  margin-bottom: 14px;
+}
+
+.panel-breadcrumb button {
+  background: none;
+  border: none;
+  color: var(--primary);
+  text-decoration: underline;
+  cursor: pointer;
+  padding: 0;
+  font-size: 12px;
+}
+
+.panel-heading {
+  font-size: 16px;
+  font-weight: 700;
+  margin: 0 0 4px;
+}
+
+/* A <details>/<summary> section inside the map panel (currently just the
+   block panel's Trees list) — collapsed by default so a block with a real
+   farm's worth of trees doesn't turn the panel into one long scroll. */
+.panel-collapsible summary {
+  font-size: 16px;
+  font-weight: 700;
+  margin: 0 0 4px;
+  cursor: pointer;
+  list-style: none; /* hide the default disclosure triangle, draw our own */
+}
+
+.panel-collapsible summary::-webkit-details-marker {
+  display: none;
+}
+
+.panel-collapsible summary::before {
+  content: "▸";
+  display: inline-block;
+  width: 14px;
+  color: var(--text-muted);
+  transition: transform 0.15s ease;
+}
+
+.panel-collapsible[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.panel-collapsible .panel-actions {
+  margin-top: 8px;
+}
+
+.panel-subheading {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin: 0 0 14px;
+}
+
+.panel-list {
+  list-style: none;
+  margin: 0 0 14px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.panel-list-button {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  padding: 9px 10px;
+  border-radius: 4px;
+  font-size: 14px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.panel-list-button:hover {
+  background: rgba(47, 74, 56, 0.08);
+}
+
+.panel-list-button.selected {
+  background: var(--primary);
+  color: #fff;
+  font-weight: 600;
+}
+
+.panel-list-meta {
+  font-size: 12px;
+  color: inherit;
+  opacity: 0.75;
+  white-space: nowrap;
+}
+
+.detail-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 13px;
+  padding: 5px 0;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.detail-row-label {
+  color: var(--text-muted);
+}
+
+.detail-row-value {
+  font-weight: 600;
+  text-align: right;
+}
+
+.panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.panel-empty {
+  font-size: 13px;
+  color: var(--text-muted);
+  margin: 8px 0 16px;
+}
+
+.tree-checklist {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.tree-checklist label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}

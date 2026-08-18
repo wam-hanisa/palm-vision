@@ -1,0 +1,40 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Delete image{% endblock %}
+{% block page_title %}Delete this image?{% endblock %}
+{% block content %}
+<section class="panel">
+  {% if compliance_exempt %}
+    <div class="flash flash-error">
+      This image can't be deleted — it's referenced as evidence by a deforestation baseline
+      (docs/12-security-ops.md's storage lifecycle policy). Remove that link first if you
+      genuinely need this image gone.
+    </div>
+    <div class="panel-actions">
+      <a href="{% url 'dashboard:imagery' %}" class="secondary-button">Back</a>
+    </div>
+  {% else %}
+    {% if image.preview_file %}
+      <img src="{{ image.preview_file.url }}" alt="" class="image-thumb-large">
+    {% endif %}
+    <p class="panel-note">
+      Uploaded {{ image.created_at }} to {{ image.farm.name }}.
+      {% if run_count %}
+        This will permanently delete {{ run_count }} processing run{{ run_count|pluralize }} and
+        {{ detection_count }} detection{{ detection_count|pluralize }} (and any health
+        classifications and preview images tied to them). Confirmed trees created from this
+        image's detections are kept — only the imagery-derived history is removed.
+      {% else %}
+        This image has no processing history yet — deleting it is straightforward.
+      {% endif %}
+      The uploaded file and its preview are removed from storage too, not just this record.
+    </p>
+    <form method="post">
+      {% csrf_token %}
+      <div class="panel-actions">
+        <button type="submit" class="primary-button primary-button-inline">Delete permanently</button>
+        <a href="{% url 'dashboard:imagery' %}" class="secondary-button">Cancel</a>
+      </div>
+    </form>
+  {% endif %}
+</section>
+{% endblock %}

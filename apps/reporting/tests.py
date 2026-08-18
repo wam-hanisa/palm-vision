@@ -12,6 +12,7 @@ relies on for run_processing_task.
 import pytest
 from rest_framework import status
 
+from apps.farms.models import Farm
 from apps.operations.models import ActualHarvest, Harvest
 from apps.reporting.models import ReportDefinition, ReportRun
 from apps.reporting.services import generate_report
@@ -108,3 +109,20 @@ def test_pic_block_can_read_and_run_definitions_for_their_block(as_pic_block, fa
     run_response = as_pic_block.post(f"/api/reports/{definition.id}/run/")
     assert run_response.status_code == status.HTTP_200_OK
     assert run_response.data["status"] == ReportRun.STATUS_READY
+
+
+@pytest.mark.django_db
+def test_manager_cannot_reassign_a_report_definition_to_a_farm_they_do_not_manage(as_manager, farm):
+    """Regression test for a gap found alongside the FK-scope audit:
+    ReportDefinitionViewSet checked the Manager-only rule on create() but
+    never overrode perform_update(), so PATCHing an existing definition's
+    `farm` to one the requester doesn't manage previously went through
+    unchecked (see apps/reporting/views.py).
+    """
+    definition = _definition(farm, ReportDefinition.TYPE_PRODUCTION, ReportDefinition.FORMAT_PDF)
+    other_farm = Farm.objects.create(name="A farm this manager has no role on")
+
+    response = as_manager.patch(f"/api/reports/{definition.id}/", {"farm": str(other_farm.id)}, format="json")
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    definition.refresh_from_db()
+    assert definition.farm_id == farm.id

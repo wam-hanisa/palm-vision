@@ -1,0 +1,97 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Draw boundary{% endblock %}
+{% block page_title %}Draw boundary — {{ farm_block.name }}{% endblock %}
+{% block content %}
+{% comment %}
+Leaflet.draw (CDN, same accepted exception as Leaflet/tile imagery
+elsewhere in this app — see map.html's own comment for the reasoning) is
+the polygon-drawing toolbar. Only one polygon is ever kept in
+drawnItems — draw:created clears anything already there first — since a
+block has exactly one boundary, not a multi-polygon collection. The
+farm's other blocks are shown read-only/dimmed purely for spatial
+context (so a Manager can see they're not drawing over a neighbor), never
+added to drawnItems, never editable.
+{% endcomment %}
+<section class="panel panel-wide">
+  <div id="boundary-map"></div>
+  <form method="post" id="boundary-form">
+    {% csrf_token %}
+    <input type="hidden" name="geometry" id="boundary-geometry">
+    <button type="submit" class="primary-button primary-button-inline" id="boundary-save" disabled>Save boundary</button>
+    <a href="{% url 'dashboard:farms' %}" class="link-button">Cancel</a>
+  </form>
+  <p class="panel-note">Use the polygon tool on the map to draw this block's boundary, or edit the existing one. Other blocks on this farm are shown dimmed for reference only.</p>
+</section>
+
+{{ boundary_data|json_script:"boundary-data" }}
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+<script>
+(function () {
+  var data = JSON.parse(document.getElementById("boundary-data").textContent);
+  var el = document.getElementById("boundary-map");
+  var geometryInput = document.getElementById("boundary-geometry");
+  var saveButton = document.getElementById("boundary-save");
+  if (!el || typeof L === "undefined") return;
+
+  var map = L.map(el);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 20,
+    attribution: "&copy; OpenStreetMap contributors",
+  }).addTo(map);
+
+  var boundsSources = [];
+
+  data.other_blocks.forEach(function (b) {
+    var layer = L.geoJSON(b.geometry, { style: { color: "#8A8578", weight: 1, fillOpacity: 0.05, dashArray: "3 3" } });
+    layer.bindPopup(b.name);
+    layer.addTo(map);
+    boundsSources.push(layer);
+  });
+
+  var drawnItems = new L.FeatureGroup();
+  map.addLayer(drawnItems);
+
+  function updateGeometryInput() {
+    var layers = drawnItems.getLayers();
+    if (!layers.length) {
+      geometryInput.value = "";
+      saveButton.disabled = true;
+      return;
+    }
+    geometryInput.value = JSON.stringify(layers[0].toGeoJSON().geometry);
+    saveButton.disabled = false;
+  }
+
+  if (data.block.geometry) {
+    var existing = L.geoJSON(data.block.geometry, { style: { color: "#2F4A38", weight: 2, fillOpacity: 0.15 } });
+    existing.eachLayer(function (layer) { drawnItems.addLayer(layer); });
+    boundsSources.push(drawnItems);
+  }
+
+  var drawControl = new L.Control.Draw({
+    edit: { featureGroup: drawnItems, remove: true },
+    draw: { polygon: true, polyline: false, rectangle: false, circle: false, marker: false, circlemarker: false },
+  });
+  map.addControl(drawControl);
+
+  map.on(L.Draw.Event.CREATED, function (event) {
+    drawnItems.clearLayers(); // one boundary per block -- a newly drawn polygon replaces any previous one
+    drawnItems.addLayer(event.layer);
+    updateGeometryInput();
+  });
+  map.on(L.Draw.Event.EDITED, updateGeometryInput);
+  map.on(L.Draw.Event.DELETED, updateGeometryInput);
+
+  updateGeometryInput();
+
+  if (boundsSources.length) {
+    map.fitBounds(L.featureGroup(boundsSources).getBounds().pad(0.2));
+  } else {
+    map.setView([0, 0], 2);
+  }
+})();
+</script>
+{% endblock %}

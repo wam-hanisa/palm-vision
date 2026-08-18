@@ -1,0 +1,20 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Add harvest plan{% endblock %}
+{% block page_title %}Add harvest plan — “{{ farm_block.name }}”{% endblock %}
+{% block content %}
+{% comment %}
+Direct-URL fallback — the Farm Map page itself now opens this same form
+inline in its side panel (HarvestPlanCreateView's AJAX branch).
+_partials/harvest_plan_form.html is the one copy of the actual field
+markup both surfaces render.
+{% endcomment %}
+<section class="panel">
+  {% include "dashboard/_partials/harvest_plan_form.html" %}
+  <p class="panel-note">
+    This plan is created for the whole block “{{ farm_block.name }}” — any
+    trees selected on the map before reaching this form are a visual aid
+    only, not saved against the plan. Per-tree harvest scoping is planned
+    for a later update.
+  </p>
+</section>
+{% endblock %}

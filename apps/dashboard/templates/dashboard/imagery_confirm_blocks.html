@@ -1,0 +1,145 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Confirm blocks{% endblock %}
+{% block page_title %}Confirm which block(s) to process{% endblock %}
+{% block content %}
+
+{% if image.georeference_status == "pending" %}
+<section class="panel">
+  <p>Georeferencing this image — this page will refresh automatically in a
+  few seconds.</p>
+  <p class="panel-note">Once it finishes, its footprint will show on a map
+  here against this farm's blocks, so you can pick which one(s) to process
+  it against.</p>
+</section>
+<script>
+  setTimeout(function () { window.location.reload(); }, 4000);
+</script>
+
+{% elif image.georeference_status == "failed" %}
+<section class="panel">
+  <div class="flash flash-error">Georeferencing failed: {{ image.georeference_error }}</div>
+  <p class="panel-note">This image can't be processed against any block
+  until it has a real footprint. <a href="{% url 'dashboard:imagery' %}">Back to Imagery</a>.</p>
+</section>
+
+{% else %}
+{% comment %}
+Georeferencing succeeded — image.footprint is a real polygon. Renders it
+on a Leaflet map (same CDN/library MapView already uses — no new
+dependency) against every boundary-having block on this image's farm, with
+blocks that spatially intersect the footprint pre-checked (confirm_data's
+"suggested" flag, computed in ImageConfirmBlocksView from the exact same
+boundary__intersects logic BlockImageryView already uses, just run in the
+other direction: "which blocks does this image cover" instead of "which
+images cover this block"). Checking/unchecking a block on the map and in
+the list below are kept in sync both ways, since a Manager might find
+either the visual map or the plain list easier depending on how many
+blocks a farm has.
+{% endcomment %}
+<section class="panel panel-wide">
+  <div id="confirm-blocks-map"></div>
+  <p class="panel-note">Suggested blocks (footprint overlaps them) are
+  pre-checked. Flight overshoot can mean a real, useful overlap even where
+  the boundaries don't strictly touch — check any additional block you
+  still want processed.</p>
+
+  <form method="post" id="confirm-blocks-form">
+    {% csrf_token %}
+    <ul class="block-checklist" id="block-checklist"></ul>
+    <button type="submit" class="primary-button primary-button-inline">Confirm &amp; start processing</button>
+  </form>
+</section>
+
+{{ confirm_data|json_script:"confirm-data" }}
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+(function () {
+  var data = JSON.parse(document.getElementById("confirm-data").textContent);
+  var el = document.getElementById("confirm-blocks-map");
+  var checklist = document.getElementById("block-checklist");
+  if (!el || typeof L === "undefined") return;
+
+  var map = L.map(el);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 20,
+    attribution: "&copy; OpenStreetMap contributors",
+  }).addTo(map);
+
+  var boundsSources = [];
+
+  if (data.image.geometry) {
+    var footprintLayer = L.geoJSON(data.image.geometry, {
+      style: { color: "#D9A441", weight: 2, dashArray: "6 4", fillOpacity: data.image.preview_url ? 0 : 0.05 },
+    }).addTo(map);
+    boundsSources.push(footprintLayer);
+    if (data.image.preview_url) {
+      var ring = data.image.geometry.coordinates[0];
+      var lons = ring.map(function (c) { return c[0]; });
+      var lats = ring.map(function (c) { return c[1]; });
+      L.imageOverlay(data.image.preview_url, [
+        [Math.min.apply(null, lats), Math.min.apply(null, lons)],
+        [Math.max.apply(null, lats), Math.max.apply(null, lons)],
+      ], { opacity: 0.85 }).addTo(map);
+    }
+  }
+
+  var blockLayers = {}; // block id -> Leaflet layer, so map clicks and checkbox clicks can stay in sync
+
+  function setBlockChecked(blockId, checked) {
+    var checkbox = checklist.querySelector('input[value="' + blockId + '"]');
+    if (checkbox) checkbox.checked = checked;
+    var layer = blockLayers[blockId];
+    if (layer) {
+      layer.setStyle({ fillOpacity: checked ? 0.35 : 0.05, weight: checked ? 3 : 2 });
+    }
+  }
+
+  data.blocks.forEach(function (block) {
+    var layer = L.geoJSON(block.geometry, {
+      style: {
+        color: "#2F4A38",
+        weight: block.suggested ? 3 : 2,
+        fillOpacity: block.suggested ? 0.35 : 0.05,
+      },
+    }).addTo(map);
+    layer.bindPopup(block.name);
+    layer.on("click", function () {
+      var checkbox = checklist.querySelector('input[value="' + block.id + '"]');
+      setBlockChecked(block.id, checkbox ? !checkbox.checked : true);
+    });
+    blockLayers[block.id] = layer;
+    boundsSources.push(layer);
+
+    var li = document.createElement("li");
+    var label = document.createElement("label");
+    var checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.name = "block_id";
+    checkbox.value = block.id;
+    checkbox.checked = block.suggested;
+    checkbox.addEventListener("change", function () { setBlockChecked(block.id, checkbox.checked); });
+    label.appendChild(checkbox);
+    label.appendChild(document.createTextNode(
+      " " + block.name + (block.suggested ? " (suggested — footprint overlaps this block)" : "")
+    ));
+    li.appendChild(label);
+    checklist.appendChild(li);
+  });
+
+  if (boundsSources.length) {
+    map.fitBounds(L.featureGroup(boundsSources).getBounds().pad(0.15));
+  } else {
+    map.setView([0, 0], 2);
+  }
+
+  if (!data.blocks.length) {
+    var empty = document.createElement("p");
+    empty.className = "empty-state";
+    empty.textContent = "No blocks on this farm have a boundary drawn yet — draw one before this image can be processed.";
+    checklist.replaceWith(empty);
+  }
+})();
+</script>
+{% endif %}
+{% endblock %}

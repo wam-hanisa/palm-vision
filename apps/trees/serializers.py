@@ -1,9 +1,12 @@
 from rest_framework import serializers
 
+from apps.common.scoping import scoped_farm_blocks
+from apps.common.serializers import ScopedPrimaryKeyFieldsMixin
+
 from .models import Tree
 
 
-class TreeSerializer(serializers.ModelSerializer):
+class TreeSerializer(ScopedPrimaryKeyFieldsMixin, serializers.ModelSerializer):
     """`id` is writable (not read_only) so an offline client can supply a
     client-generated UUID — see apps/common/mixins.py IdempotentUUIDCreateMixin
     and docs/05-offline-sync.md.
@@ -16,10 +19,18 @@ class TreeSerializer(serializers.ModelSerializer):
     defeats the entire point of the idempotent-create pattern. `required=False`
     preserves the ability to omit `id` on a normal online create and let the
     model's own `default=uuid.uuid4` generate one.
+
+    `scoped_pk_fields`: `farm_block` is restricted to blocks the requesting
+    user can actually reach (apps/common/serializers.py) — otherwise a PIC
+    Block user could create a Tree in a block they have no access to, since
+    DRF's default PrimaryKeyRelatedField only checks the block *exists*.
     """
 
     id = serializers.UUIDField(required=False)
     location_orphaned_warning = serializers.SerializerMethodField()
+    harvest_stage = serializers.SerializerMethodField()
+    fertilizer_stage = serializers.SerializerMethodField()
+    scoped_pk_fields = {"farm_block": scoped_farm_blocks}
 
     class Meta:
         model = Tree
@@ -31,13 +42,44 @@ class TreeSerializer(serializers.ModelSerializer):
             "source",
             "status",
             "current_health",
+            "last_harvested_at",
+            "last_fertilized_at",
+            "harvest_marked_at",
+            "fertilizer_marked_at",
+            "harvest_stage",
+            "fertilizer_stage",
             "created_by",
             "updated_by",
             "location_orphaned_warning",
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["current_health", "created_by", "updated_by", "created_at", "updated_at"]
+        # last_harvested_at/last_fertilized_at/harvest_marked_at/
+        # fertilizer_marked_at are read-only here on purpose — they're
+        # never written through a plain PATCH to this endpoint, only
+        # through the dedicated mark_harvested/mark_fertilized actions
+        # below (PWA/PIC Block completion) or the office dashboard's own
+        # Mark-trees views (direct model .save(), not this serializer).
+        # Same reasoning current_health already had: a field with a
+        # specific, audited write path shouldn't also be reachable through
+        # a general-purpose edit.
+        read_only_fields = [
+            "current_health",
+            "last_harvested_at",
+            "last_fertilized_at",
+            "harvest_marked_at",
+            "fertilizer_marked_at",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_harvest_stage(self, obj):
+        return obj.harvest_stage()
+
+    def get_fertilizer_stage(self, obj):
+        return obj.fertilizer_stage()
 
     def get_location_orphaned_warning(self, obj):
         if not obj.pk:

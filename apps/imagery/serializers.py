@@ -52,6 +52,7 @@ class TreeHealthClassificationSerializer(serializers.ModelSerializer):
             "tree_detection",
             "health_label",
             "confidence",
+            "patch_image",
             "reviewed",
             "reviewed_by",
             "corrected_label",

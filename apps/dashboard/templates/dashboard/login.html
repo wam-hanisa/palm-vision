@@ -1,0 +1,21 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Sign in{% endblock %}
+{% block guest_content %}
+<div class="login-screen">
+  <div class="login-card">
+    <div class="brand brand-login">Palm Vision</div>
+    <p class="login-sub">Office dashboard — Managers and Super Admins. Field staff, use the <a href="/field/">field app</a> instead.</p>
+    {% if form.non_field_errors %}
+      <div class="flash flash-error">{{ form.non_field_errors.0 }}</div>
+    {% endif %}
+    <form method="post">
+      {% csrf_token %}
+      <label for="id_username">Username</label>
+      {{ form.username }}
+      <label for="id_password">Password</label>
+      {{ form.password }}
+      <button type="submit" class="primary-button">Sign in</button>
+    </form>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,14 @@
+{% extends "dashboard/base.html" %}
+{% block title %}Delete block{% endblock %}
+{% block page_title %}Delete “{{ farm_block.name }}”?{% endblock %}
+{% block content %}
+{% comment %}
+Direct-URL fallback — the Farm Map page itself now opens this same
+confirmation inline in its side panel (FarmBlockDeleteView's AJAX
+branch). _partials/block_delete.html is the one copy of the actual
+markup both surfaces render.
+{% endcomment %}
+<section class="panel">
+  {% include "dashboard/_partials/block_delete.html" %}
+</section>
+{% endblock %}
