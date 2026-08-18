@@ -1165,14 +1165,26 @@ def test_farm_map_only_shows_data_in_the_managers_scope(client, manager, farm_ro
 
 
 @pytest.mark.django_db
-def test_farm_map_renders_with_nothing_in_scope(client, manager, farm_role_manager):
+def test_farm_map_renders_with_nothing_in_scope(client, super_admin):
     """No farms/blocks/trees/images at all is still a normal 200 — the
     "nothing here yet" messaging is rendered client-side by farm_map.html's
     own JS from an empty farm_map_data, not a server-rendered empty state
     (unlike the old Map page, which had one) — so this only asserts the
     payload itself is genuinely empty, not any particular HTML string.
+
+    Uses `super_admin`, not `manager` — a plain Manager's dashboard access
+    is itself granted BY a UserFarmRole on some real Farm (see
+    ManagerOrSuperAdminRequiredMixin._require_office_staff()), so "a
+    Manager with nothing in scope" is a contradiction: granting the role
+    needed to reach this page at all necessarily puts at least one Farm in
+    scope. Only a Super Admin can reach the dashboard without being tied to
+    any farm — genuinely empty here since this test creates no Farm at all.
+    Found live: the original version used `manager` + the `farm_role_manager`
+    fixture, which grants exactly the UserFarmRole (and its real Farm) this
+    test's own assertions say shouldn't exist — a self-contradicting test
+    that was silently failing until caught by a real CI run.
     """
-    client.login(username="manager", password="manager12345")
+    client.login(username="admin", password="admin12345")
     response = client.get(reverse("dashboard:farms"))
     assert response.status_code == 200
     farm_map_data = response.context["farm_map_data"]
