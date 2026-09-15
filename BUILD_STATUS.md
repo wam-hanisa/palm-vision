@@ -782,6 +782,76 @@ offline-created tree still filtered out of the block list by
 and freezing, and the failed login still wiping the typed username. `main`'s
 own new "Sync now" button was 36px tall in a gloves-first UI and is now 44px.
 
+## Second UI pass — two dashboard screens were silently broken
+
+Auditing the surfaces the first pass never opened (the dashboard's own
+forms, and the PWA's map/tree-detail screens `main` added) turned up a
+functional break, not a cosmetic one.
+
+**"Add tree" and "Edit boundary" did not work at all.** `style.css` gave a
+560px height to `#dashboard-map` — an id no template has ever used, left
+behind by a rename. The ids actually mounted, `#tree-map` and
+`#boundary-map`, had no height rule, so both containers rendered at 0px.
+That is invisible and unclickable on its own, but it also made Leaflet
+throw inside `_clipPoints` when the first vector layer was added (the
+renderer has no `_bounds` at zero size), and the uncaught exception aborted
+the rest of each page's init script. On the Add-tree form that meant the
+block boundary and existing trees never drew, the map click handler was
+never wired, and `#tree-lat`/`#tree-lng` could never be populated — so a
+Manager could not place a tree at all. Both screens still returned 200, and
+`manage.py check` saw nothing. Verified fixed by driving the real form:
+clicking the map now fills in coordinates inside Block A.
+
+A second, latent version of the same fault: all four Leaflet maps were
+constructed with `L.map(el)` and only given a view by a `fitBounds` call
+*after* their layers were added. A map has no view until then, so the first
+`.addTo(map)` can throw. Each now seeds a provisional view at construction;
+the later `fitBounds` still sets the real one.
+
+`apps/dashboard/tests.py` has a regression test that resolves the variable
+handed to `L.map(...)` back to the id it was read from and asserts each one
+has a height rule (with CSS comments stripped first — the first version of
+the test passed on the strength of a comment that merely mentioned the id).
+Confirmed to fail when the old selector is put back.
+
+**An invisible primary action.** `.link-button` hardcoded the cream `#E7E4D8`
+it needs inside the dark sidebar, but the class is also used on ordinary
+light pages — block_boundary's "Cancel" and imagery_list's "Process against
+block(s)". Those measured **1.09:1** against the page background. The
+default is now the readable ink colour, with the sidebar opting into the
+light one. (The imagery-list case never showed up in the first pass because
+that list was empty, so the link never rendered.)
+
+**Colourblind fallback on marker fills, now closed.** The first pass fixed
+the harvest/fertilizer rings and flagged health fill as still colour-only.
+Measured, it was worse than assumed: `Success` and `Text muted` used as
+fills sit at relative luminance 0.2396 and 0.2353 — a **1.015:1** greyscale
+separation, so "healthy" and "not yet assessed" were the same marker to a
+red-green colourblind viewer. Radius could not carry the cue (radius 8
+already means "selected") and the ring was already taken, so the three
+fills are now separated on the lightness axis instead — `#99B29D` /
+`#8A8578` / `#9B4D3E`, lightest to darkest, at 1.61:1 or better. Each stays
+in its own hue family and `unknown` is unchanged.
+
+**docs/09-design-system.md now matches what ships.** The four corrected text
+tokens, the vendored-font decision, and the marker-encoding rules are
+recorded there, with the measured figures and the reasoning, so the document
+and the two stylesheets no longer disagree.
+
+**Also:** select controls are styled on-palette (`appearance: none` plus an
+inline-SVG chevron) instead of using per-OS browser chrome — which also
+required narrowing two `background: #fff` shorthands to `background-color`,
+since the shorthand was silently resetting the chevron. The PWA's GPS
+checkbox row is a 44px-minimum target (the row toggles, not just the 28px
+box — verified by clicking the label text).
+
+**Checked and deliberately not changed:** Leaflet's disabled zoom control
+measures 1.75:1, but inactive controls are exempt from WCAG 1.4.3. The
+"Leaflet" attribution link is small by license convention. Stray chevrons
+that appeared over the sidebar in screenshots are a headless-Chromium
+compositing artifact — the sidebar renders clean when screenshotted alone
+and nothing exists at those coordinates — so nothing was "fixed" for it.
+
 ## Known gaps in what's built (not blockers, but don't forget these)
 
 **Update — FK write-scope validation: fixed.** The gap below (no viewset

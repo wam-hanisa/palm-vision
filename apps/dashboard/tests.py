@@ -11,6 +11,7 @@ correctly-scoped data, and can a PIC Block user (who has no dashboard
 journey per docs/10-user-journeys.md) not get in at all.
 """
 import pathlib
+import re
 import numpy as np
 import pytest
 import rasterio
@@ -1759,3 +1760,50 @@ def test_no_dashboard_template_loads_frontend_code_from_a_cdn():
             if "cdnjs.cloudflare.com" in line or "unpkg.com" in line or "fonts.googleapis.com" in line:
                 offenders.append(f"{path.name}:{lineno}")
     assert not offenders, f"CDN-loaded front-end code found at: {offenders}"
+
+
+def test_every_leaflet_map_container_has_a_height_rule():
+    """A Leaflet container with no CSS height renders at 0px: invisible, and
+    unclickable, so nothing can be placed on it. Worse, it makes Leaflet
+    throw while adding the first vector layer, which aborts the rest of that
+    page's init script and takes the form's other wiring down with it.
+
+    That is exactly what happened to #tree-map and #boundary-map: the
+    stylesheet sized `#dashboard-map`, an id no template has ever used, so
+    the "Add tree" and "Edit boundary" screens were both silently broken
+    while still returning 200. Nothing else catches this — no view test, no
+    template test, and `manage.py check` sees nothing wrong.
+
+    Discovery is deliberately tied to what Leaflet is actually mounted on:
+    the variable handed to `L.map(...)`, resolved back to the id it was
+    read from. That way a renamed container fails here instead of silently
+    losing its height rule again.
+    """
+    template_dir = pathlib.Path(settings.BASE_DIR, "apps", "dashboard", "templates", "dashboard")
+    css = pathlib.Path(
+        settings.BASE_DIR, "apps", "dashboard", "static", "dashboard", "style.css"
+    ).read_text()
+    # Strip /* ... */ comments first. Without this the check passes on the
+    # strength of a comment that merely *mentions* the id — including the
+    # one above this very rule explaining why it exists.
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+
+    mounted = {}
+    for path in template_dir.rglob("*.html"):
+        text = path.read_text()
+        for var in re.findall(r"L\.map\(\s*([A-Za-z_$][\w$]*)", text):
+            match = re.search(
+                rf"\b{re.escape(var)}\s*=\s*document\.getElementById\(\s*[\"']([^\"']+)[\"']",
+                text,
+            )
+            if match:
+                mounted[match.group(1)] = path.name
+
+    assert mounted, "no Leaflet map containers discovered — has the markup changed?"
+
+    missing = sorted(f"#{i} ({f})" for i, f in mounted.items() if f"#{i}" not in css)
+    assert not missing, (
+        "Leaflet map container(s) with no height rule in style.css: "
+        f"{missing}. They render at height 0, and the surrounding page's "
+        "JavaScript breaks when the first layer is added."
+    )

@@ -138,16 +138,24 @@ input:focus, select:focus { border-color: var(--primary); }
    checkbox and its label text side by side, not the stacked
    label-above-field layout the rest of this file's `label` rule gives
    text/select inputs. */
+/* The whole row is the hit area, not just the 22px box — this is the
+   gloves-in-sunlight surface, where 44px is the floor. Clicking the label
+   already toggles the input (it wraps it), so padding the label is what
+   actually makes the target big; the box itself is enlarged too so it is
+   visible at arm's length. */
 .checkbox-label {
   flex-direction: row;
   align-items: center;
   gap: 0.6rem;
   font-weight: 500;
+  min-height: 44px;
+  padding: 0.35rem 0;
+  cursor: pointer;
 }
 
 .checkbox-label input[type="checkbox"] {
-  width: 1.4rem;
-  height: 1.4rem;
+  width: 1.75rem;
+  height: 1.75rem;
   flex-shrink: 0;
   accent-color: var(--primary);
 }

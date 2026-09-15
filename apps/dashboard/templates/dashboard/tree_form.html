@@ -33,7 +33,16 @@ clicked again.
   var lngInput = document.getElementById("tree-lng");
   if (!el || typeof L === "undefined") return;
 
-  var map = L.map(el);
+  // A Leaflet map has NO view until setView/fitBounds is called, and adding a
+  // vector layer before that point throws inside Leaflet's _clipPoints (the
+  // renderer has no _bounds yet). Every map on this page sets its real view
+  // with fitBounds AFTER the boundary/tree/footprint layers are added, so a
+  // provisional view has to be seeded here or the very first .addTo(map)
+  // raises. When it raised it aborted the rest of this IIFE, which is what
+  // silently broke the surrounding form: the layers never rendered and the
+  // map's click handler was never wired, so a user could not place a point
+  // at all. The fitBounds call further down still sets the real view.
+  var map = L.map(el).setView([0, 0], 2);
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
     maxZoom: 21,
     attribution: "&copy; OpenStreetMap contributors",

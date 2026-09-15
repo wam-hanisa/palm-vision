@@ -157,16 +157,28 @@ a { color: var(--primary); }
   margin-bottom: 8px;
 }
 
+/* Used in two different contexts, which the single hardcoded colour below
+   did not survive: the dark sidebar (base.html's "Log out") and ordinary
+   light page bodies (block_boundary.html's "Cancel",
+   imagery_list.html's "Process against block(s)"). The sidebar's cream
+   #E7E4D8 measured 1.09:1 against the page background on the light pages —
+   effectively invisible, on what is a primary action in the imagery list's
+   case. The default is now the readable ink colour and the sidebar opts
+   into the light one. */
 .link-button {
   background: none;
   border: none;
-  color: #E7E4D8;
+  color: var(--primary);
   text-decoration: underline;
   cursor: pointer;
   /* Was `padding: 0`, giving a 43x15 hit area — under every pointer-target
-     guideline even for a mouse, and this is the log-out control. */
-  padding: 8px 4px;
-  min-height: 32px;
+     guideline even for a mouse, and this is the log-out control.
+     inline-flex because min-height does nothing on an inline <a>, which is
+     how this class is used on the form pages ("Cancel"). */
+  display: inline-flex;
+  align-items: center;
+  padding: 8px 6px;
+  min-height: 36px;
   font-size: 13px;
 }
 
@@ -544,7 +556,14 @@ a.tag-link:hover {
   border: 1px solid #D8D3C3;
   border-radius: 4px;
   font-size: 14px;
-  background: #fff;
+  /* background-color, not the `background` shorthand: the shorthand resets
+     background-image too, which silently removed the select chevron set
+     further down. */
+  background-color: #fff;
+  /* Restated here because this rule's own `padding` shorthand outranks the
+     bare `select` rule — without it a long option label runs under the
+     chevron. Harmless on the inputs this selector also matches. */
+  padding-right: 34px;
   color: var(--text);
 }
 
@@ -750,12 +769,21 @@ a.tag-link:hover {
   padding: 6px 8px;
   border: 1px solid #D8D3C3;
   border-radius: 4px;
-  background: #fff;
+  background-color: #fff;   /* not the shorthand — see .stacked-form above */
+  padding-right: 30px;      /* clear of the chevron; this rule sets its own padding */
   font-size: 13px;
   color: var(--text);
 }
 
-#dashboard-map, #confirm-blocks-map {
+/* `#dashboard-map` matched nothing — no template has ever used that id, so
+   this rule only ever sized the imagery-confirm map. The two that were
+   missed, #tree-map (the "Add tree" form) and #boundary-map (the "Edit
+   boundary" screen), therefore rendered at height 0: invisible, and
+   unclickable, so neither a tree nor a boundary could actually be placed.
+   The zero height also made Leaflet throw during layer setup, which aborted
+   the rest of each page's init script — see the setView note in
+   tree_form.html. Listing the ids that genuinely exist. */
+#tree-map, #boundary-map, #confirm-blocks-map {
   width: 100%;
   height: 560px;
   border-radius: 6px;
@@ -1140,6 +1168,9 @@ body.farm-map-fullpage .flash {
   font-size: 13px;
 }
 
+/* The dark-sidebar context this colour was originally written for. */
+.sidebar .link-button { color: #E7E4D8; }
+
 /* --- Focus visibility ----------------------------------------------------
    There were no focus rules at all, leaving the browser default — a black
    ring that is effectively invisible against the dark forest-green sidebar,
@@ -1271,3 +1302,28 @@ input[type="checkbox"] {
   min-height: 18px;
   vertical-align: middle;
 }
+
+/* --- Select controls -----------------------------------------------------
+   Native select arrows are browser chrome: they differ per OS/browser and
+   sit outside this palette entirely, which is the one thing
+   docs/09-design-system.md's "line icons only, used sparingly" rule is
+   meant to prevent. They also render unreliably here — Chromium painted the
+   arrow detached from its control, leaving stray chevrons over the sidebar
+   on any page with several selects.
+
+   `appearance: none` plus an inline-SVG chevron in the palette's own muted
+   ink gives one consistent control everywhere. The SVG is a data: URI so it
+   costs no extra request and still works offline. Keyboard behaviour and
+   the native dropdown are untouched — only the arrow is ours. */
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8' fill='none' stroke='%23656258' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  padding-right: 34px;
+}
+
+/* Firefox keeps a focus ring inside the control unless this is cleared. */
+select:-moz-focusring { color: transparent; text-shadow: 0 0 0 var(--text); }

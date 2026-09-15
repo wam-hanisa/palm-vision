@@ -152,8 +152,8 @@ scripted.
   <div class="map-legend">
     <div class="map-legend-group"><span class="legend-swatch legend-swatch-line" style="background:#2F4A38;"></span> Block boundary</div>
     <div class="map-legend-group"><span class="legend-swatch legend-swatch-line" style="background:#D9A441;"></span> Image footprint</div>
-    <div class="map-legend-group"><span class="legend-swatch" style="background:#6B8F71;"></span> Healthy tree</div>
-    <div class="map-legend-group"><span class="legend-swatch" style="background:#B85C4A;"></span> Yellowing</div>
+    <div class="map-legend-group"><span class="legend-swatch" style="background:#99B29D;"></span> Healthy tree</div>
+    <div class="map-legend-group"><span class="legend-swatch" style="background:#9B4D3E;"></span> Yellowing</div>
     <div class="map-legend-group"><span class="legend-swatch" style="background:#8A8578;"></span> Unknown health</div>
     <div class="map-legend-group"><span class="legend-swatch legend-swatch-ring legend-swatch-ring-thick" style="border-color:#3B6FA0;"></span> Needs action (marked by a Manager)</div>
     <div class="map-legend-group"><span class="legend-swatch legend-swatch-ring legend-swatch-ring-dashed" style="border-color:#C0392B;"></span> Harvest/fertilizer overdue</div>
@@ -282,7 +282,16 @@ scripted.
   // instead (Leaflet stacks same-corner controls in the order they're
   // added — adding this one after the layers control puts it below,
   // not on top of, that button).
-  var map = L.map(mapEl, { zoomControl: false });
+  // A Leaflet map has NO view until setView/fitBounds is called, and adding a
+  // vector layer before that point throws inside Leaflet's _clipPoints (the
+  // renderer has no _bounds yet). Every map on this page sets its real view
+  // with fitBounds AFTER the boundary/tree/footprint layers are added, so a
+  // provisional view has to be seeded here or the very first .addTo(map)
+  // raises. When it raised it aborted the rest of this IIFE, which is what
+  // silently broke the surrounding form: the layers never rendered and the
+  // map's click handler was never wired, so a user could not place a point
+  // at all. The fitBounds call further down still sets the real view.
+  var map = L.map(mapEl, { zoomControl: false }).setView([0, 0], 2);
 
   // Street/satellite basemap toggle — Esri World Imagery since it's usable
   // free and without an API key (unlike Google/Mapbox satellite tiles),
@@ -444,7 +453,25 @@ scripted.
   // there's no longer a separate color for it. healthColors[tree.health] ||
   // healthColors.unknown below already handles any stale pre-migration
   // "small" value gracefully, falling back to the unknown color.
-  var healthColors = { healthy: "#6B8F71", yellow: "#B85C4A", unknown: "#8A8578" };
+  // Health fill. The three values are separated on the LIGHTNESS axis, not
+  // only by hue, so the marker stays readable without colour vision — the
+  // fill is the one part of a tree marker that cannot carry a stroke
+  // pattern (the ring already uses those for harvest/fertilizer stage) and
+  // cannot carry a radius cue either (radius 8 already means "selected",
+  // see refreshTreeMarkers()).
+  //
+  // The documented palette's own values collapse in greyscale: measured
+  // relative luminance was healthy 0.2396, unknown 0.2353 — a 1.015:1
+  // separation, i.e. a deuteranope or anyone on a monochrome screen saw
+  // "healthy" and "not yet assessed" as the same marker. Yellowing was
+  // barely better at 1.24:1 against each.
+  //
+  // These keep each hue in its own family (moss / warm grey / clay) and
+  // move only lightness, giving 1.61:1 healthy-vs-unknown, 1.62:1
+  // unknown-vs-yellowing and 2.61:1 healthy-vs-yellowing, ordered
+  // lightest = healthy -> darkest = needs attention. `unknown` is
+  // unchanged from docs/09-design-system.md; only the other two moved.
+  var healthColors = { healthy: "#99B29D", yellow: "#9B4D3E", unknown: "#8A8578" };
 
   // Harvest/fertilizer indicator — drawn as the marker's *stroke*
   // (color/weight/dashArray), independent of fillColor (which stays
