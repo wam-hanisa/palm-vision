@@ -922,6 +922,41 @@ accumulating history instead of overwriting it, and scope enforcement on
 the new TreeCareHistoryView. All 326 tests pass; `ruff check` and
 `makemigrations --check --dry-run` are clean.
 
+## Bulk quantity entry for harvest/fertilizer marking
+
+Follow-up to the quantity-capture work above, requested directly: a way to
+record harvest/fertilizer quantity across a multi-tree selection in bulk,
+with quantity staying optional per tree.
+
+**"Bulk quantity" row**, shown above the per-tree checklist only in the two
+completion modes (mark_harvested/mark_fertilized — never the mark_need_*
+assignment modes, where nothing has happened yet and a quantity has no
+meaning). Type one value, click "Apply to all selected," and every
+currently-checked tree's row gets that value. This is a client-side
+fill-in, not a new write path — it just populates the exact same
+`selectedTreeQuantities` map (and `quantity_<id>` form fields) the
+per-tree inputs already fed into MarkTreesHarvestedView/
+MarkTreesFertilizedView, so no server-side change was needed and the
+existing per-tree quantity tests already cover the path this feeds.
+
+**Deliberately not live-bound.** Typing into the bulk field doesn't touch
+any tree's value until "Apply to all selected" is clicked — an explicit
+action, not something that could silently clobber a value a Manager is
+still typing into a specific row. It's a "fill down," not a lock: every
+per-tree row stays individually editable afterward, so a tree that
+actually yielded a different amount can be corrected, and any tree can
+still be left blank — quantity was already optional per tree, and bulk
+entry doesn't change that (applying a blank bulk value is itself a quick
+way to clear quantities across a selection).
+
+Verified end to end against live Postgres: selecting all 4 trees in a
+block, bulk-applying 15, then manually overriding one tree to 22 and
+clearing another back to blank, submitted correctly — `last_harvest_quantity`
+came back 15/22/None/15 across the four trees, with a TreeCareRecord
+logged for each. No new Python tests — this is a client-side convenience
+over an unchanged write path already covered by the per-tree quantity
+tests added alongside TreeCareRecord.
+
 ## Known gaps in what's built (not blockers, but don't forget these)
 
 **Update — FK write-scope validation: fixed.** The gap below (no viewset

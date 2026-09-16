@@ -652,6 +652,14 @@ scripted.
     // three points selectedTreeIds is (startTreeSelection/
     // cancelTreeSelection/submitMarkTrees's success path).
     selectedTreeQuantities: {},
+    // The "Bulk quantity" input's current value (renderTreeSelectionChecklist()
+    // below) — typed once, applied on demand to every currently-checked
+    // tree via its "Apply to N selected" button, which just fills
+    // selectedTreeQuantities for those ids. Not a live-bound default: it
+    // only writes when the button is clicked, so it never silently
+    // overwrites a per-tree value the Manager is still in the middle of
+    // typing. Cleared at the same points selectedTreeQuantities is.
+    bulkQuantityValue: "",
     // Which single-tree quick-mark inline form (renderTreeDetailPanel()
     // below) is currently expanded — null, "mark_harvested" or
     // "mark_fertilized". Reset to null whenever the tree detail panel is
@@ -898,6 +906,7 @@ scripted.
     state.selectionMode = mode;
     state.selectedTreeIds = {};
     state.selectedTreeQuantities = {};
+    state.bulkQuantityValue = "";
     renderMap();
     renderPanel();
   }
@@ -908,6 +917,7 @@ scripted.
     state.selectionMode = null;
     state.selectedTreeIds = {};
     state.selectedTreeQuantities = {};
+    state.bulkQuantityValue = "";
     renderMap();
     renderPanel();
   }
@@ -1673,6 +1683,42 @@ scripted.
         renderMap(); renderPanel();
       }),
     ]));
+
+    // Bulk-fill: type one value once and apply it to every currently
+    // checked tree in a single action, rather than typing the same number
+    // into each row below one at a time. This writes into the exact same
+    // selectedTreeQuantities map the per-tree inputs read from and
+    // submitMarkTrees() sends — there's no separate bulk write path on
+    // the server, just a faster way to fill in the per-tree one. Applying
+    // again after checking more trees re-applies to the full current
+    // selection; it's a "fill down," not a live-bound default, so it
+    // never overwrites a row while you're still typing into it — only on
+    // an explicit click. Each per-tree row underneath stays individually
+    // editable afterward — the bulk value is a starting point, not a
+    // lock, so a tree that actually yielded a different amount (or none
+    // at all — quantity is optional per tree either way) can still be
+    // changed or cleared on its own row.
+    if (quantityUnit) {
+      var bulkInput = el("input", {
+        type: "number", step: "0.01", min: "0", inputmode: "decimal",
+        class: "tree-checklist-qty", placeholder: quantityUnit,
+        "aria-label": "Bulk quantity in " + quantityUnit + ", applied to every checked tree below",
+      });
+      bulkInput.value = state.bulkQuantityValue || "";
+      bulkInput.addEventListener("input", function () { state.bulkQuantityValue = bulkInput.value; });
+      var applyBulkBtn = actionButton("Apply to all selected", function () {
+        var ids = Object.keys(state.selectedTreeIds);
+        if (!ids.length) { showFlash("Select at least one tree first.", "error"); return; }
+        ids.forEach(function (id) { state.selectedTreeQuantities[id] = state.bulkQuantityValue; });
+        renderPanel();
+      });
+      panelEl.appendChild(el("div", { class: "bulk-qty-row" }, [
+        el("label", { class: "bulk-qty-label", text: "Bulk quantity (" + quantityUnit + ")" }),
+        bulkInput,
+        applyBulkBtn,
+      ]));
+    }
+
     var list = el("ul", { class: "tree-checklist" });
     trees.forEach(function (tree) {
       var checkbox = el("input", { type: "checkbox" });
@@ -1817,6 +1863,7 @@ scripted.
         state.selectionMode = null;
         state.selectedTreeIds = {};
         state.selectedTreeQuantities = {};
+        state.bulkQuantityValue = "";
         showFlash(json.message, "success");
         refreshData(json.farm_map_data, json.focus);
       } else {

@@ -1196,6 +1196,29 @@ body.farm-map-fullpage .flash {
   color: var(--text);
 }
 
+/* "Apply to all selected" bulk-fill row — renderTreeSelectionChecklist()'s
+   own comment has the reasoning. Sits above the per-tree rows it fills;
+   wraps on narrow widths rather than squeezing the input. */
+.bulk-qty-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px dashed #D8D3C3;
+}
+
+.bulk-qty-label {
+  font-size: 13px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.bulk-qty-row .tree-checklist-qty {
+  width: 96px;
+}
+
 /* Single-tree "Mark harvested/fertilized (today)" quick action, expanded
    in place of its button — see renderTreeDetailPanel()'s
    renderQuickMarkRow(). Same optional-quantity idea as the bulk checklist
