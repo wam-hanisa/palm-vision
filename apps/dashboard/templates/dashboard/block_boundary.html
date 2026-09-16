@@ -37,9 +37,14 @@ added to drawnItems, never editable.
   if (!el || typeof L === "undefined") return;
 
   var map = L.map(el);
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  // CARTO's free Voyager basemap, not tile.openstreetmap.org directly —
+  // see farm_map.html's matching comment for why (OSM's own tile server
+  // blocks exactly this kind of embedded, repeatedly-reloaded use under
+  // its usage policy; this page hit the same block).
+  L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
     maxZoom: 20,
-    attribution: "&copy; OpenStreetMap contributors",
+    subdomains: "abcd",
+    attribution: "&copy; OpenStreetMap contributors &copy; CARTO",
   }).addTo(map);
 
   var boundsSources = [];

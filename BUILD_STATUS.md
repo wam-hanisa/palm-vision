@@ -3362,6 +3362,14 @@ Left deliberately untouched: `ImageConfirmBlocksView`'s own overlap-based block 
 
 **Verified**: `apps/dashboard` suite re-run — 91 passed, 1 failed (the same pre-existing, unrelated `test_farm_map_renders_with_nothing_in_scope` fixture bug flagged repeatedly above). Confirmed live against the real database (temporary throwaway superuser, deleted after): B5's imagery picker now reads "No imagery processed against this block yet." — the image doesn't appear as an option at all anymore, not even with a caveat. B4 (the block actually processed) is unaffected — its image still appears, still renders as its own clipped file.
 
+## Update — the map's own basemap tiles started getting blocked by OpenStreetMap
+
+Reported directly, with a screenshot: every base-map tile across the Farm Map had been replaced with OSM's own literal "Access blocked" image (`osm.wiki/Blocked`). Confirmed this was a real, deliberate block, not a network hiccup: `tile.openstreetmap.org` (what `L.tileLayer(...)` was pointed at in four templates — `farm_map.html`, `block_boundary.html`, `imagery_confirm_blocks.html`, `tree_form.html`) is OSM's own volunteer-run tile server, whose [usage policy](https://operations.osmfoundation.org/policies/tiles/) explicitly prohibits exactly this kind of embedded, repeatedly-reloaded use in a real application — it's meant for light/individual/evaluation use. This session's own extensive browser-based verification (dozens of Farm Map reloads while checking earlier fixes) was very plausibly what tipped it over.
+
+**Fixed**: switched all four to CARTO's free Voyager basemap (`basemaps.cartocdn.com`) — same underlying OSM data, no API key, explicitly supports unauthenticated embedded use, same free-no-signup bar the existing Esri satellite layer was already held to. Straightforward URL/attribution swap, no other map logic touched.
+
+**Verified**: all four templates confirmed loadable via Django's own loader. Logged in live as the real `admin` account and confirmed directly — not just assumed — that the map now actually requests `cartocdn` tiles (checked the rendered `<img class="leaflet-tile">` `src`), and that a real tile fetch returns `200 OK` with a genuine ~11KB PNG (not another blocked-placeholder image). No browser console errors. Full `apps/dashboard` suite re-run: **92 passed, 0 failed** — genuinely clean now (the one previously-failing, self-contradicting test was fixed in the update above).
+
 ## Recommended next step
 
 Run `docker compose up -d --build && docker compose exec web python

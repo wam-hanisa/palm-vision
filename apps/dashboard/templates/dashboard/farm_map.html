@@ -270,11 +270,24 @@ scripted.
 
   // Street/satellite basemap toggle — Esri World Imagery since it's usable
   // free and without an API key (unlike Google/Mapbox satellite tiles),
-  // same reasoning already applied to the OSM street layer below. Standard
-  // Leaflet layer control, no extra plugin needed.
-  var streetBaseLayer = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  // same reasoning already applied to the street layer below.
+  //
+  // Update: the street layer used to point straight at
+  // tile.openstreetmap.org — OSM's own volunteer-run tile server, whose
+  // usage policy (operations.osmfoundation.org/policies/tiles) explicitly
+  // prohibits exactly this kind of embedded, repeatedly-reloaded use in a
+  // real application; it's meant for light/individual/evaluation use.
+  // Reported directly, with a screenshot: every tile had been replaced
+  // with OSM's own "Access blocked" image, confirming the server had
+  // deliberately blocked this connection, not a transient network error.
+  // Switched to CARTO's free Voyager basemap (basemaps.cartocdn.com) —
+  // same underlying OSM data, no API key, explicitly supports this kind
+  // of unauthenticated embedded use — same free-no-signup bar the Esri
+  // satellite layer below was already held to.
+  var streetBaseLayer = L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
     maxZoom: 20,
-    attribution: "&copy; OpenStreetMap contributors",
+    subdomains: "abcd",
+    attribution: "&copy; OpenStreetMap contributors &copy; CARTO",
   });
   var satelliteBaseLayer = L.tileLayer(
     "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
