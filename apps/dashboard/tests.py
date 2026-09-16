@@ -36,7 +36,7 @@ from apps.imagery.models import Image, ImageProcessingRun, TreeDetection
 from apps.notifications.models import Notification, NotificationCategory
 from apps.operations.models import Fertilizer, Harvest
 from apps.reporting.models import ReportDefinition, ReportRun
-from apps.trees.models import Tree
+from apps.trees.models import Tree, TreeCareRecord
 
 # Same synthetic-raster technique as apps/imagery/tests.py (see that file's
 # module docstring for why: real rasterio I/O, not mocked, without needing
@@ -1715,6 +1715,150 @@ def test_ajax_write_actions_still_enforce_scope(client, manager, farm_role_manag
     )
     assert response.status_code == 404  # not in this manager's scoped FarmBlockViewSet queryset at all
     assert FarmBlock.objects.filter(id=other_block.id).exists()
+
+
+# --- Harvest/fertilizer marking: quantity capture + history -------------
+# Reported directly: "current harvest and fertilize only marking the trees
+# giving date without telling how many quantities and there are no history
+# too." MarkTreesHarvestedView/MarkTreesFertilizedView previously only ever
+# stamped a date on the Tree row; TreeCareHistoryView didn't exist at all.
+
+@pytest.fixture
+def tree_b(db, block_a, pic_block):
+    return Tree.objects.create(
+        farm_block=block_a,
+        name="Tree A2",
+        location=Point(101.4415, 0.5315, srid=4326),
+        created_by=pic_block,
+        updated_by=pic_block,
+    )
+
+
+def test_mark_trees_harvested_accepts_a_quantity_per_tree(client, manager, farm_role_manager, block_a, tree_in_block_a, tree_b):
+    """Two trees selected in the same submission, with two different
+    quantities — the whole reason quantity is keyed per tree_id rather than
+    one shared field for the submission.
+    """
+    client.login(username="manager", password="manager12345")
+    response = client.post(
+        reverse("dashboard:trees-mark-harvested", kwargs={"block_id": block_a.id}),
+        {
+            "tree_ids": [str(tree_in_block_a.id), str(tree_b.id)],
+            "date": "2026-01-15",
+            f"quantity_{tree_in_block_a.id}": "8",
+            f"quantity_{tree_b.id}": "11.5",
+        },
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+
+    tree_in_block_a.refresh_from_db()
+    tree_b.refresh_from_db()
+    assert tree_in_block_a.last_harvest_quantity == 8
+    assert tree_b.last_harvest_quantity == 11.5
+
+    record_a = TreeCareRecord.objects.get(tree=tree_in_block_a, kind=TreeCareRecord.KIND_HARVEST)
+    record_b = TreeCareRecord.objects.get(tree=tree_b, kind=TreeCareRecord.KIND_HARVEST)
+    assert record_a.quantity == 8
+    assert record_b.quantity == 11.5
+    assert record_a.recorded_by == manager
+
+
+def test_mark_trees_harvested_without_any_quantity_still_succeeds(client, manager, farm_role_manager, block_a, tree_in_block_a):
+    """Quantity is optional on this path too — a Manager who doesn't know
+    the amount shouldn't be blocked from recording that the work happened."""
+    client.login(username="manager", password="manager12345")
+    response = client.post(
+        reverse("dashboard:trees-mark-harvested", kwargs={"block_id": block_a.id}),
+        {"tree_ids": [str(tree_in_block_a.id)], "date": "2026-01-15"},
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    assert response.status_code == 200
+    tree_in_block_a.refresh_from_db()
+    assert tree_in_block_a.last_harvest_quantity is None
+    assert TreeCareRecord.objects.filter(tree=tree_in_block_a, kind=TreeCareRecord.KIND_HARVEST, quantity__isnull=True).exists()
+
+
+def test_mark_trees_fertilized_quantity_is_independent_of_harvest(client, manager, farm_role_manager, block_a, tree_in_block_a):
+    client.login(username="manager", password="manager12345")
+    response = client.post(
+        reverse("dashboard:trees-mark-fertilized", kwargs={"block_id": block_a.id}),
+        {"tree_ids": [str(tree_in_block_a.id)], "date": "2026-01-15", f"quantity_{tree_in_block_a.id}": "2.25"},
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    assert response.status_code == 200
+    tree_in_block_a.refresh_from_db()
+    assert tree_in_block_a.last_fertilizer_quantity == 2.25
+    assert tree_in_block_a.last_harvest_quantity is None
+    assert TreeCareRecord.objects.filter(tree=tree_in_block_a, kind=TreeCareRecord.KIND_FERTILIZER).count() == 1
+
+
+def test_repeated_dashboard_marking_accumulates_history(client, manager, farm_role_manager, block_a, tree_in_block_a):
+    client.login(username="manager", password="manager12345")
+    for date, qty in [("2026-01-01", "5"), ("2026-01-15", "9")]:
+        client.post(
+            reverse("dashboard:trees-mark-harvested", kwargs={"block_id": block_a.id}),
+            {"tree_ids": [str(tree_in_block_a.id)], "date": date, f"quantity_{tree_in_block_a.id}": qty},
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+    records = list(
+        TreeCareRecord.objects.filter(tree=tree_in_block_a, kind=TreeCareRecord.KIND_HARVEST).order_by("date")
+    )
+    assert [r.quantity for r in records] == [5, 9]
+    tree_in_block_a.refresh_from_db()
+    assert tree_in_block_a.last_harvest_quantity == 9  # most recent wins on the denormalized Tree field
+
+
+def test_tree_care_history_returns_both_kinds_newest_first(client, manager, farm_role_manager, block_a, tree_in_block_a):
+    client.login(username="manager", password="manager12345")
+    TreeCareRecord.objects.create(tree=tree_in_block_a, kind=TreeCareRecord.KIND_HARVEST, date="2026-01-01", quantity=5)
+    TreeCareRecord.objects.create(tree=tree_in_block_a, kind=TreeCareRecord.KIND_FERTILIZER, date="2026-01-10", quantity=None)
+    TreeCareRecord.objects.create(tree=tree_in_block_a, kind=TreeCareRecord.KIND_HARVEST, date="2026-01-20", quantity=12)
+
+    response = client.get(reverse("dashboard:tree-care-history", kwargs={"tree_id": tree_in_block_a.id}))
+    assert response.status_code == 200
+    history = response.json()["history"]
+    assert [h["date"] for h in history] == ["2026-01-20", "2026-01-10", "2026-01-01"]
+    assert history[0]["kind"] == "harvest"
+    assert history[0]["quantity"] == 12
+    assert history[1]["quantity"] is None
+
+
+def test_tree_care_history_empty_when_no_records(client, manager, farm_role_manager, tree_in_block_a):
+    client.login(username="manager", password="manager12345")
+    response = client.get(reverse("dashboard:tree-care-history", kwargs={"tree_id": tree_in_block_a.id}))
+    assert response.status_code == 200
+    assert response.json()["history"] == []
+
+
+def test_unrelated_manager_cannot_view_care_history_outside_their_scope(client, manager, farm_role_manager, tmp_path):
+    other_farm = Farm.objects.create(name="Someone else's farm")
+    other_block = FarmBlock.objects.create(farm=other_farm, name="Not managed")
+    other_tree = Tree.objects.create(farm_block=other_block, name="Other tree", location=Point(0, 0, srid=4326))
+    client.login(username="manager", password="manager12345")
+    response = client.get(reverse("dashboard:tree-care-history", kwargs={"tree_id": other_tree.id}))
+    assert response.status_code == 404
+
+
+def test_mark_trees_ajax_scope_still_enforced_for_the_new_quantity_path(client, manager, farm_role_manager):
+    """Same scoping check as test_ajax_write_actions_still_enforce_scope
+    above, specifically for the quantity-carrying path added to this view —
+    a manager can't mark trees (with or without a quantity) in a block they
+    don't manage.
+    """
+    other_farm = Farm.objects.create(name="Someone else's farm")
+    other_block = FarmBlock.objects.create(farm=other_farm, name="Not managed")
+    other_tree = Tree.objects.create(farm_block=other_block, name="Sneaky tree", location=Point(0, 0, srid=4326))
+    client.login(username="manager", password="manager12345")
+    response = client.post(
+        reverse("dashboard:trees-mark-harvested", kwargs={"block_id": other_block.id}),
+        {"tree_ids": [str(other_tree.id)], "date": "2026-01-15", f"quantity_{other_tree.id}": "99"},
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    assert response.status_code == 404
+    other_tree.refresh_from_db()
+    assert other_tree.last_harvest_quantity is None
 
 
 # --- Vendored front-end assets -------------------------------------------

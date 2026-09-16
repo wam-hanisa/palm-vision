@@ -644,6 +644,20 @@ scripted.
   var state = {
     farmId: null, blockId: null, treeId: null,
     planningBlockId: null, selectionMode: null, selectedTreeIds: {},
+    // Per-tree quantity typed into renderTreeSelectionChecklist()'s
+    // mark_harvested/mark_fertilized rows — keyed by tree id, kept
+    // separate from selectedTreeIds (a plain presence map) so a value
+    // typed into one tree's row survives the full panel re-render that
+    // toggling any OTHER tree's checkbox triggers. Cleared at the same
+    // three points selectedTreeIds is (startTreeSelection/
+    // cancelTreeSelection/submitMarkTrees's success path).
+    selectedTreeQuantities: {},
+    // Which single-tree quick-mark inline form (renderTreeDetailPanel()
+    // below) is currently expanded — null, "mark_harvested" or
+    // "mark_fertilized". Reset to null whenever the tree detail panel is
+    // left (selectTree()/clearSelection() etc. all call renderPanel(),
+    // which is enough since this only matters while that panel is open).
+    quickMarkOpenMode: null,
     // Which overlapping image (if any) to display for a given block, keyed
     // by block id — chosen from the block panel's imagery picker (see
     // renderImageryPickerSection()) instead of always stacking every
@@ -824,6 +838,7 @@ scripted.
     exitInteractiveModes();
     state.farmId = tree.farm_id; state.blockId = tree.block_id; state.treeId = treeId;
     state.planningBlockId = null; state.selectionMode = null;
+    state.quickMarkOpenMode = null; // don't carry an open quick-mark form over from a previously viewed tree
     farmSelect.value = state.farmId;
     repopulateBlockOptions(state.farmId);
     blockSelect.value = state.blockId;
@@ -882,6 +897,7 @@ scripted.
     state.planningBlockId = blockId;
     state.selectionMode = mode;
     state.selectedTreeIds = {};
+    state.selectedTreeQuantities = {};
     renderMap();
     renderPanel();
   }
@@ -891,6 +907,7 @@ scripted.
     state.planningBlockId = null;
     state.selectionMode = null;
     state.selectedTreeIds = {};
+    state.selectedTreeQuantities = {};
     renderMap();
     renderPanel();
   }
@@ -1623,7 +1640,16 @@ scripted.
   // below — the lasso button, select-all/clear shortcuts, and the actual
   // checkbox list are identical across every "select several trees"
   // flow; only the panel-actions button below it differs per flow.
-  function renderTreeSelectionChecklist(block) {
+  // `quantityUnit` (null | "bunches" | "kg") turns on a per-tree quantity
+  // input next to each CHECKED row — used by the mark_harvested/
+  // mark_fertilized completion flows (submitMarkTrees() below reads these
+  // back via state.selectedTreeQuantities), never by harvest_plan or the
+  // mark_need_* assignment flows, where nothing has actually happened yet
+  // and a quantity wouldn't mean anything. Deliberately one input PER
+  // TREE, not one shared field for the whole selection — different trees
+  // yield different amounts, and a single shared value would be wrong for
+  // most of a multi-tree selection.
+  function renderTreeSelectionChecklist(block, quantityUnit) {
     var trees = treesByBlock[block.id] || [];
     if (!trees.length) {
       panelEl.appendChild(el("p", { class: "panel-empty", text: "No active trees in this block to select." }));
@@ -1652,7 +1678,24 @@ scripted.
       var checkbox = el("input", { type: "checkbox" });
       checkbox.checked = !!state.selectedTreeIds[tree.id];
       checkbox.addEventListener("change", function () { toggleTreeSelected(tree.id); });
-      list.appendChild(el("li", {}, [el("label", {}, [checkbox, document.createTextNode(tree.name)])]));
+      var label = el("label", {}, [checkbox, document.createTextNode(tree.name)]);
+      var rowChildren = [label];
+      // The quantity input is a SIBLING of the <label>, not nested inside
+      // it — a form control nested inside a <label> that already wraps a
+      // checkbox is a real cross-browser footgun (a click meant to place
+      // the caret can instead toggle the checkbox via label-forwarding),
+      // and this only needs the checkbox itself to be the label's target.
+      if (quantityUnit && checkbox.checked) {
+        var qtyInput = el("input", {
+          type: "number", step: "0.01", min: "0", inputmode: "decimal",
+          class: "tree-checklist-qty", placeholder: quantityUnit,
+          "aria-label": tree.name + " quantity (" + quantityUnit + ", optional)",
+        });
+        qtyInput.value = state.selectedTreeQuantities[tree.id] || "";
+        qtyInput.addEventListener("input", function () { state.selectedTreeQuantities[tree.id] = qtyInput.value; });
+        rowChildren.push(qtyInput);
+      }
+      list.appendChild(el("li", { class: "tree-checklist-item" }, rowChildren));
     });
     panelEl.appendChild(list);
   }
@@ -1681,21 +1724,26 @@ scripted.
   // (apps/trees/models.py) for the full two-stage workflow. `needsDate`
   // is what tells them apart in this UI: completion records *when* the
   // work happened (defaults to today, editable), assignment is just "now."
+  // quantityUnit is null for the two mark_need_* assignment modes (nothing
+  // has happened yet, so a quantity has no meaning) and set for the two
+  // completion modes — "bunches" mirrors HarvestTree.quantity's own
+  // help_text ("e.g. fruit bunch count"), "kg" mirrors how fertilizer
+  // amounts are recorded everywhere else in this app.
   var MARK_MODE_CONFIG = {
-    mark_harvested: { verb: "harvested", url: "trees_mark_harvested", needsDate: true, noun: "harvest" },
-    mark_fertilized: { verb: "fertilized", url: "trees_mark_fertilized", needsDate: true, noun: "fertilizer" },
-    mark_need_harvest: { verb: "needing harvest", url: "trees_mark_need_harvest", needsDate: false, noun: "harvest" },
-    mark_need_fertilize: { verb: "needing fertilizer", url: "trees_mark_need_fertilize", needsDate: false, noun: "fertilizer" },
+    mark_harvested: { verb: "harvested", url: "trees_mark_harvested", needsDate: true, noun: "harvest", quantityUnit: "bunches" },
+    mark_fertilized: { verb: "fertilized", url: "trees_mark_fertilized", needsDate: true, noun: "fertilizer", quantityUnit: "kg" },
+    mark_need_harvest: { verb: "needing harvest", url: "trees_mark_need_harvest", needsDate: false, noun: "harvest", quantityUnit: null },
+    mark_need_fertilize: { verb: "needing fertilizer", url: "trees_mark_need_fertilize", needsDate: false, noun: "fertilizer", quantityUnit: null },
   };
 
   function renderMarkTreesSection(block, mode) {
     var cfg = MARK_MODE_CONFIG[mode];
     var intervalDays = cfg.noun === "harvest" ? block.effective_harvest_interval_days : block.effective_fertilizer_interval_days;
     var noteText = cfg.needsDate
-      ? "Select the trees you just " + cfg.verb + " — click them on the map, check them below, or drag a lasso around a group — then confirm. Current interval for this block: every " + intervalDays + " days."
+      ? "Select the trees you just " + cfg.verb + " — click them on the map, check them below, or drag a lasso around a group — then confirm. Current interval for this block: every " + intervalDays + " days. A per-tree quantity is optional."
       : "Select the trees that need " + cfg.noun + " — click them on the map, check them below, or drag a lasso around a group — then confirm. The PIC Block user assigned to this block will see these as a to-do in the field app.";
     panelEl.appendChild(el("p", { class: "panel-note", text: noteText }));
-    renderTreeSelectionChecklist(block);
+    renderTreeSelectionChecklist(block, cfg.quantityUnit);
 
     var dateInput = null;
     if (cfg.needsDate) {
@@ -1722,14 +1770,21 @@ scripted.
   // to complete it. Reuses the same completion endpoints as the bulk flow
   // (mark_harvested/mark_fertilized), just with a one-tree FormData built
   // directly rather than going through state.selectedTreeIds.
-  function quickMarkTreeDone(tree, block, mode) {
+  //
+  // Not a single click-and-POST any more — it used to be, and that's
+  // exactly the "marking gives a date with no quantity" gap this closes.
+  // renderTreeDetailPanel() below expands this into a small inline form
+  // (optional quantity input + Save/Cancel) instead of firing immediately.
+  function quickMarkTreeDone(tree, block, mode, quantity) {
     var cfg = MARK_MODE_CONFIG[mode];
     var formData = new FormData();
     formData.append("tree_ids", tree.id);
     formData.append("date", new Date().toISOString().slice(0, 10));
+    if (quantity !== undefined && quantity !== "") formData.append("quantity_" + tree.id, quantity);
     formData.append("csrfmiddlewaretoken", CSRF_TOKEN);
     postJson(buildUrl(data.urls[cfg.url], block.id), formData).then(function (json) {
       if (json.ok) {
+        state.quickMarkOpenMode = null;
         showFlash(json.message, "success");
         refreshData(json.farm_map_data, json.focus);
       } else {
@@ -1744,7 +1799,15 @@ scripted.
     var cfg = MARK_MODE_CONFIG[mode];
     var url = data.urls[cfg.url];
     var formData = new FormData();
-    treeIds.forEach(function (id) { formData.append("tree_ids", id); });
+    treeIds.forEach(function (id) {
+      formData.append("tree_ids", id);
+      // One optional quantity field PER tree — see
+      // renderTreeSelectionChecklist()'s own comment for why this isn't a
+      // single shared value. Blank entries are simply omitted; the server
+      // treats a missing quantity_<id> the same as an explicitly blank one.
+      var qty = state.selectedTreeQuantities[id];
+      if (qty !== undefined && qty !== "") formData.append("quantity_" + id, qty);
+    });
     if (dateValue) formData.append("date", dateValue);
     formData.append("csrfmiddlewaretoken", CSRF_TOKEN);
     postJson(buildUrl(url, block.id), formData).then(function (json) {
@@ -1752,6 +1815,8 @@ scripted.
         exitInteractiveModes();
         state.planningBlockId = null;
         state.selectionMode = null;
+        state.selectedTreeIds = {};
+        state.selectedTreeQuantities = {};
         showFlash(json.message, "success");
         refreshData(json.farm_map_data, json.focus);
       } else {
@@ -1938,16 +2003,42 @@ scripted.
 
     // Quick single-tree completion — only shown when there's actually a
     // pending stage-1 flag on this tree (see quickMarkTreeDone() above).
+    // Clicking "Mark X (today)" expands an inline optional-quantity form
+    // in place of the button, rather than posting immediately — that
+    // instant-POST behaviour (no quantity, ever) was the exact gap this
+    // whole change closes for the single-tree case.
+    function renderQuickMarkRow(mode, label) {
+      if (state.quickMarkOpenMode !== mode) {
+        return actionButton(label, function () {
+          state.quickMarkOpenMode = mode;
+          renderPanel();
+        }, "primary-button-small");
+      }
+      var cfg = MARK_MODE_CONFIG[mode];
+      var qtyInput = el("input", {
+        type: "number", step: "0.01", min: "0", inputmode: "decimal",
+        class: "tree-checklist-qty", placeholder: cfg.quantityUnit,
+        "aria-label": label + " — quantity (" + cfg.quantityUnit + ", optional)",
+      });
+      var wrap = el("div", { class: "quick-mark-form" }, [qtyInput]);
+      var saveBtn = actionButton("Save", function () {
+        quickMarkTreeDone(tree, block, mode, qtyInput.value);
+      }, "primary-button-small");
+      var cancelBtn = actionButton("Cancel", function () {
+        state.quickMarkOpenMode = null;
+        renderPanel();
+      }, "link-button");
+      wrap.appendChild(saveBtn);
+      wrap.appendChild(cancelBtn);
+      return wrap;
+    }
+
     var quickActions = [];
     if (tree.harvest_stage === "marked" && block) {
-      quickActions.push(actionButton(
-        "Mark harvested (today)", function () { quickMarkTreeDone(tree, block, "mark_harvested"); }, "primary-button-small"
-      ));
+      quickActions.push(renderQuickMarkRow("mark_harvested", "Mark harvested (today)"));
     }
     if (tree.fertilizer_stage === "marked" && block) {
-      quickActions.push(actionButton(
-        "Mark fertilized (today)", function () { quickMarkTreeDone(tree, block, "mark_fertilized"); }, "primary-button-small"
-      ));
+      quickActions.push(renderQuickMarkRow("mark_fertilized", "Mark fertilized (today)"));
     }
     if (quickActions.length) {
       panelEl.appendChild(el("div", { class: "panel-actions" }, quickActions));
@@ -1958,7 +2049,44 @@ scripted.
       actionButton("Mark removed", function () { removeTree(tree); }, "link-button-danger"),
     ]));
 
+    renderTreeCareHistory(tree.id);
     renderTreeHealthHistory(tree.id);
+  }
+
+  // On-demand harvest/fertilizer marking history — TreeCareRecord rows
+  // (apps/trees/models.py), one per completion from either surface (this
+  // dashboard's own mark-directly actions, or the PWA field app's
+  // mark_harvested/mark_fertilized). Same on-demand-fetch shape as
+  // renderTreeHealthHistory() below, and for the same reason — see
+  // TreeCareHistoryView's docstring in views.py.
+  function renderTreeCareHistory(treeId) {
+    var container = el("div", {}, [
+      el("h2", { class: "panel-heading", text: "Harvest & fertilizer history", style: "margin-top:20px;" }),
+      el("p", { class: "panel-empty", text: "Loading…" }),
+    ]);
+    panelEl.appendChild(container);
+    getJson(buildUrl(data.urls.tree_care_history, treeId)).then(function (json) {
+      if (state.treeId !== treeId) return; // navigated away before this resolved
+      container.innerHTML = "";
+      container.appendChild(el("h2", { class: "panel-heading", text: "Harvest & fertilizer history", style: "margin-top:20px;" }));
+      if (!json.history || !json.history.length) {
+        container.appendChild(el("p", { class: "panel-empty", text: "No harvest or fertilizer completions recorded yet for this tree." }));
+        return;
+      }
+      var list = el("ul", { class: "panel-list" });
+      json.history.forEach(function (entry) {
+        var unit = entry.kind === "harvest" ? "bunches" : "kg";
+        var qtyText = entry.quantity === null || entry.quantity === undefined
+          ? "no quantity recorded"
+          : entry.quantity + " " + unit;
+        var meta = qtyText + (entry.recorded_by_name ? " · " + entry.recorded_by_name : "");
+        list.appendChild(el("li", { class: "panel-list-button" }, [
+          el("span", { text: new Date(entry.date + "T00:00:00").toLocaleDateString() + " — " + entry.kind_display }),
+          el("span", { class: "panel-list-meta", text: meta }),
+        ]));
+      });
+      container.appendChild(list);
+    });
   }
 
   // On-demand tree health-by-date history — surfaces TreeHealthClassification

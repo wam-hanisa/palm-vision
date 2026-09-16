@@ -245,6 +245,26 @@ input:focus, select:focus { border-color: var(--primary); }
 .mark-banner .pill { margin-top: 0; background: transparent; padding: 0; font-weight: 600; }
 .mark-banner button { min-height: 44px; flex-shrink: 0; }
 
+/* Expanded state — markBanner() swaps the single "Mark X" button for an
+   inline optional-quantity form in place, rather than posting immediately
+   with no way to record how much was actually done. Row layout doesn't
+   work once there's a form to fit, so this switches to a stacked column. */
+.mark-banner--open {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.mark-banner--open form { margin-top: 0.6rem; }
+
+/* The Cancel control here is .btn-text, which uses --primary (forest
+   green) text on a transparent background — fine on the cream page
+   background (9.7:1) but only 4.33:1 on this banner's amber fill, just
+   under the 4.5:1 AA floor for text this size/weight (19.8px/600 doesn't
+   clear WCAG's bold-text large-text bar, which starts at 700). --text
+   matches the pill label already on this banner (6.39:1) and reads as
+   consistent rather than a special case. */
+.mark-banner--open .btn-text { color: var(--text); }
+
 /* Always-visible offline/sync status chip — docs/09-design-system.md is
    explicit this must never be buried in a menu. */
 .sync-chip {

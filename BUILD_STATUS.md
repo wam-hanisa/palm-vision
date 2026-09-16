@@ -852,6 +852,76 @@ that appeared over the sidebar in screenshots are a headless-Chromium
 compositing artifact — the sidebar renders clean when screenshotted alone
 and nothing exists at those coordinates — so nothing was "fixed" for it.
 
+## Harvest/fertilizer marking: quantity capture + real history
+
+Reported directly against the running app: "current harvest and fertilize
+only marking the trees giving date without telling how many quantities and
+there are no history too." Both were real gaps in the completion side of
+the two-stage harvest/fertilizer workflow (Tree.harvest_marked_at's
+help_text has the full two-stage shape) — not the separate compliance
+yield-reporting pipeline (Harvest/ActualHarvest/HarvestTree), which already
+had quantity and is untouched here.
+
+**What was actually happening.** Every "Mark harvested"/"Mark fertilized"
+completion — the PWA's mark_harvested/mark_fertilized API actions and this
+dashboard's own MarkTreesHarvestedView/MarkTreesFertilizedView/
+quickMarkTreeDone — only ever accepted a date, and wrote it by overwriting
+Tree.last_harvested_at/last_fertilized_at directly. A second completion
+erased any trace the first one had happened at all; there was no quantity
+capture and no history to look at.
+
+**Fixed with one new model, `apps/trees/models.py::TreeCareRecord`** — an
+append-only per-tree log (kind, date, quantity, recorded_by), written
+alongside the existing date stamp rather than replacing it. Quantity is
+optional everywhere it's captured, since not every recording knows the
+amount at the time. Two new denormalized fields on Tree itself,
+`last_harvest_quantity`/`last_fertilizer_quantity`, hold the latest value
+so read paths (TreeSerializer, the offline sync pull) don't pay an extra
+per-tree query for it — a real farm block can hold over a thousand trees
+(see the "B4" block in the field screenshot this was reported against), so
+an N+1 there would have been a genuine cost, not a theoretical one.
+
+**Dashboard.** The bulk "Record harvest/fertilizer directly" and "Mark
+trees needing X" checklist now shows a per-tree quantity input next to
+each CHECKED row — deliberately per-tree, not one shared field for the
+whole selection, since different trees yield different amounts. It's
+absent for the two stage-1 assignment modes (mark_need_harvest/
+mark_need_fertilize), where nothing has happened yet and a quantity has no
+meaning. The single-tree "Mark harvested/fertilized (today)" quick action
+on the tree detail panel no longer posts on click — it expands into the
+same optional-quantity input plus Save/Cancel. A new "Harvest & fertilizer
+history" section (mirroring the existing on-demand "Health history"
+section's fetch-after-render pattern, via a new TreeCareHistoryView) lists
+every TreeCareRecord for the open tree, newest first, with quantity and
+who recorded it.
+
+**PWA field app.** The single "Mark harvested"/"Mark fertilized" button on
+the tree detail screen's stage-2 completion banner now expands into the
+same inline optional-quantity form instead of posting immediately. The
+"Last harvested: DATE" line shows the quantity when one was recorded
+(`DATE (N bunches)`), degrading to plain `DATE` when it wasn't. Full
+history browsing was judged not worth the added offline-sync/IndexedDB
+surface for this pass — the quantity capture and the "last known amount"
+display are the field-app-side half of the same fix; the dashboard is
+where a Manager actually reviews history over time.
+
+**Caught while wiring this up:** a genuine, if small, accessibility
+regression — the PWA quick-mark form's "Cancel" control uses `.btn-text`,
+which is `--primary` (forest green) text on transparent, fine against the
+cream page background (9.7:1) but only 4.33:1 against the amber banner
+fill it now sits inside, just under the 4.5:1 AA floor for that size/weight
+(19.8px/600 doesn't clear WCAG's large-bold threshold, which starts at
+700). Fixed by making that one context use `--text` instead (6.39:1,
+matching the pill label already on the same banner).
+
+14 new tests (`apps/trees/tests.py`, `apps/dashboard/tests.py`) cover:
+quantity capture with/without a value, an unparseable quantity degrading
+to "not provided" rather than a 400, two different trees in one bulk
+submission getting two different quantities, repeated markings
+accumulating history instead of overwriting it, and scope enforcement on
+the new TreeCareHistoryView. All 326 tests pass; `ruff check` and
+`makemigrations --check --dry-run` are clean.
+
 ## Known gaps in what's built (not blockers, but don't forget these)
 
 **Update — FK write-scope validation: fixed.** The gap below (no viewset

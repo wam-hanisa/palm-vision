@@ -1168,6 +1168,49 @@ body.farm-map-fullpage .flash {
   font-size: 13px;
 }
 
+/* Wraps each checklist row: the checkbox+name <label> and (only while a
+   completion mode with a quantity unit is active — see
+   renderTreeSelectionChecklist()) a per-tree quantity input, as siblings
+   rather than the input nested inside the label — see that function's own
+   comment for why nesting a form control inside a label that already
+   wraps a checkbox is worth avoiding. */
+.tree-checklist-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.tree-checklist-item label {
+  flex: 1;
+  min-width: 0;
+}
+
+.tree-checklist-qty {
+  width: 84px;
+  flex-shrink: 0;
+  padding: 6px 8px;
+  border: 1px solid #D8D3C3;
+  border-radius: 4px;
+  background-color: #fff;
+  font-size: 13px;
+  color: var(--text);
+}
+
+/* Single-tree "Mark harvested/fertilized (today)" quick action, expanded
+   in place of its button — see renderTreeDetailPanel()'s
+   renderQuickMarkRow(). Same optional-quantity idea as the bulk checklist
+   above, just for one tree instead of several. */
+.quick-mark-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.quick-mark-form .tree-checklist-qty {
+  width: 100px;
+}
+
 /* The dark-sidebar context this colour was originally written for. */
 .sidebar .link-button { color: #E7E4D8; }
 

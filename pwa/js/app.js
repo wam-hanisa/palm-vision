@@ -17,6 +17,12 @@ const state = {
   // came back with both fields blank after a bad password, forcing a gloved
   // user to retype their username every attempt.
   loginUsername: "",
+  // Which mark-done banner ("harvest" | "fertilizer" | null) is currently
+  // expanded into its inline quantity form on the tree detail screen — see
+  // markBanner()'s docstring. Reset whenever a different tree is opened
+  // (setScreen("treeDetail", ...) below already blows away selectedTreeId,
+  // so tying this reset to the same call keeps it simple).
+  quickMarkOpenKind: null,
 };
 
 const root = () => document.getElementById("app");
@@ -456,22 +462,59 @@ function formatDateOrNever(isoString) {
   return isoString ? new Date(isoString).toLocaleDateString() : "never";
 }
 
-/** Stage-1 "needs harvest/fertilizer" banner + completion button — `kind`
+/** "Last harvested: DATE" line, extended with a quantity when one was
+ * recorded (Tree.last_harvest_quantity/last_fertilizer_quantity — see that
+ * field's help_text) — previously this line only ever showed a date, with
+ * no way to tell how much was actually done. Quantity is optional at
+ * capture time, so a tree with a date but no quantity on record is
+ * expected and shown plainly, not as an error.
+ */
+function formatLastDone(isoDate, quantity, unit) {
+  if (!isoDate) return "never";
+  const when = new Date(isoDate).toLocaleDateString();
+  return quantity === null || quantity === undefined ? when : `${when} (${quantity} ${unit})`;
+}
+
+/** Stage-1 "needs harvest/fertilizer" banner + completion control — `kind`
  * is 'harvest' or 'fertilizer'. Only rendered when the corresponding
  * *_marked_at field is set (see Tree.harvest_marked_at's help_text,
  * apps/trees/models.py, for the two-stage workflow this is stage 2 of).
- * The button posts to TreeViewSet's mark_harvested/mark_fertilized action
- * — wired in wireScreenEvents() below, alongside the tree-edit-form, since
- * both are online-only record edits (see that handler's own comment).
+ *
+ * Two states, toggled by state.quickMarkOpenKind: a plain "Mark
+ * harvested"/"Mark fertilized" button, or — once tapped — an inline
+ * optional-quantity form in its place. It used to be a single button that
+ * posted immediately with no way to record how much was actually done;
+ * this is the field-app side of the same gap the office dashboard's
+ * "Record harvest/fertilizer directly" flow had. Wired in
+ * wireScreenEvents() below, alongside the tree-edit-form, since both are
+ * online-only record edits (see that handler's own comment).
  */
 function markBanner(tree, kind) {
   const markedAt = kind === "harvest" ? tree.harvest_marked_at : tree.fertilizer_marked_at;
   if (!markedAt) return "";
   const label = kind === "harvest" ? "harvest" : "fertilizer";
+  const doneVerb = label === "harvest" ? "harvested" : "fertilized";
+  const unit = kind === "harvest" ? "bunches" : "kg";
+  const assignedLine = `<span class="pill pill--accent">Needs ${label} — assigned ${formatDateOrNever(markedAt)}</span>`;
+
+  if (state.quickMarkOpenKind !== kind) {
+    return `
+      <div class="mark-banner">
+        ${assignedLine}
+        <button id="mark-${kind}-btn" data-tree-id="${tree.id}" ${navigator.onLine ? "" : "disabled"}>Mark ${doneVerb}</button>
+      </div>`;
+  }
+
   return `
-    <div class="mark-banner">
-      <span class="pill pill--accent">Needs ${label} — assigned ${formatDateOrNever(markedAt)}</span>
-      <button id="mark-${kind}-btn" data-tree-id="${tree.id}" ${navigator.onLine ? "" : "disabled"}>Mark ${label === "harvest" ? "harvested" : "fertilized"}</button>
+    <div class="mark-banner mark-banner--open">
+      ${assignedLine}
+      <form id="mark-${kind}-form" data-tree-id="${tree.id}" data-kind="${kind}">
+        <label>Quantity (${unit}, optional)<input name="quantity" type="number" step="0.01" min="0" inputmode="decimal"></label>
+        <div class="action-row">
+          <button type="submit" ${navigator.onLine ? "" : "disabled"}>Save</button>
+          <button type="button" id="mark-${kind}-cancel-btn" class="btn-text">Cancel</button>
+        </div>
+      </form>
     </div>`;
 }
 
@@ -496,7 +539,7 @@ async function treeDetailScreen() {
       <p class="pill ${tree.status === "removed" ? "pill--warning" : "pill--accent"}">${tree.status === "removed" ? "Removed" : "Active"}</p>
       <p class="muted">Health: ${healthLabels[tree.current_health] || tree.current_health} &middot; Source: ${tree.source === "drone_detected" ? "Drone detected" : "Manual"}</p>
       <p class="muted">Pin: ${lat.toFixed(6)}, ${lon.toFixed(6)}</p>
-      <p class="muted">Last harvested: ${formatDateOrNever(tree.last_harvested_at)} &middot; Last fertilized: ${formatDateOrNever(tree.last_fertilized_at)}</p>
+      <p class="muted">Last harvested: ${formatLastDone(tree.last_harvested_at, tree.last_harvest_quantity, "bunches")} &middot; Last fertilized: ${formatLastDone(tree.last_fertilized_at, tree.last_fertilizer_quantity, "kg")}</p>
 
       ${offlineNotice}
       ${markBanner(tree, "harvest")}
@@ -597,35 +640,64 @@ async function render() {
 
 // --- Event wiring ---------------------------------------------------------
 
-/** Binds a mark-harvest-btn/mark-fertilizer-btn click handler, if present
- * on the currently rendered screen — see markBanner()'s docstring and the
- * two calls to this in wireScreenEvents() below. `apiAction` is
- * "mark_harvested" or "mark_fertilized", matching TreeViewSet's own action
- * names (apps/trees/views.py) exactly, so the POST path is built the same
- * way DRF's router would generate it.
+/** Binds the mark-harvest-btn/mark-fertilizer-btn CLICK (present when
+ * markBanner() is in its collapsed state) to expand the inline quantity
+ * form in its place — see markBanner()'s docstring. `kind` is "harvest" or
+ * "fertilizer"; wireMarkDoneForm() below handles what happens once that
+ * form is actually submitted.
  */
-function wireMarkDoneButton(btnId, apiAction) {
-  const btn = document.getElementById(btnId);
+function wireMarkExpandButton(kind) {
+  const btn = document.getElementById(`mark-${kind}-btn`);
   if (!btn) return;
-  btn.addEventListener("click", async () => {
-    const treeId = btn.dataset.treeId;
-    btn.disabled = true;
-    const originalLabel = btn.textContent;
-    btn.textContent = "Saving…";
-    try {
-      const updated = await window.PalmVisionAPI.onlineOnlyWrite(`/api/trees/${treeId}/${apiAction}/`, "POST", {});
-      await window.PalmVisionDB.putOne("trees", updated);
-      await render(); // stays on this same tree-detail screen, now reflecting the cleared marked_at
-    } catch (err) {
-      btn.disabled = false;
-      btn.textContent = originalLabel;
-      if (err.isNetworkError) {
-        showError("You're offline — this needs a live connection. Nothing was saved; try again once you're back online.");
-      } else {
-        showError(err);
-      }
-    }
+  btn.addEventListener("click", () => {
+    state.quickMarkOpenKind = kind;
+    render();
   });
+}
+
+/** Binds the mark-harvest-form/mark-fertilizer-form SUBMIT (present once
+ * markBanner() is expanded) plus its Cancel button — see markBanner()'s
+ * docstring and the two calls to this in wireScreenEvents() below.
+ * `apiAction` is "mark_harvested" or "mark_fertilized", matching
+ * TreeViewSet's own action names (apps/trees/views.py) exactly, so the
+ * POST path is built the same way DRF's router would generate it.
+ */
+function wireMarkDoneForm(kind, apiAction) {
+  const form = document.getElementById(`mark-${kind}-form`);
+  if (form) {
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const treeId = form.dataset.treeId;
+      const submitBtn = form.querySelector("button[type=submit]");
+      const originalLabel = submitBtn.textContent;
+      submitBtn.disabled = true;
+      submitBtn.textContent = "Saving…";
+      const quantityRaw = new FormData(form).get("quantity");
+      const body = quantityRaw ? { quantity: quantityRaw } : {};
+      try {
+        const updated = await window.PalmVisionAPI.onlineOnlyWrite(`/api/trees/${treeId}/${apiAction}/`, "POST", body);
+        await window.PalmVisionDB.putOne("trees", updated);
+        state.quickMarkOpenKind = null;
+        await render(); // stays on this same tree-detail screen, now reflecting the cleared marked_at
+      } catch (err) {
+        submitBtn.disabled = false;
+        submitBtn.textContent = originalLabel;
+        if (err.isNetworkError) {
+          showError("You're offline — this needs a live connection. Nothing was saved; try again once you're back online.");
+        } else {
+          showError(err);
+        }
+      }
+    });
+  }
+
+  const cancelBtn = document.getElementById(`mark-${kind}-cancel-btn`);
+  if (cancelBtn) {
+    cancelBtn.addEventListener("click", () => {
+      state.quickMarkOpenKind = null;
+      render();
+    });
+  }
 }
 
 function wireScreenEvents() {
@@ -689,7 +761,7 @@ function wireScreenEvents() {
   // function's docstring for why this was previously a dead click (no
   // handler existed at all).
   document.querySelectorAll(".tree-item").forEach((li) => {
-    li.addEventListener("click", () => setScreen("treeDetail", { selectedTreeId: li.dataset.treeId }));
+    li.addEventListener("click", () => setScreen("treeDetail", { selectedTreeId: li.dataset.treeId, quickMarkOpenKind: null }));
   });
 
   const logHarvestTreeBtn = document.getElementById("log-harvest-tree-btn");
@@ -713,8 +785,10 @@ function wireScreenEvents() {
   // record, so it follows docs/05-offline-sync.md § Conflict handling's
   // "editing an existing record is online-only" rule rather than being
   // queued like a fresh yield-log entry would be.
-  wireMarkDoneButton("mark-harvest-btn", "mark_harvested");
-  wireMarkDoneButton("mark-fertilizer-btn", "mark_fertilized");
+  wireMarkExpandButton("harvest");
+  wireMarkExpandButton("fertilizer");
+  wireMarkDoneForm("harvest", "mark_harvested");
+  wireMarkDoneForm("fertilizer", "mark_fertilized");
 
   const treeForm = document.getElementById("tree-form");
   if (treeForm) {
