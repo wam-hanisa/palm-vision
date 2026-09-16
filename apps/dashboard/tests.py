@@ -2018,9 +2018,6 @@ def test_vendored_frontend_assets_exist_on_disk():
         ("vendor", "leaflet", "leaflet.css"),
         ("vendor", "leaflet", "leaflet.draw.js"),
         ("vendor", "leaflet", "leaflet.draw.css"),
-        ("vendor", "leaflet", "leaflet.markercluster.js"),
-        ("vendor", "leaflet", "MarkerCluster.css"),
-        ("vendor", "leaflet", "MarkerCluster.Default.css"),
         ("vendor", "chartjs", "chart.umd.js"),
         ("fonts", "public-sans-latin.woff2"),
     ]:

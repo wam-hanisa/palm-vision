@@ -2564,9 +2564,7 @@ class ReportRunListView(ManagerOrSuperAdminRequiredMixin, TemplateView):
 # bare "act on whatever's under the pin" shortcut — see this module's
 # docstring for why that distinction matters here specifically. Every
 # feature carries `farm_id` so the template's farm filter can select
-# client-side without a round trip, and tree markers are clustered
-# (Leaflet.markercluster) rather than plotted individually, since a real
-# farm can carry far more trees than this project's test-scale fixtures. ---
+# client-side without a round trip. ---
 
 # MapView (old, separate map page) removed — superseded by FarmMapView,
 # which merges browsing, farm/block/tree management, imagery-upload

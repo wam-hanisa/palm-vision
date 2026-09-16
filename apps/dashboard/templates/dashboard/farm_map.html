@@ -39,11 +39,10 @@ layout below — this branch has no map, so it needs its own padding back.
 {% else %}
 {% comment %}
 The one map-first hub — see FarmMapView's own docstring
-(apps/dashboard/views.py) for the full reasoning. Leaflet + Leaflet.
-markercluster + Leaflet.draw + OpenStreetMap tiles from a CDN, same
-accepted exception this app already makes on every other map page (see
-style.css's own flagged font/icon deviations and the old map.html's
-matching note).
+(apps/dashboard/views.py) for the full reasoning. Leaflet + Leaflet.draw +
+OpenStreetMap tiles from a CDN, same accepted exception this app already
+makes on every other map page (see style.css's own flagged font/icon
+deviations and the old map.html's matching note).
 
 Everything below the map/legend is built entirely by JS from one
 embedded JSON payload (farm_map_data) — no separate page load for
@@ -101,33 +100,33 @@ driven by client-side state rather than separate server-rendered pages:
   poll) so there's exactly one implementation of this step.
 {% endcomment %}
 {% comment %}
-Leaflet and its two plugins are served from this project's own static files,
+Leaflet and leaflet-draw are served from this project's own static files,
 not from cdnjs. CLAUDE.md's local-first ground rule means the Farm Map — the
 dashboard's single most important screen — has to render on a machine with
 no internet reachability, and a CDN <link> silently degrades it to the
 "Leaflet failed to load" no-op path below. Pinned copies live in
-apps/dashboard/static/dashboard/vendor/leaflet/ (leaflet 1.9.4,
-leaflet.markercluster 1.5.3, leaflet-draw 1.0.4 — the same versions the CDN
-URLs requested).
+apps/dashboard/static/dashboard/vendor/leaflet/ (leaflet 1.9.4, leaflet-draw
+1.0.4 — the same versions the CDN URLs requested).
 
 The basemap TILES are a separate question and remain remote (see the
 tileLayer calls below): tiles are imagery that genuinely cannot be bundled,
 so the map degrades to boundaries-on-blank-background without a connection
 rather than failing outright.
+
+Leaflet.markercluster (grouping nearby trees into one icon at low zoom) was
+tried and then removed — reported directly, twice, with screenshots: first
+that its default numbered icon read as noise and had poor contrast against
+a real canopy photo, then — after that was fixed — that grouping itself
+wasn't wanted at all: "there are no need to make a group of dot ... show
+dot as is." buildLayers() below now adds every tree marker straight to a
+plain L.featureGroup(), no clustering. This does trade away the
+"a farm block can hold over a thousand trees" scale cushion clustering
+existed for (see that same comment elsewhere in this file) — worth
+revisiting if a very large block ever makes the map itself sluggish, but
+that's not what was asked for here.
 {% endcomment %}
 <link rel="stylesheet" href="{% static 'dashboard/vendor/leaflet/leaflet.css' %}">
-<link rel="stylesheet" href="{% static 'dashboard/vendor/leaflet/MarkerCluster.css' %}">
 <link rel="stylesheet" href="{% static 'dashboard/vendor/leaflet/leaflet.draw.css' %}">
-{% comment %}
-MarkerCluster.Default.css (the plugin's own numbered, pale-green/yellow/
-orange cluster icon styling) is deliberately not loaded — reported
-directly, with a screenshot: its count label was unwanted noise, and its
-pale yellow-green fill nearly disappeared against a real green plantation
-canopy photo. buildLayers()'s own iconCreateFunction below renders a
-plain, count-less dot with this project's own .tree-cluster-dot styling
-(style.css) instead. MarkerCluster.css itself (transition/animation rules
-only, no colors) is still needed for the spiderfy/expand behavior.
-{% endcomment %}
 
 {% comment %}
 Full-page, Google-Maps-style layout: #farm-map fills the entire content
@@ -175,7 +174,6 @@ scripted.
 {{ farm_map_data|json_script:"farm-map-data" }}
 
 <script src="{% static 'dashboard/vendor/leaflet/leaflet.js' %}"></script>
-<script src="{% static 'dashboard/vendor/leaflet/leaflet.markercluster.js' %}"></script>
 <script src="{% static 'dashboard/vendor/leaflet/leaflet.draw.js' %}"></script>
 <script>
 (function () {
@@ -586,7 +584,7 @@ scripted.
   // exactly the kind of thing these arrays hold. Always tears down
   // whatever this function's own previous run put on the map first.
   var blockLayers = [], imageLayers = [], treeMarkers = [];
-  var currentBlockLayers = [], currentImageLayers = [], currentClusterGroup = null;
+  var currentBlockLayers = [], currentImageLayers = [], currentTreeLayer = null;
 
   // Shared teardown for whatever the browse-and-manage state machine
   // currently has on the map — used both here (buildLayers() rebuilds
@@ -599,10 +597,10 @@ scripted.
   function clearCurrentMapLayers() {
     currentBlockLayers.forEach(function (e) { map.removeLayer(e.layer); });
     currentImageLayers.forEach(function (e) { map.removeLayer(e.layer); });
-    if (currentClusterGroup) map.removeLayer(currentClusterGroup);
+    if (currentTreeLayer) map.removeLayer(currentTreeLayer);
     currentBlockLayers = [];
     currentImageLayers = [];
-    currentClusterGroup = null;
+    currentTreeLayer = null;
   }
 
   function buildLayers() {
@@ -634,9 +632,9 @@ scripted.
       return { farmId: image.farm_id, imageId: image.id, layer: group };
     });
 
-    // Trees are clustered (Leaflet.markercluster) rather than added
-    // individually — a real farm can have thousands, and bare markers
-    // would make the map unusable long before it became visually wrong.
+    // Every tree gets its own always-visible marker — no clustering (see
+    // this file's own top-of-file comment for why that was tried and
+    // then removed: reported directly, "show dot as is," not grouped).
     treeMarkers = data.trees.map(function (tree) {
       var coords = tree.geometry.coordinates; // [lon, lat]
       var indicator = treeIndicatorStyle(tree);
@@ -805,25 +803,12 @@ scripted.
     });
     currentImageLayers.forEach(function (e) { e.layer.addTo(map); });
 
-    currentClusterGroup = L.markerClusterGroup({
-      maxClusterRadius: 40,
-      // Plain, count-less dot instead of the plugin's own numbered icon —
-      // reported directly: the digit inside read as noise ("just show the
-      // dot"), and the plugin's default pale yellow-green fill nearly
-      // disappeared against a real green plantation canopy photo. Styled
-      // via .tree-cluster-dot (style.css) instead of the vendored
-      // MarkerCluster.Default.css, which is no longer loaded at all.
-      iconCreateFunction: function () {
-        // iconAnchor centers the dot on its actual coordinate (like the
-        // individual circleMarkers above), not Leaflet's own default
-        // bottom-center pin anchor, which would offset a round dot
-        // upward from where the cluster actually sits.
-        return L.divIcon({
-          html: "<div></div>", className: "tree-cluster-dot",
-          iconSize: L.point(24, 24), iconAnchor: L.point(12, 12),
-        });
-      },
-    });
+    // L.featureGroup, not a marker-cluster group — every tree marker
+    // added below stays its own always-visible dot; see this file's
+    // top-of-file comment for why clustering was tried and then removed.
+    // A plain L.layerGroup would do for add/remove, but this needs
+    // .getBounds() too (used by the boundsSources fitBounds call below).
+    currentTreeLayer = L.featureGroup();
     visibleTrees.forEach(function (e) {
       var isPlanning = state.planningBlockId === e.blockId;
       var isChecked = !!state.selectedTreeIds[e.treeId];
@@ -836,13 +821,13 @@ scripted.
         weight: isSelectedTree || isChecked ? e.indicatorWeight + 1 : e.indicatorWeight,
         fillOpacity: isPlanning && !isChecked ? 0.4 : 0.85,
       });
-      currentClusterGroup.addLayer(e.marker);
+      currentTreeLayer.addLayer(e.marker);
     });
-    currentClusterGroup.addTo(map);
+    currentTreeLayer.addTo(map);
 
     var boundsSources = currentBlockLayers.map(function (e) { return e.layer; })
       .concat(currentImageLayers.map(function (e) { return e.layer; }));
-    if (visibleTrees.length) boundsSources.push(currentClusterGroup);
+    if (visibleTrees.length) boundsSources.push(currentTreeLayer);
     if (boundsSources.length) {
       map.fitBounds(L.featureGroup(boundsSources).getBounds().pad(0.15));
     } else {
