@@ -12,6 +12,7 @@ journey per docs/10-user-journeys.md) not get in at all.
 """
 import pathlib
 import re
+import uuid
 import numpy as np
 import pytest
 import rasterio
@@ -1855,12 +1856,59 @@ def test_block_care_history_spans_every_tree_in_the_block(client, manager, farm_
     assert response.status_code == 200
     history = response.json()["history"]
     assert [h["date"] for h in history] == ["2026-01-15", "2026-01-10", "2026-01-05"]
-    # newest entry belongs to tree_b's harvest — confirms each row is
-    # correctly labelled with WHICH tree, the whole point of this endpoint
-    assert history[0]["tree_id"] == str(tree_b.id)
-    assert history[0]["tree_name"] == tree_b.name
+    # newest entry belongs to tree_b's harvest — each of these three
+    # records has a distinct default batch_id (none were created together
+    # as one bulk action), so each stays its own single-tree batch here
+    assert history[0]["tree_ids"] == [str(tree_b.id)]
+    assert history[0]["tree_count"] == 1
+    assert history[0]["total_quantity"] == 14
     assert history[0]["kind"] == "harvest"
     assert history[1]["kind"] == "fertilizer"
+
+
+def test_block_care_history_groups_rows_from_the_same_batch_into_one_entry(client, manager, farm_role_manager, block_a, tree_in_block_a, tree_b):
+    """The whole point of batch_id: marking/recording several trees in one
+    submission (MarkTreesHarvestedView etc. share one batch_id across the
+    loop) must collapse back into ONE history entry — "3 trees harvested,
+    X bunches total" — not three separate lines. Reported directly: "the
+    harvest marking history is not the each tree history but the marking
+    history itself.\""""
+    client.login(username="manager", password="manager12345")
+    batch_id = uuid.uuid4()
+    TreeCareRecord.objects.create(
+        tree=tree_in_block_a, kind=TreeCareRecord.KIND_HARVEST, date="2026-02-15", quantity=10, batch_id=batch_id,
+    )
+    TreeCareRecord.objects.create(
+        tree=tree_b, kind=TreeCareRecord.KIND_HARVEST, date="2026-02-15", quantity=15, batch_id=batch_id,
+    )
+
+    response = client.get(reverse("dashboard:block-care-history", kwargs={"block_id": block_a.id}))
+    assert response.status_code == 200
+    history = response.json()["history"]
+    assert len(history) == 1
+    assert history[0]["tree_count"] == 2
+    assert history[0]["total_quantity"] == 25
+    assert sorted(history[0]["tree_ids"]) == sorted([str(tree_in_block_a.id), str(tree_b.id)])
+
+
+def test_block_care_history_includes_needed_action_with_no_quantity(client, manager, farm_role_manager, block_a, tree_in_block_a):
+    """A stage-1 'needs harvest' assignment (no work done yet, no
+    quantity) must still show up in the block's marking history — reported
+    directly as missing before: "if I mark need to harvest ... it show the
+    marking history.\""""
+    client.login(username="manager", password="manager12345")
+    TreeCareRecord.objects.create(
+        tree=tree_in_block_a, kind=TreeCareRecord.KIND_HARVEST, action=TreeCareRecord.ACTION_NEEDED,
+        date="2026-02-15", quantity=None,
+    )
+
+    response = client.get(reverse("dashboard:block-care-history", kwargs={"block_id": block_a.id}))
+    assert response.status_code == 200
+    history = response.json()["history"]
+    assert len(history) == 1
+    assert history[0]["action"] == "needed"
+    assert history[0]["total_quantity"] is None
+    assert history[0]["tree_count"] == 1
 
 
 def test_block_care_history_excludes_other_blocks(client, manager, farm_role_manager, block_a, block_b, tree_in_block_a):
@@ -1876,7 +1924,7 @@ def test_block_care_history_excludes_other_blocks(client, manager, farm_role_man
     assert response.status_code == 200
     history = response.json()["history"]
     assert len(history) == 1
-    assert history[0]["quantity"] == 10
+    assert history[0]["total_quantity"] == 10
 
 
 def test_block_care_history_empty_when_no_records(client, manager, farm_role_manager, block_a):
@@ -1892,6 +1940,33 @@ def test_unrelated_manager_cannot_view_block_care_history_outside_their_scope(cl
     client.login(username="manager", password="manager12345")
     response = client.get(reverse("dashboard:block-care-history", kwargs={"block_id": other_block.id}))
     assert response.status_code == 404
+
+
+def test_mark_trees_need_harvest_creates_one_batch_of_needed_care_records(client, manager, farm_role_manager, block_a, tree_in_block_a, tree_b):
+    """MarkTreesNeedHarvestView (stage 1) previously left no trace at all
+    once resolved — only Tree.harvest_marked_at, which completion clears
+    right back. Now logs one TreeCareRecord per tree (action=needed, no
+    quantity) sharing a single batch_id, so BlockCareHistoryView can group
+    them into one "N trees marked needing harvest" entry."""
+    client.login(username="manager", password="manager12345")
+    response = client.post(
+        reverse("dashboard:trees-mark-need-harvest", kwargs={"block_id": block_a.id}),
+        {"tree_ids": [str(tree_in_block_a.id), str(tree_b.id)]},
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+
+    records = TreeCareRecord.objects.filter(kind=TreeCareRecord.KIND_HARVEST, action=TreeCareRecord.ACTION_NEEDED)
+    assert records.count() == 2
+    batch_ids = set(records.values_list("batch_id", flat=True))
+    assert len(batch_ids) == 1  # one shared batch for the whole submission
+    assert all(r.quantity is None for r in records)
+
+    history = client.get(reverse("dashboard:block-care-history", kwargs={"block_id": block_a.id})).json()["history"]
+    assert len(history) == 1
+    assert history[0]["action"] == "needed"
+    assert history[0]["tree_count"] == 2
 
 
 def test_mark_trees_ajax_scope_still_enforced_for_the_new_quantity_path(client, manager, farm_role_manager):

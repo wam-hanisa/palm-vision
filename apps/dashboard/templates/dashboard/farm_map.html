@@ -1912,7 +1912,17 @@ scripted.
       // renderTreeSelectionChecklist()'s own comment for why this isn't a
       // single shared value. Blank entries are simply omitted; the server
       // treats a missing quantity_<id> the same as an explicitly blank one.
+      //
+      // Falls back to the bulk-quantity box (state.bulkQuantityValue) for
+      // any tree that never got its own value — reported directly: typing
+      // a number into "Bulk quantity" and submitting straight away,
+      // without first clicking "Apply to all selected," silently dropped
+      // it entirely ("the quantity bunch not shown in anywhere"). The
+      // "Apply" button still exists as a way to pre-fill the visible
+      // per-tree boxes, but the submit itself no longer depends on having
+      // clicked it.
       var qty = state.selectedTreeQuantities[id];
+      if ((qty === undefined || qty === "") && state.bulkQuantityValue) qty = state.bulkQuantityValue;
       if (qty !== undefined && qty !== "") formData.append("quantity_" + id, qty);
     });
     if (dateValue) formData.append("date", dateValue);
@@ -2126,13 +2136,32 @@ scripted.
     renderBlockCareHistory(block.id, kind);
   }
 
-  // On-demand block-wide marking history — TreeCareRecord rows across
-  // every tree in the block, backing renderBlockSectionPanel() above. Same
-  // fetch-after-render shape as renderTreeCareHistory()/
-  // renderTreeHealthHistory() further down, and the same reasoning for not
-  // baking it into _build_farm_map_data() (see BlockCareHistoryView's own
-  // docstring in views.py). Both kinds come back from the one endpoint;
-  // filtered here to just the one this panel is showing.
+  // Highlights a set of trees on the map (the same bigger/bolder-ring style
+  // renderMap() already gives a checked tree during an active selection
+  // flow) without navigating the panel away from wherever it currently is.
+  // Used by renderBlockCareHistory() below — clicking a marking-history
+  // entry should show WHICH trees that action covered, not jump into one
+  // of them arbitrarily.
+  function highlightTreesOnMap(treeIds) {
+    state.selectedTreeIds = {};
+    treeIds.forEach(function (id) { state.selectedTreeIds[id] = true; });
+    renderMap();
+    showFlash(
+      "Highlighted " + treeIds.length + " tree" + (treeIds.length === 1 ? "" : "s") + " on the map.",
+      "info"
+    );
+  }
+
+  // On-demand block-wide marking history — one entry per bulk mark/record
+  // ACTION (BlockCareHistoryView groups TreeCareRecord rows by batch_id),
+  // not one row per tree. Same fetch-after-render shape as
+  // renderTreeCareHistory()/renderTreeHealthHistory() further down, and the
+  // same reasoning for not baking it into _build_farm_map_data() (see
+  // BlockCareHistoryView's own docstring in views.py). Both kinds come back
+  // from the one endpoint; filtered here to just the one this panel is
+  // showing. Clicking an entry highlights that action's trees on the map
+  // (highlightTreesOnMap() above) rather than opening one of them — with
+  // several trees behind one entry, there's no single "the" tree to jump to.
   function renderBlockCareHistory(blockId, kind) {
     var heading = (kind === "harvest" ? "Harvest" : "Fertilizer") + " marking history";
     var container = el("div", {}, [
@@ -2146,21 +2175,30 @@ scripted.
       container.appendChild(el("h2", { class: "panel-heading", text: heading, style: "margin-top:20px;" }));
       var entries = (json.history || []).filter(function (h) { return h.kind === kind; });
       if (!entries.length) {
-        container.appendChild(el("p", { class: "panel-empty", text: "No " + kind + " completions recorded yet for this block." }));
+        container.appendChild(el("p", { class: "panel-empty", text: "No " + kind + " marking actions recorded yet for this block." }));
         return;
       }
       var unit = kind === "harvest" ? "bunches" : "kg";
+      var verb = kind === "harvest" ? "harvested" : "fertilized";
       var list = el("ul", { class: "panel-list" });
       entries.forEach(function (entry) {
-        var qtyText = entry.quantity === null || entry.quantity === undefined
-          ? "no quantity recorded"
-          : entry.quantity + " " + unit;
-        var meta = qtyText + (entry.recorded_by_name ? " · " + entry.recorded_by_name : "");
+        var treeWord = entry.tree_count + " tree" + (entry.tree_count === 1 ? "" : "s");
+        var label, meta;
+        if (entry.action === "needed") {
+          label = treeWord + " marked needing " + kind;
+          meta = entry.recorded_by_name || "";
+        } else {
+          label = treeWord + " " + verb;
+          var qtyText = entry.total_quantity === null || entry.total_quantity === undefined
+            ? "no quantity recorded"
+            : entry.total_quantity + " " + unit + " total";
+          meta = qtyText + (entry.recorded_by_name ? " · " + entry.recorded_by_name : "");
+        }
         var btn = el("button", { type: "button", class: "panel-list-button" }, [
-          el("span", { text: new Date(entry.date + "T00:00:00").toLocaleDateString() + " — " + entry.tree_name }),
+          el("span", { text: new Date(entry.date + "T00:00:00").toLocaleDateString() + " — " + label }),
           el("span", { class: "panel-list-meta", text: meta }),
         ]);
-        btn.addEventListener("click", function () { selectTree(entry.tree_id); });
+        btn.addEventListener("click", function () { highlightTreesOnMap(entry.tree_ids); });
         list.appendChild(el("li", {}, [btn]));
       });
       container.appendChild(list);
@@ -2319,11 +2357,15 @@ scripted.
   }
 
   // On-demand harvest/fertilizer marking history — TreeCareRecord rows
-  // (apps/trees/models.py), one per completion from either surface (this
-  // dashboard's own mark-directly actions, or the PWA field app's
+  // (apps/trees/models.py), one per completion or stage-1 "needs"
+  // assignment this tree was ever part of, from either surface (this
+  // dashboard's own mark actions, or the PWA field app's
   // mark_harvested/mark_fertilized). Same on-demand-fetch shape as
   // renderTreeHealthHistory() below, and for the same reason — see
-  // TreeCareHistoryView's docstring in views.py.
+  // TreeCareHistoryView's docstring in views.py. Unlike
+  // renderBlockCareHistory() above, this stays one row per record — scoped
+  // to a single tree, every row already IS one complete "this happened"
+  // entry, nothing to group.
   function renderTreeCareHistory(treeId) {
     var container = el("div", {}, [
       el("h2", { class: "panel-heading", text: "Harvest & fertilizer history", style: "margin-top:20px;" }),
@@ -2335,18 +2377,25 @@ scripted.
       container.innerHTML = "";
       container.appendChild(el("h2", { class: "panel-heading", text: "Harvest & fertilizer history", style: "margin-top:20px;" }));
       if (!json.history || !json.history.length) {
-        container.appendChild(el("p", { class: "panel-empty", text: "No harvest or fertilizer completions recorded yet for this tree." }));
+        container.appendChild(el("p", { class: "panel-empty", text: "No harvest or fertilizer activity recorded yet for this tree." }));
         return;
       }
       var list = el("ul", { class: "panel-list" });
       json.history.forEach(function (entry) {
-        var unit = entry.kind === "harvest" ? "bunches" : "kg";
-        var qtyText = entry.quantity === null || entry.quantity === undefined
-          ? "no quantity recorded"
-          : entry.quantity + " " + unit;
-        var meta = qtyText + (entry.recorded_by_name ? " · " + entry.recorded_by_name : "");
+        var label, meta;
+        if (entry.action === "needed") {
+          label = entry.kind_display + " — marked as needed";
+          meta = entry.recorded_by_name || "";
+        } else {
+          var unit = entry.kind === "harvest" ? "bunches" : "kg";
+          var qtyText = entry.quantity === null || entry.quantity === undefined
+            ? "no quantity recorded"
+            : entry.quantity + " " + unit;
+          label = entry.kind_display;
+          meta = qtyText + (entry.recorded_by_name ? " · " + entry.recorded_by_name : "");
+        }
         list.appendChild(el("li", { class: "panel-list-button" }, [
-          el("span", { text: new Date(entry.date + "T00:00:00").toLocaleDateString() + " — " + entry.kind_display }),
+          el("span", { text: new Date(entry.date + "T00:00:00").toLocaleDateString() + " — " + label }),
           el("span", { class: "panel-list-meta", text: meta }),
         ]));
       });

@@ -24,6 +24,7 @@ into those existing per-block pages rather than adding any new bare
 "act on whatever's under the pin" shortcut.
 """
 import json as _json
+import uuid
 from collections import defaultdict
 
 from django.conf import settings
@@ -1172,10 +1173,18 @@ class TreeCareHistoryView(ManagerOrSuperAdminRequiredMixin, View):
     TreeCareRecord rows (apps/trees/models.py), one per "mark
     harvested"/"mark fertilized" completion from either surface (the PWA's
     mark_harvested/mark_fertilized API actions, or this dashboard's own
-    MarkTreesHarvestedView/MarkTreesFertilizedView). Mirrors
-    TreeHealthHistoryView immediately above — same on-demand-fetch shape,
-    same reasoning for not baking this into _build_farm_map_data() (a farm
-    block can hold over a thousand trees; see that view's own docstring).
+    MarkTreesHarvestedView/MarkTreesFertilizedView), plus (since `action`
+    was added) one per stage-1 "needs" assignment this tree was ever part
+    of. Mirrors TreeHealthHistoryView immediately above — same
+    on-demand-fetch shape, same reasoning for not baking this into
+    _build_farm_map_data() (a farm block can hold over a thousand trees;
+    see that view's own docstring).
+
+    Not grouped by batch_id like BlockCareHistoryView below — a single
+    bulk action can only ever include a given tree once (it's a checkbox
+    selection), so scoped to one tree every row is already its own
+    complete "this happened" entry; batching only matters once you're
+    looking across many trees at once.
 
     Both kinds are returned together, newest first, with `kind` on each
     entry so the panel can label/group them — a tree's harvest and
@@ -1196,6 +1205,8 @@ class TreeCareHistoryView(ManagerOrSuperAdminRequiredMixin, View):
                 "date": r.date.isoformat(),
                 "kind": r.kind,
                 "kind_display": r.get_kind_display(),
+                "action": r.action,
+                "action_display": r.get_action_display(),
                 "quantity": r.quantity,
                 "recorded_by_name": r.recorded_by.get_full_name() or r.recorded_by.username if r.recorded_by else None,
             }
@@ -1205,20 +1216,27 @@ class TreeCareHistoryView(ManagerOrSuperAdminRequiredMixin, View):
 
 
 class BlockCareHistoryView(ManagerOrSuperAdminRequiredMixin, View):
-    """Block-wide harvest/fertilizer marking history — the same
-    TreeCareRecord rows TreeCareHistoryView above returns for one tree, but
-    across every tree in the block, each entry labelled with which tree it
-    belongs to. Backs the Harvest/Fertilizer section panels
-    (farm_map.html's renderBlockSectionPanel()) — reported directly that
-    reviewing "which trees have been harvested/fertilized" for a block
-    meant opening every tree individually to piece it together, since the
-    only history view was tree-scoped.
+    """Block-wide harvest/fertilizer marking history — grouped by the
+    bulk mark/record ACTION (TreeCareRecord.batch_id), not one row per
+    tree per completion. Backs the Harvest/Fertilizer section panels
+    (farm_map.html's renderBlockSectionPanel()).
 
-    Both kinds are returned together (like TreeCareHistoryView), and the
-    client filters to the one the open panel cares about — a block's
-    harvest and fertilizer records both fit comfortably under the [:50]
-    cap below, so a second near-identical endpoint wasn't worth it just to
-    split them server-side.
+    Originally returned one flat row per TreeCareRecord, each labelled
+    with its own tree — reported directly as wrong: "the harvest marking
+    history is not the each tree history but the marking history itself,"
+    e.g. marking 3 trees as needing harvest on one date should show as ONE
+    history entry (how many trees, and for a completion, the total
+    quantity), not 3 separate lines — and clicking that entry should
+    highlight just those trees on the map, not jump into one of them.
+    Every row from the same bulk submission already shares one batch_id
+    (see TreeCareRecord's own docstring), so grouping by it here is enough
+    to reconstruct "one action" without a separate batch table.
+
+    Pulls a wider raw slice than the old flat cap (400 records, not 50) —
+    several trees now collapse into a single history entry, so the same
+    record budget needs to cover more ground before being capped down to
+    50 *batches*. Both kinds are still returned together and the client
+    filters to the one the open panel cares about, same as before.
     """
 
     def get(self, request, block_id):
@@ -1227,20 +1245,37 @@ class BlockCareHistoryView(ManagerOrSuperAdminRequiredMixin, View):
         records = (
             TreeCareRecord.objects.filter(tree__farm_block_id=block.id)
             .select_related("recorded_by", "tree")
-            .order_by("-date", "-recorded_at")[:50]
+            .order_by("-date", "-recorded_at")[:400]
         )
-        history = [
-            {
-                "date": r.date.isoformat(),
-                "kind": r.kind,
-                "kind_display": r.get_kind_display(),
-                "quantity": r.quantity,
-                "tree_id": str(r.tree_id),
-                "tree_name": r.tree.name or str(r.tree_id)[:8],
-                "recorded_by_name": r.recorded_by.get_full_name() or r.recorded_by.username if r.recorded_by else None,
-            }
-            for r in records
-        ]
+        batches = {}
+        batch_order = []
+        for r in records:
+            batch = batches.get(r.batch_id)
+            if batch is None:
+                batch = {
+                    "batch_id": str(r.batch_id),
+                    "date": r.date.isoformat(),
+                    "kind": r.kind,
+                    "kind_display": r.get_kind_display(),
+                    "action": r.action,
+                    "action_display": r.get_action_display(),
+                    "recorded_by_name": r.recorded_by.get_full_name() or r.recorded_by.username if r.recorded_by else None,
+                    "tree_ids": [],
+                    "quantities": [],
+                }
+                batches[r.batch_id] = batch
+                batch_order.append(r.batch_id)
+            batch["tree_ids"].append(str(r.tree_id))
+            if r.quantity is not None:
+                batch["quantities"].append(r.quantity)
+
+        history = []
+        for batch_id in batch_order[:50]:
+            batch = batches[batch_id]
+            quantities = batch.pop("quantities")
+            batch["tree_count"] = len(batch["tree_ids"])
+            batch["total_quantity"] = sum(quantities) if quantities else None
+            history.append(batch)
         return JsonResponse({"history": history})
 
 
@@ -1410,11 +1445,21 @@ class _MarkTreesNeedView(_MarkTreesActionMixin, ManagerOrSuperAdminRequiredMixin
     done) is deliberately NOT here — it's apps.trees.views.TreeViewSet's
     mark_harvested/mark_fertilized API actions, reached from the PWA, per
     this app's existing Manager-dashboard/PIC-Block-PWA split.
+
+    Also logs one TreeCareRecord per tree (action=ACTION_NEEDED, no
+    quantity — nothing's actually happened yet) sharing a single batch_id
+    for the whole request. Reported directly: this assignment previously
+    left no trace once the "needs" pending list moved on (the tree gets
+    completed, or reassigned later) — only Tree.harvest_marked_at existed,
+    which this action itself immediately clears again on completion. The
+    block-wide history (BlockCareHistoryView) is what actually surfaces
+    these, grouped by batch_id into one "N trees marked needing X" entry.
     """
 
     marked_at_field = None  # "harvest_marked_at" or "fertilizer_marked_at" — set by subclass
     marked_by_field = None  # "harvest_marked_by" or "fertilizer_marked_by" — set by subclass
     verb = None  # "harvest" or "fertilizer" — set by subclass
+    kind = None  # TreeCareRecord.KIND_HARVEST or KIND_FERTILIZER — set by subclass
 
     def post(self, request, *args, **kwargs):
         block = self._get_block()
@@ -1423,12 +1468,18 @@ class _MarkTreesNeedView(_MarkTreesActionMixin, ManagerOrSuperAdminRequiredMixin
             return self._no_selection_response(request, block)
 
         now = timezone.now()
+        marked_date = timezone.localdate()
+        batch_id = uuid.uuid4()
         count = 0
         for tree in trees:
             setattr(tree, self.marked_at_field, now)
             setattr(tree, self.marked_by_field, request.user)
             tree.updated_by = request.user
             tree.save(update_fields=[self.marked_at_field, self.marked_by_field, "updated_by", "updated_at"])
+            TreeCareRecord.objects.create(
+                tree=tree, kind=self.kind, action=TreeCareRecord.ACTION_NEEDED,
+                date=marked_date, quantity=None, recorded_by=request.user, batch_id=batch_id,
+            )
             count += 1
 
         message = f"Marked {count} tree{'s' if count != 1 else ''} as needing {self.verb} — the assigned PIC Block user will see this in the field app."
@@ -1439,12 +1490,14 @@ class MarkTreesNeedHarvestView(_MarkTreesNeedView):
     marked_at_field = "harvest_marked_at"
     marked_by_field = "harvest_marked_by"
     verb = "harvest"
+    kind = TreeCareRecord.KIND_HARVEST
 
 
 class MarkTreesNeedFertilizeView(_MarkTreesNeedView):
     marked_at_field = "fertilizer_marked_at"
     marked_by_field = "fertilizer_marked_by"
     verb = "fertilizer"
+    kind = TreeCareRecord.KIND_FERTILIZER
 
 
 class _MarkTreesView(_MarkTreesActionMixin, ManagerOrSuperAdminRequiredMixin, View):
@@ -1499,6 +1552,7 @@ class _MarkTreesView(_MarkTreesActionMixin, ManagerOrSuperAdminRequiredMixin, Vi
             return self._no_selection_response(request, block)
 
         marked_date = parse_date(request.POST.get("date") or "") or timezone.localdate()
+        batch_id = uuid.uuid4()
         count = 0
         for tree in trees:
             quantity = self._quantity_for(request, tree.id)
@@ -1512,7 +1566,8 @@ class _MarkTreesView(_MarkTreesActionMixin, ManagerOrSuperAdminRequiredMixin, Vi
                 "updated_by", "updated_at",
             ])
             TreeCareRecord.objects.create(
-                tree=tree, kind=self.kind, date=marked_date, quantity=quantity, recorded_by=request.user,
+                tree=tree, kind=self.kind, action=TreeCareRecord.ACTION_COMPLETED,
+                date=marked_date, quantity=quantity, recorded_by=request.user, batch_id=batch_id,
             )
             count += 1
 

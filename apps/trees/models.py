@@ -226,8 +226,12 @@ class TreeCareRecord(models.Model):
     against a tree — one row per "mark harvested"/"mark fertilized" action
     (apps/trees/views.py TreeViewSet._mark_done, reached from the PWA, and
     apps/dashboard/views.py's MarkTreesHarvestedView/MarkTreesFertilizedView,
-    the office equivalent), alongside stamping Tree.last_harvested_at/
-    last_fertilized_at (and last_harvest_quantity/last_fertilizer_quantity)
+    the office equivalent) — and, since `action`/`batch_id` were added, also
+    one row per tree included in a stage-1 "mark needing harvest/fertilizer"
+    action (apps/dashboard/views.py's MarkTreesNeedHarvestView/
+    MarkTreesNeedFertilizeView). Both kinds of row alongside stamping
+    Tree.last_harvested_at/last_fertilized_at (and last_harvest_quantity/
+    last_fertilizer_quantity) or harvest_marked_at/harvest_marked_by
     themselves.
 
     Before this model existed, every mark simply overwrote the previous
@@ -235,6 +239,19 @@ class TreeCareRecord(models.Model):
     captured no quantity at all — reported directly as a UI/UX gap:
     "current harvest and fertilize only marking the trees giving date
     without telling how many quantities and there are no history too."
+
+    `action`/`batch_id` were added after a follow-up report: the dashboard's
+    block-wide history (BlockCareHistoryView) originally showed one row per
+    tree per completion — "not the each tree history but the marking
+    history itself" — and stage-1 "needs" assignments left no trace at all
+    once resolved. `batch_id` is shared by every row created from the same
+    bulk mark/record submission (generated once per request, not per row —
+    see MarkTreesHarvestedView/MarkTreesNeedHarvestView etc.), so the
+    dashboard can group rows back into one history entry per action
+    ("3 trees marked needing harvest" / "3 trees harvested, 42.5 bunches
+    total") instead of one line per tree. The PWA's single-tree
+    mark_harvested/mark_fertilized just gets the field's own uuid4 default
+    — a "batch" of one is exactly what it is.
 
     Deliberately NOT apps.operations.models.Harvest/ActualHarvest/
     HarvestTree — that pipeline is the compliance/yield-reporting system,
@@ -254,9 +271,22 @@ class TreeCareRecord(models.Model):
         (KIND_FERTILIZER, "Fertilizer"),
     ]
 
+    ACTION_NEEDED = "needed"
+    ACTION_COMPLETED = "completed"
+    ACTION_CHOICES = [
+        (ACTION_NEEDED, "Marked as needed"),
+        (ACTION_COMPLETED, "Completed"),
+    ]
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     tree = models.ForeignKey(Tree, on_delete=models.CASCADE, related_name="care_records")
     kind = models.CharField(max_length=16, choices=KIND_CHOICES)
+    action = models.CharField(
+        max_length=16,
+        choices=ACTION_CHOICES,
+        default=ACTION_COMPLETED,
+        help_text="Whether this row logs a stage-1 'needs harvest/fertilizer' assignment or the completion itself. Quantity only ever applies to a completion.",
+    )
     date = models.DateField(help_text="The date the work was done, not necessarily today (a backdated mark is allowed, same as last_harvested_at).")
     quantity = models.FloatField(
         null=True,
@@ -265,10 +295,16 @@ class TreeCareRecord(models.Model):
     )
     recorded_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL)
     recorded_at = models.DateTimeField(auto_now_add=True)
+    batch_id = models.UUIDField(
+        default=uuid.uuid4,
+        editable=False,
+        db_index=True,
+        help_text="Shared by every row created from the same bulk mark/record submission, so the dashboard can group them back into one history entry per action instead of one row per tree.",
+    )
 
     class Meta:
         ordering = ["-date", "-recorded_at"]
-        indexes = [models.Index(fields=["tree", "kind"])]
+        indexes = [models.Index(fields=["tree", "kind"]), models.Index(fields=["batch_id"])]
 
     def __str__(self):
         return f"{self.get_kind_display()} — {self.tree} — {self.date}"

@@ -94,7 +94,8 @@ class TreeViewSet(IdempotentUUIDCreateMixin, viewsets.ModelViewSet):
             date_field, quantity_field, marked_at_field, marked_by_field, "updated_by", "updated_at",
         ])
         TreeCareRecord.objects.create(
-            tree=tree, kind=kind, date=marked_date, quantity=quantity, recorded_by=request.user,
+            tree=tree, kind=kind, action=TreeCareRecord.ACTION_COMPLETED,
+            date=marked_date, quantity=quantity, recorded_by=request.user,
         )
         return Response(TreeSerializer(tree).data)
 
