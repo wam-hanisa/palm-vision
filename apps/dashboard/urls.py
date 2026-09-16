@@ -56,6 +56,11 @@ urlpatterns = [
         views.TreeHealthHistoryView.as_view(),
         name="tree-health-history",
     ),
+    path(
+        "trees/<uuid:tree_id>/care-history/",
+        views.TreeCareHistoryView.as_view(),
+        name="tree-care-history",
+    ),
     path("notifications/", views.NotificationListView.as_view(), name="notifications"),
     path("imagery/", views.ImageListUploadView.as_view(), name="imagery"),
     path(

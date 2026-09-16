@@ -13,6 +13,16 @@ const state = {
   location: null,
   watchId: null,
   error: null,
+  // Survives the re-render showError() triggers. Without it the login screen
+  // came back with both fields blank after a bad password, forcing a gloved
+  // user to retype their username every attempt.
+  loginUsername: "",
+  // Which mark-done banner ("harvest" | "fertilizer" | null) is currently
+  // expanded into its inline quantity form on the tree detail screen — see
+  // markBanner()'s docstring. Reset whenever a different tree is opened
+  // (setScreen("treeDetail", ...) below already blows away selectedTreeId,
+  // so tying this reset to the same call keeps it simple).
+  quickMarkOpenKind: null,
 };
 
 const root = () => document.getElementById("app");
@@ -41,19 +51,47 @@ function escapeAttr(value) {
   return String(value).replace(/&/g, "&amp;").replace(/"/g, "&quot;");
 }
 
+/** A record created offline has no server-assigned fields yet, `status`
+ * among them. Treat "no status" as active rather than filtering it out.
+ */
+function isActiveRecord(record) {
+  return record.status === undefined || record.status === "active";
+}
+
+/** Trees render in the order someone walking the block expects, not
+ * IndexedDB insertion order (which put A2, A4, A1, A3 on screen). Numeric
+ * -aware so "Tree 10" sorts after "Tree 9".
+ */
+const TREE_COLLATOR = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+
+function sortTrees(trees) {
+  return [...trees].sort((a, b) => TREE_COLLATOR.compare(a.name || "", b.name || ""));
+}
+
 // --- Sync status chip ------------------------------------------------
 
+/** Emits the chip INCLUDING its id, because updateSyncChip() swaps this in
+ * via outerHTML. The previous version returned an id-less div wrapped by a
+ * separate <div id="sync-chip">, so the very first update replaced the
+ * element carrying the id and every later getElementById returned null —
+ * the chip then silently stopped updating for the rest of the session.
+ * Reproduced in a browser: forcing syncing→idle left it reading "Syncing…".
+ *
+ * Offline also takes precedence over "syncing" in the label: a sync cannot
+ * be in progress with no connection, and this is the one component that
+ * must never misreport that.
+ */
 function renderSyncChip(status, outboxCount) {
-  const label =
-    status === "syncing"
-      ? "Syncing…"
-      : !navigator.onLine
-      ? `Offline${outboxCount ? ` — ${outboxCount} queued` : ""}`
-      : outboxCount
-      ? `Online — ${outboxCount} queued`
-      : "Online — synced";
-  const cls = !navigator.onLine ? "offline" : status === "syncing" ? "syncing" : "online";
-  return `<div class="sync-chip sync-chip--${cls}">${label}</div>`;
+  const offline = !navigator.onLine;
+  const label = offline
+    ? `Offline${outboxCount ? ` — ${outboxCount} queued` : " — no connection"}`
+    : status === "syncing"
+    ? "Syncing…"
+    : outboxCount
+    ? `Online — ${outboxCount} queued`
+    : "Online — synced";
+  const cls = offline ? "offline" : status === "syncing" ? "syncing" : "online";
+  return `<div id="sync-chip" class="sync-chip sync-chip--${cls}" role="status" aria-live="polite">${label}</div>`;
 }
 
 /** A more prominent, opt-in-only banner — the always-visible sync-chip
@@ -124,11 +162,11 @@ function loginScreen() {
       <h1>Palm Vision</h1>
       <p class="muted">Field access — works offline once logged in.</p>
       <form id="login-form">
-        <label>Username<input name="username" autocomplete="username" required></label>
+        <label>Username<input name="username" autocomplete="username" required value="${escapeAttr(state.loginUsername)}"></label>
         <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
         <button type="submit">Log in</button>
       </form>
-      ${state.error ? `<p class="error">${state.error}</p>` : ""}
+      ${state.error ? `<p class="error" role="alert">${state.error}</p>` : ""}
     </div>
   `;
 }
@@ -159,7 +197,14 @@ async function blocksScreen() {
           <button id="logout-btn" class="btn-text">Log out</button>
         </div>
       </header>
-      ${blocks.length === 0 ? '<p class="muted">No blocks pre-cached yet. Pull to sync while online.</p>' : `<ul class="block-list">${items}</ul>`}
+      ${
+        blocks.length === 0
+          ? `<div class="empty-state">
+               <span class="empty-state__title">No blocks downloaded yet</span>
+               <p class="empty-state__hint">Connect to the network and this list fills in automatically. You can keep working offline once it has.</p>
+             </div>`
+          : `<ul class="block-list">${items}</ul>`
+      }
     </div>
   `;
 }
@@ -265,7 +310,7 @@ async function mapScreen() {
   return `
     <div class="screen screen--map">
       <header class="screen-header">
-        <button id="back-btn" class="btn-text">&larr; Blocks</button>
+        <button id="back-btn" class="btn-text btn-text--back">&larr; Blocks</button>
         <h1>Farm map</h1>
       </header>
       ${
@@ -275,7 +320,13 @@ async function mapScreen() {
           ? `<p class="muted">You're not currently inside a mapped block boundary.</p>`
           : `<p class="muted">Waiting for GPS…</p>`
       }
-      ${svgContent || '<p class="muted">No blocks pre-cached yet — nothing to draw. Pull to sync while online.</p>'}
+      ${
+        svgContent ||
+        `<div class="empty-state">
+           <span class="empty-state__title">Nothing to draw yet</span>
+           <p class="empty-state__hint">Block boundaries haven't been downloaded to this device. Connect to the network to load the map.</p>
+         </div>`
+      }
       <p class="muted map-legend-note">Boundaries only — no satellite/street imagery is available offline. Tap a block to open it.</p>
     </div>
   `;
@@ -286,7 +337,13 @@ async function blockScreen() {
   if (!block) return `<p class="error">Block not found in local cache.</p>`;
 
   const allTrees = await window.PalmVisionDB.getAll("trees");
-  const trees = allTrees.filter((t) => t.farm_block === block.id && t.status === "active");
+  // isActiveRecord(), not `status === "active"`: a tree created offline is
+  // stored from the request payload, which carries no server-assigned
+  // `status`, so the strict comparison hid the record the field worker had
+  // just added while it sat in the outbox. Confirmed in a browser — the
+  // list read "Trees (4)" with the new tree missing. They would then add it
+  // again, duplicating it on sync.
+  const trees = sortTrees(allTrees.filter((t) => t.farm_block === block.id && isActiveRecord(t)));
 
   const proximity = state.location ? window.PalmVisionGeo.proximityCandidate(state.location.lat, state.location.lon, trees) : null;
 
@@ -327,7 +384,7 @@ async function blockScreen() {
   return `
     <div class="screen screen--block">
       <header class="screen-header">
-        <button id="back-btn" class="btn-text">&larr; Blocks</button>
+        <button id="back-btn" class="btn-text btn-text--back">&larr; Blocks</button>
         <h1>${block.name}</h1>
       </header>
 
@@ -336,8 +393,8 @@ async function blockScreen() {
       ${
         proximity
           ? `<div class="proximity-prompt" data-tree-id="${proximity.tree.id}">
-               Near <strong>${proximity.tree.name || "a tree"}</strong> (${Math.round(proximity.distanceM)}m) — log yield?
-               <button id="proximity-confirm-btn">Log here</button>
+               <p class="proximity-prompt__text">You are ${Math.round(proximity.distanceM)}m from <strong>${proximity.tree.name || "a tree"}</strong>. Log a harvest against it?</p>
+               <button id="proximity-confirm-btn">Log harvest here</button>
              </div>`
           : ""
       }
@@ -349,7 +406,14 @@ async function blockScreen() {
       </div>
 
       <h2>Trees (${trees.length})</h2>
-      <ul class="tree-list">${treeItems || '<li class="muted">No trees cached for this block yet.</li>'}</ul>
+      ${
+        treeItems
+          ? `<ul class="tree-list">${treeItems}</ul>`
+          : `<div class="empty-state">
+               <span class="empty-state__title">No trees in this block yet</span>
+               <p class="empty-state__hint">Use “+ Add tree” above to record the first one. It saves on this device straight away, even with no signal.</p>
+             </div>`
+      }
     </div>
   `;
 }
@@ -358,7 +422,7 @@ function treeFormScreen() {
   return `
     <div class="screen screen--form">
       <header class="screen-header">
-        <button id="back-btn" class="btn-text">&larr; Block</button>
+        <button id="back-btn" class="btn-text btn-text--back">&larr; Block</button>
         <h1>Add tree</h1>
       </header>
       <form id="tree-form">
@@ -368,7 +432,7 @@ function treeFormScreen() {
         }</p>
         <button type="submit" ${state.location ? "" : "disabled"}>Save tree</button>
       </form>
-      ${state.error ? `<p class="error">${state.error}</p>` : ""}
+      ${state.error ? `<p class="error" role="alert">${state.error}</p>` : ""}
     </div>
   `;
 }
@@ -398,22 +462,59 @@ function formatDateOrNever(isoString) {
   return isoString ? new Date(isoString).toLocaleDateString() : "never";
 }
 
-/** Stage-1 "needs harvest/fertilizer" banner + completion button — `kind`
+/** "Last harvested: DATE" line, extended with a quantity when one was
+ * recorded (Tree.last_harvest_quantity/last_fertilizer_quantity — see that
+ * field's help_text) — previously this line only ever showed a date, with
+ * no way to tell how much was actually done. Quantity is optional at
+ * capture time, so a tree with a date but no quantity on record is
+ * expected and shown plainly, not as an error.
+ */
+function formatLastDone(isoDate, quantity, unit) {
+  if (!isoDate) return "never";
+  const when = new Date(isoDate).toLocaleDateString();
+  return quantity === null || quantity === undefined ? when : `${when} (${quantity} ${unit})`;
+}
+
+/** Stage-1 "needs harvest/fertilizer" banner + completion control — `kind`
  * is 'harvest' or 'fertilizer'. Only rendered when the corresponding
  * *_marked_at field is set (see Tree.harvest_marked_at's help_text,
  * apps/trees/models.py, for the two-stage workflow this is stage 2 of).
- * The button posts to TreeViewSet's mark_harvested/mark_fertilized action
- * — wired in wireScreenEvents() below, alongside the tree-edit-form, since
- * both are online-only record edits (see that handler's own comment).
+ *
+ * Two states, toggled by state.quickMarkOpenKind: a plain "Mark
+ * harvested"/"Mark fertilized" button, or — once tapped — an inline
+ * optional-quantity form in its place. It used to be a single button that
+ * posted immediately with no way to record how much was actually done;
+ * this is the field-app side of the same gap the office dashboard's
+ * "Record harvest/fertilizer directly" flow had. Wired in
+ * wireScreenEvents() below, alongside the tree-edit-form, since both are
+ * online-only record edits (see that handler's own comment).
  */
 function markBanner(tree, kind) {
   const markedAt = kind === "harvest" ? tree.harvest_marked_at : tree.fertilizer_marked_at;
   if (!markedAt) return "";
   const label = kind === "harvest" ? "harvest" : "fertilizer";
+  const doneVerb = label === "harvest" ? "harvested" : "fertilized";
+  const unit = kind === "harvest" ? "bunches" : "kg";
+  const assignedLine = `<span class="pill pill--accent">Needs ${label} — assigned ${formatDateOrNever(markedAt)}</span>`;
+
+  if (state.quickMarkOpenKind !== kind) {
+    return `
+      <div class="mark-banner">
+        ${assignedLine}
+        <button id="mark-${kind}-btn" data-tree-id="${tree.id}" ${navigator.onLine ? "" : "disabled"}>Mark ${doneVerb}</button>
+      </div>`;
+  }
+
   return `
-    <div class="mark-banner">
-      <span class="pill pill--accent">Needs ${label} — assigned ${formatDateOrNever(markedAt)}</span>
-      <button id="mark-${kind}-btn" data-tree-id="${tree.id}" ${navigator.onLine ? "" : "disabled"}>Mark ${label === "harvest" ? "harvested" : "fertilized"}</button>
+    <div class="mark-banner mark-banner--open">
+      ${assignedLine}
+      <form id="mark-${kind}-form" data-tree-id="${tree.id}" data-kind="${kind}">
+        <label>Quantity (${unit}, optional)<input name="quantity" type="number" step="0.01" min="0" inputmode="decimal"></label>
+        <div class="action-row">
+          <button type="submit" ${navigator.onLine ? "" : "disabled"}>Save</button>
+          <button type="button" id="mark-${kind}-cancel-btn" class="btn-text">Cancel</button>
+        </div>
+      </form>
     </div>`;
 }
 
@@ -431,14 +532,14 @@ async function treeDetailScreen() {
   return `
     <div class="screen screen--tree-detail">
       <header class="screen-header">
-        <button id="back-btn" class="btn-text">&larr; Block</button>
+        <button id="back-btn" class="btn-text btn-text--back">&larr; Block</button>
         <h1>${tree.name || "Unnamed tree"}</h1>
       </header>
 
       <p class="pill ${tree.status === "removed" ? "pill--warning" : "pill--accent"}">${tree.status === "removed" ? "Removed" : "Active"}</p>
       <p class="muted">Health: ${healthLabels[tree.current_health] || tree.current_health} &middot; Source: ${tree.source === "drone_detected" ? "Drone detected" : "Manual"}</p>
       <p class="muted">Pin: ${lat.toFixed(6)}, ${lon.toFixed(6)}</p>
-      <p class="muted">Last harvested: ${formatDateOrNever(tree.last_harvested_at)} &middot; Last fertilized: ${formatDateOrNever(tree.last_fertilized_at)}</p>
+      <p class="muted">Last harvested: ${formatLastDone(tree.last_harvested_at, tree.last_harvest_quantity, "bunches")} &middot; Last fertilized: ${formatLastDone(tree.last_fertilized_at, tree.last_fertilizer_quantity, "kg")}</p>
 
       ${offlineNotice}
       ${markBanner(tree, "harvest")}
@@ -466,7 +567,7 @@ async function treeDetailScreen() {
         </label>
         <button type="submit">Save changes</button>
       </form>
-      ${state.error ? `<p class="error">${state.error}</p>` : ""}
+      ${state.error ? `<p class="error" role="alert">${state.error}</p>` : ""}
     </div>
   `;
 }
@@ -482,7 +583,7 @@ function actualFormScreen(kind) {
   return `
     <div class="screen screen--form">
       <header class="screen-header">
-        <button id="back-btn" class="btn-text">&larr; Block</button>
+        <button id="back-btn" class="btn-text btn-text--back">&larr; Block</button>
         <h1>Log ${label.toLowerCase()}${treeMode ? " (tree)" : " (block total)"}</h1>
       </header>
       <form id="actual-form" data-kind="${kind}">
@@ -491,7 +592,7 @@ function actualFormScreen(kind) {
         ${kind === "harvest" ? '<label>Weight (kg, optional)<input name="weight_kg" type="number" step="0.01" inputmode="decimal"></label>' : ""}
         <button type="submit">Save</button>
       </form>
-      ${state.error ? `<p class="error">${state.error}</p>` : ""}
+      ${state.error ? `<p class="error" role="alert">${state.error}</p>` : ""}
     </div>
   `;
 }
@@ -530,7 +631,7 @@ async function render() {
     default:
       body = `<p>Unknown screen</p>`;
   }
-  const chip = state.screen === "login" ? "" : `<div id="sync-chip">${renderSyncChip(window._lastSyncStatus || "idle", outbox.length)}</div>`;
+  const chip = state.screen === "login" ? "" : renderSyncChip(window._lastSyncStatus || "idle", outbox.length);
   const banner = state.screen === "login" ? "" : renderUnsyncedBanner(outbox.length);
   el.innerHTML = chip + banner + body;
   wireScreenEvents();
@@ -539,35 +640,64 @@ async function render() {
 
 // --- Event wiring ---------------------------------------------------------
 
-/** Binds a mark-harvest-btn/mark-fertilizer-btn click handler, if present
- * on the currently rendered screen — see markBanner()'s docstring and the
- * two calls to this in wireScreenEvents() below. `apiAction` is
- * "mark_harvested" or "mark_fertilized", matching TreeViewSet's own action
- * names (apps/trees/views.py) exactly, so the POST path is built the same
- * way DRF's router would generate it.
+/** Binds the mark-harvest-btn/mark-fertilizer-btn CLICK (present when
+ * markBanner() is in its collapsed state) to expand the inline quantity
+ * form in its place — see markBanner()'s docstring. `kind` is "harvest" or
+ * "fertilizer"; wireMarkDoneForm() below handles what happens once that
+ * form is actually submitted.
  */
-function wireMarkDoneButton(btnId, apiAction) {
-  const btn = document.getElementById(btnId);
+function wireMarkExpandButton(kind) {
+  const btn = document.getElementById(`mark-${kind}-btn`);
   if (!btn) return;
-  btn.addEventListener("click", async () => {
-    const treeId = btn.dataset.treeId;
-    btn.disabled = true;
-    const originalLabel = btn.textContent;
-    btn.textContent = "Saving…";
-    try {
-      const updated = await window.PalmVisionAPI.onlineOnlyWrite(`/api/trees/${treeId}/${apiAction}/`, "POST", {});
-      await window.PalmVisionDB.putOne("trees", updated);
-      await render(); // stays on this same tree-detail screen, now reflecting the cleared marked_at
-    } catch (err) {
-      btn.disabled = false;
-      btn.textContent = originalLabel;
-      if (err.isNetworkError) {
-        showError("You're offline — this needs a live connection. Nothing was saved; try again once you're back online.");
-      } else {
-        showError(err);
-      }
-    }
+  btn.addEventListener("click", () => {
+    state.quickMarkOpenKind = kind;
+    render();
   });
+}
+
+/** Binds the mark-harvest-form/mark-fertilizer-form SUBMIT (present once
+ * markBanner() is expanded) plus its Cancel button — see markBanner()'s
+ * docstring and the two calls to this in wireScreenEvents() below.
+ * `apiAction` is "mark_harvested" or "mark_fertilized", matching
+ * TreeViewSet's own action names (apps/trees/views.py) exactly, so the
+ * POST path is built the same way DRF's router would generate it.
+ */
+function wireMarkDoneForm(kind, apiAction) {
+  const form = document.getElementById(`mark-${kind}-form`);
+  if (form) {
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const treeId = form.dataset.treeId;
+      const submitBtn = form.querySelector("button[type=submit]");
+      const originalLabel = submitBtn.textContent;
+      submitBtn.disabled = true;
+      submitBtn.textContent = "Saving…";
+      const quantityRaw = new FormData(form).get("quantity");
+      const body = quantityRaw ? { quantity: quantityRaw } : {};
+      try {
+        const updated = await window.PalmVisionAPI.onlineOnlyWrite(`/api/trees/${treeId}/${apiAction}/`, "POST", body);
+        await window.PalmVisionDB.putOne("trees", updated);
+        state.quickMarkOpenKind = null;
+        await render(); // stays on this same tree-detail screen, now reflecting the cleared marked_at
+      } catch (err) {
+        submitBtn.disabled = false;
+        submitBtn.textContent = originalLabel;
+        if (err.isNetworkError) {
+          showError("You're offline — this needs a live connection. Nothing was saved; try again once you're back online.");
+        } else {
+          showError(err);
+        }
+      }
+    });
+  }
+
+  const cancelBtn = document.getElementById(`mark-${kind}-cancel-btn`);
+  if (cancelBtn) {
+    cancelBtn.addEventListener("click", () => {
+      state.quickMarkOpenKind = null;
+      render();
+    });
+  }
 }
 
 function wireScreenEvents() {
@@ -576,6 +706,7 @@ function wireScreenEvents() {
     loginForm.addEventListener("submit", async (e) => {
       e.preventDefault();
       const fd = new FormData(loginForm);
+      state.loginUsername = fd.get("username") || "";
       try {
         await window.PalmVisionAPI.login(fd.get("username"), fd.get("password"));
         await window.PalmVisionSync.runSync();
@@ -630,7 +761,7 @@ function wireScreenEvents() {
   // function's docstring for why this was previously a dead click (no
   // handler existed at all).
   document.querySelectorAll(".tree-item").forEach((li) => {
-    li.addEventListener("click", () => setScreen("treeDetail", { selectedTreeId: li.dataset.treeId }));
+    li.addEventListener("click", () => setScreen("treeDetail", { selectedTreeId: li.dataset.treeId, quickMarkOpenKind: null }));
   });
 
   const logHarvestTreeBtn = document.getElementById("log-harvest-tree-btn");
@@ -654,8 +785,10 @@ function wireScreenEvents() {
   // record, so it follows docs/05-offline-sync.md § Conflict handling's
   // "editing an existing record is online-only" rule rather than being
   // queued like a fresh yield-log entry would be.
-  wireMarkDoneButton("mark-harvest-btn", "mark_harvested");
-  wireMarkDoneButton("mark-fertilizer-btn", "mark_fertilized");
+  wireMarkExpandButton("harvest");
+  wireMarkExpandButton("fertilizer");
+  wireMarkDoneForm("harvest", "mark_harvested");
+  wireMarkDoneForm("fertilizer", "mark_fertilized");
 
   const treeForm = document.getElementById("tree-form");
   if (treeForm) {
@@ -673,7 +806,15 @@ function wireScreenEvents() {
         const result = await window.PalmVisionAPI.queueableWrite("trees", "/api/trees/", "POST", payload);
         // Optimistic local write regardless of queued/sent — the field
         // worker needs to see it immediately either way.
-        await window.PalmVisionDB.putOne("trees", result.response || payload);
+        //
+        // When the write was queued rather than accepted, `result.response`
+        // is undefined and the request payload is stored instead. That
+        // payload has no server-assigned fields, so supply the ones the
+        // block list actually reads: without `current_health` the meta line
+        // renders "undefined". The record is identified as still-queued by
+        // the *absence* of `status` — see isActiveRecord().
+        const stored = result.response || { ...payload, current_health: "unknown" };
+        await window.PalmVisionDB.putOne("trees", stored);
         setScreen("block", { selectedBlockId: state.selectedBlockId });
       } catch (err) {
         showError(err);

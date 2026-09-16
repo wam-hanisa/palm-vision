@@ -9,7 +9,7 @@ from apps.common.mixins import IdempotentUUIDCreateMixin
 from apps.common.permissions import IsAssignedPicBlockOrManagerOrSuperAdmin
 from apps.common.scoping import scoped_to_user_blocks
 
-from .models import Tree
+from .models import Tree, TreeCareRecord
 from .serializers import TreeSerializer
 
 
@@ -57,7 +57,7 @@ class TreeViewSet(IdempotentUUIDCreateMixin, viewsets.ModelViewSet):
         instance.updated_by = self.request.user
         instance.save(update_fields=["status", "updated_by", "updated_at"])
 
-    def _mark_done(self, request, date_field, marked_at_field, marked_by_field):
+    def _mark_done(self, request, date_field, marked_at_field, marked_by_field, quantity_field, kind):
         # Shared body for mark_harvested/mark_fertilized below — get_object()
         # already runs get_queryset()'s scoping plus
         # IsAssignedPicBlockOrManagerOrSuperAdmin.has_object_permission()
@@ -72,11 +72,30 @@ class TreeViewSet(IdempotentUUIDCreateMixin, viewsets.ModelViewSet):
         if marked_date is None:
             marked_date = timezone.localdate()
 
+        # Optional — this completion action has never required a quantity
+        # (see Tree.last_harvest_quantity's help_text), so a blank/missing
+        # value is a normal input, not an error. Anything that doesn't
+        # parse as a number is treated the same as "not provided" rather
+        # than 400ing the whole request over what's an optional field.
+        quantity_raw = request.data.get("quantity")
+        quantity = None
+        if quantity_raw not in (None, ""):
+            try:
+                quantity = float(quantity_raw)
+            except (TypeError, ValueError):
+                quantity = None
+
         setattr(tree, date_field, marked_date)
+        setattr(tree, quantity_field, quantity)
         setattr(tree, marked_at_field, None)
         setattr(tree, marked_by_field, None)
         tree.updated_by = request.user
-        tree.save(update_fields=[date_field, marked_at_field, marked_by_field, "updated_by", "updated_at"])
+        tree.save(update_fields=[
+            date_field, quantity_field, marked_at_field, marked_by_field, "updated_by", "updated_at",
+        ])
+        TreeCareRecord.objects.create(
+            tree=tree, kind=kind, date=marked_date, quantity=quantity, recorded_by=request.user,
+        )
         return Response(TreeSerializer(tree).data)
 
     @action(detail=True, methods=["post"], permission_classes=[IsAuthenticated, IsAssignedPicBlockOrManagerOrSuperAdmin])
@@ -84,13 +103,20 @@ class TreeViewSet(IdempotentUUIDCreateMixin, viewsets.ModelViewSet):
         """Confirms this tree's harvest is actually done — the PIC Block
         field app's counterpart to a Manager's stage-1 "mark needing
         harvest" (see this class's own docstring). Optional `date` in the
-        POST body (defaults to today); always clears harvest_marked_at/
-        harvest_marked_by regardless of whether they were set — completing
-        the work is valid even if no one explicitly flagged it first.
+        POST body (defaults to today) and optional `quantity` (bunches);
+        always clears harvest_marked_at/harvest_marked_by regardless of
+        whether they were set — completing the work is valid even if no
+        one explicitly flagged it first.
         """
-        return self._mark_done(request, "last_harvested_at", "harvest_marked_at", "harvest_marked_by")
+        return self._mark_done(
+            request, "last_harvested_at", "harvest_marked_at", "harvest_marked_by",
+            "last_harvest_quantity", TreeCareRecord.KIND_HARVEST,
+        )
 
     @action(detail=True, methods=["post"], permission_classes=[IsAuthenticated, IsAssignedPicBlockOrManagerOrSuperAdmin])
     def mark_fertilized(self, request, pk=None):
         """Fertilizer counterpart to mark_harvested() above."""
-        return self._mark_done(request, "last_fertilized_at", "fertilizer_marked_at", "fertilizer_marked_by")
+        return self._mark_done(
+            request, "last_fertilized_at", "fertilizer_marked_at", "fertilizer_marked_by",
+            "last_fertilizer_quantity", TreeCareRecord.KIND_FERTILIZER,
+        )

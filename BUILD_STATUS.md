@@ -620,6 +620,343 @@ ruff) that doesn't need a live database, or new tests that follow the
 exact same "not yet run against live Postgres" caveat every other test in
 this project has had until the user runs them for real.
 
+## Phase 4 — browser verification (the run this file kept asking for)
+
+The PWA has now been **run in a real browser** (Chromium via Playwright, at
+390x844 and 1440x900) against live Postgres/PostGIS with `seed_demo_data`,
+including real GPS coordinates inside Block A and real offline simulation.
+This closes the "not yet confirmed in an actual browser" caveat above for
+everything except Background Sync (which needs a real device).
+
+Note on how it was run: `docker compose up` was **not** usable in that
+environment — Docker Hub's blob CDN was blocked by egress policy, so no
+base images could be pulled. PostgreSQL 16 + PostGIS 3.4 were installed
+natively and Django was run directly instead. The application code paths
+exercised are identical; only the container boundary differs.
+
+**Six real bugs were found this way. All six are fixed.** Every one of them
+was invisible to `manage.py check`, to `node --check`, and to the existing
+test suite — they only appear when the DOM is actually rendered and
+interacted with, which is exactly what this file predicted ("I'd expect the
+first real bugs to show up in `pwa/js/app.js`'s DOM rendering/event-wiring
+code").
+
+1. **A tree created offline vanished from the block screen.** `blockScreen()`
+   filtered on `t.status === "active"`, but the optimistic local write stored
+   the request payload, which has no server-assigned `status`. Verified in
+   IndexedDB: the record was present with `status: undefined` and correctly
+   queued in the outbox, but the list still read "Trees (4)" and omitted it.
+   A field worker would have concluded the entry was lost and re-added it,
+   producing duplicates on sync. Fixed with `isActiveRecord()` (absent status
+   counts as active) plus a visible "Queued" pill so the record's real state
+   is legible.
+2. **The sync chip froze permanently after its first update.** `render()`
+   emitted `<div id="sync-chip">` as a wrapper, but `updateSyncChip()`
+   replaced it via `outerHTML` with markup carrying no id — so every
+   subsequent `getElementById` returned null and the function silently
+   no-opped. Confirmed live: forcing `syncing` then `idle` left the chip
+   reading "Syncing…" forever. `renderSyncChip()` now emits the id itself.
+   Offline also takes precedence over "syncing" in the label, since a sync
+   cannot be in progress with no connection.
+3. **Tapping a tree did nothing.** `.tree-item` rendered with
+   `cursor: pointer` and a `data-tree-id`, but only `.block-item` was ever
+   wired up. Added the missing handler and the tree-detail screen it needed
+   as a destination — which also gives tree-level logging a route that
+   doesn't depend on standing within 15m of the tree.
+4. **A failed login wiped the typed username.** `showError()` re-renders from
+   a template, destroying anything held only in the DOM. Now preserved in
+   `state.loginUsername`.
+5. **`.screen-header` reversed the visual order** on every screen whose back
+   button preceded the `<h1>`, flinging titles to the right edge; at 390px
+   the back link also collapsed onto two lines on the harvest/fertilizer
+   forms.
+6. **The proximity prompt was shredded by flexbox.** Its children were bare
+   text nodes, so `justify-content: space-between` treated each text run as
+   its own flex item and tore the sentence into three widely-spaced
+   fragments. Copy now lives in a single element.
+
+**Accessibility, measured on rendered pixels rather than read off the
+palette table.** Six text/background pairs failed WCAG AA: muted text
+3.47:1 on cream and 3.14:1 on card, danger 4.24:1, warning-fg 3.84:1,
+white-on-moss 3.63:1 (the sync chip — the one element that must stay
+readable in direct sun), and white-on-clay at exactly 4.50:1. The *surface*
+palette in `docs/09-design-system.md` is unchanged; the text tokens derived
+from it were each darkened by the minimum amount that clears 4.5:1 against
+every background they actually sit on. `input:focus` no longer sets
+`outline: none`. All PWA tap targets already passed (>=48px) and still do.
+
+**Design-system drift corrected.** The specified humanist sans was never
+actually loaded — `app.css` named `"Public Sans", "Inter"` with no
+`@font-face` anywhere, so every screen silently rendered in a system
+fallback. Public Sans is now vendored as a 26KB variable woff2 in
+`pwa/fonts/` and precached by the service worker, rather than linked from
+the Google Fonts CDN, which would fall back to a system font in exactly the
+offline case this PWA exists for. Amber was also being used for "You are
+here" — a neutral locational fact — against the doc's rule that the accent
+means "needs attention" and nothing else; that now uses the primary green.
+Empty states ("no blocks", "no trees", "block not cached") were bare muted
+text, one of them an `<li class="muted">` inside the record list; they now
+have a real dashed-surface treatment.
+
+**Still not done for Phase 4:** the numeric steppers
+`docs/09-design-system.md` calls for ("big numeric steppers instead of small
+text inputs") — deliberately deferred to its own pass at the project
+owner's direction, since it is a feature build rather than a fix and it
+touches the same form layout. Also still open: a Leaflet map view, tree
+editing, and real icon art.
+
+## Office dashboard — first browser-verified UI pass
+
+The dashboard shipped on `main` has now been run in a real browser
+(Chromium, 1440x900 and 390x844) against live PostGIS, covering every
+screen: overview, farms, Farm Map in all four drill-down states (no
+selection → farm → block → tree), imagery, all five compliance screens,
+reports, and notifications.
+
+**Front-end code no longer loads from a CDN.** Leaflet, its markercluster
+and draw plugins, and Chart.js were all pulled from `cdnjs.cloudflare.com`,
+with basemap tiles from OpenStreetMap/ArcGIS. On a machine that can't reach
+cdnjs, the Farm Map — the dashboard's most important screen — hit its own
+`typeof L === "undefined"` guard and rendered as an empty panel over blank
+space, and all three overview charts rendered as blank boxes. Both failed
+silently with a 200 response. This is exactly what CLAUDE.md's local-first
+rule exists to prevent, and it was also an undeclared external dependency
+of the kind CLAUDE.md says to flag rather than add. All four libraries are
+now pinned copies under `apps/dashboard/static/dashboard/vendor/` at the
+same versions the CDN URLs requested. Two tests in `apps/dashboard/tests.py`
+guard this: the files must exist and be non-empty, and no dashboard template
+may carry a live CDN `<script>`/`<link>`. Basemap *tiles* remain remote by
+necessity — imagery can't be bundled — so with no connection the map now
+degrades to boundaries on a blank background rather than failing outright.
+
+**The specified typeface is now actually delivered.** `style.css` documented
+a deliberate decision to stay on a system stack rather than take an internet
+dependency for a webfont — sound reasoning, but the effect was that no
+screen on either surface ever rendered in Public Sans or Inter. Vendoring
+the font same-origin satisfies both constraints at once. The two surfaces
+also disagreed on stack order (dashboard led with Inter, PWA with Public
+Sans), so the same machine could render them in different typefaces; both
+now lead with Public Sans.
+
+**Accessibility, measured on rendered pixels.** Every muted-text style on
+every dashboard screen failed WCAG AA — 3.14:1 on card fills and 3.47:1 on
+the page background, at 12-14px. Same root cause as the PWA: the surface
+palette in docs/09-design-system.md used directly as small text. The
+dashboard now carries the identical corrected text tokens as the PWA. Also
+fixed: no focus styling existed at all, leaving the browser default black
+ring effectively invisible against the dark sidebar where log-out and every
+nav item live; the log-out control was a 43x15 hit area; the compliance
+sub-nav pills were 30px tall; the map's farm/block selects were 31px; and
+Leaflet's own zoom buttons were 30x30 (its stylesheet loads after ours, so
+the override needed a compound `.leaflet-touch.leaflet-container` selector,
+not a descendant one).
+
+**Colourblind fallback on the tree markers.** Harvest/fertilizer stage is
+drawn as the marker's ring. Only "never recorded" had a non-colour cue (a
+dash); "overdue" (red) and "due soon" (amber) were both solid strokes
+differing by 1px of weight — red-versus-amber is precisely the pair
+protanopia and deuteranopia collapse, and those two states mean "act now"
+versus "act this week." Each stage now carries a distinct stroke pattern as
+well as a hue (solid-thick / long-dash / short-dash / sparse-dots /
+solid-thin), and the legend swatches mirror the patterns so the vocabulary
+is learnable from the legend. Health *fill* colour (green/red/grey) is still
+colour-only — noted, not fixed; it would need a different marker shape per
+state, which is a larger change.
+
+**Layout bugs.** The Farm Map's floating panel is 380px wide with a
+non-wrapping toolbar, so "Upload imagery" ran past the panel edge and was
+clipped by its `overflow: hidden`; the toolbar now wraps. The panel and
+legend also carried `box-shadow`, against docs/09-design-system.md's
+explicit "flat surfaces, no drop shadows or gradients" — replaced with a 1px
+border, which they do need since they float over the map. Every dashboard
+screen also pushed the whole *page* sideways at phone width (up to 904px
+against a 390px viewport) because `.shell` is a flex row with a fixed 240px
+sidebar that never collapsed; the sidebar now stacks below 720px and wide
+tables scroll inside their own container instead of dragging the body.
+
+**PWA fixes carried across the merge.** `main` rewrote `pwa/js/app.js`
+(adding a map screen, tree detail, and tree editing) without the earlier
+audit's fixes, so three were re-applied on top of the newer code: the
+offline-created tree still filtered out of the block list by
+`status === "active"`, the sync chip still losing its `id` on first update
+and freezing, and the failed login still wiping the typed username. `main`'s
+own new "Sync now" button was 36px tall in a gloves-first UI and is now 44px.
+
+## Second UI pass — two dashboard screens were silently broken
+
+Auditing the surfaces the first pass never opened (the dashboard's own
+forms, and the PWA's map/tree-detail screens `main` added) turned up a
+functional break, not a cosmetic one.
+
+**"Add tree" and "Edit boundary" did not work at all.** `style.css` gave a
+560px height to `#dashboard-map` — an id no template has ever used, left
+behind by a rename. The ids actually mounted, `#tree-map` and
+`#boundary-map`, had no height rule, so both containers rendered at 0px.
+That is invisible and unclickable on its own, but it also made Leaflet
+throw inside `_clipPoints` when the first vector layer was added (the
+renderer has no `_bounds` at zero size), and the uncaught exception aborted
+the rest of each page's init script. On the Add-tree form that meant the
+block boundary and existing trees never drew, the map click handler was
+never wired, and `#tree-lat`/`#tree-lng` could never be populated — so a
+Manager could not place a tree at all. Both screens still returned 200, and
+`manage.py check` saw nothing. Verified fixed by driving the real form:
+clicking the map now fills in coordinates inside Block A.
+
+A second, latent version of the same fault: all four Leaflet maps were
+constructed with `L.map(el)` and only given a view by a `fitBounds` call
+*after* their layers were added. A map has no view until then, so the first
+`.addTo(map)` can throw. Each now seeds a provisional view at construction;
+the later `fitBounds` still sets the real one.
+
+`apps/dashboard/tests.py` has a regression test that resolves the variable
+handed to `L.map(...)` back to the id it was read from and asserts each one
+has a height rule (with CSS comments stripped first — the first version of
+the test passed on the strength of a comment that merely mentioned the id).
+Confirmed to fail when the old selector is put back.
+
+**An invisible primary action.** `.link-button` hardcoded the cream `#E7E4D8`
+it needs inside the dark sidebar, but the class is also used on ordinary
+light pages — block_boundary's "Cancel" and imagery_list's "Process against
+block(s)". Those measured **1.09:1** against the page background. The
+default is now the readable ink colour, with the sidebar opting into the
+light one. (The imagery-list case never showed up in the first pass because
+that list was empty, so the link never rendered.)
+
+**Colourblind fallback on marker fills, now closed.** The first pass fixed
+the harvest/fertilizer rings and flagged health fill as still colour-only.
+Measured, it was worse than assumed: `Success` and `Text muted` used as
+fills sit at relative luminance 0.2396 and 0.2353 — a **1.015:1** greyscale
+separation, so "healthy" and "not yet assessed" were the same marker to a
+red-green colourblind viewer. Radius could not carry the cue (radius 8
+already means "selected") and the ring was already taken, so the three
+fills are now separated on the lightness axis instead — `#99B29D` /
+`#8A8578` / `#9B4D3E`, lightest to darkest, at 1.61:1 or better. Each stays
+in its own hue family and `unknown` is unchanged.
+
+**docs/09-design-system.md now matches what ships.** The four corrected text
+tokens, the vendored-font decision, and the marker-encoding rules are
+recorded there, with the measured figures and the reasoning, so the document
+and the two stylesheets no longer disagree.
+
+**Also:** select controls are styled on-palette (`appearance: none` plus an
+inline-SVG chevron) instead of using per-OS browser chrome — which also
+required narrowing two `background: #fff` shorthands to `background-color`,
+since the shorthand was silently resetting the chevron. The PWA's GPS
+checkbox row is a 44px-minimum target (the row toggles, not just the 28px
+box — verified by clicking the label text).
+
+**Checked and deliberately not changed:** Leaflet's disabled zoom control
+measures 1.75:1, but inactive controls are exempt from WCAG 1.4.3. The
+"Leaflet" attribution link is small by license convention. Stray chevrons
+that appeared over the sidebar in screenshots are a headless-Chromium
+compositing artifact — the sidebar renders clean when screenshotted alone
+and nothing exists at those coordinates — so nothing was "fixed" for it.
+
+## Harvest/fertilizer marking: quantity capture + real history
+
+Reported directly against the running app: "current harvest and fertilize
+only marking the trees giving date without telling how many quantities and
+there are no history too." Both were real gaps in the completion side of
+the two-stage harvest/fertilizer workflow (Tree.harvest_marked_at's
+help_text has the full two-stage shape) — not the separate compliance
+yield-reporting pipeline (Harvest/ActualHarvest/HarvestTree), which already
+had quantity and is untouched here.
+
+**What was actually happening.** Every "Mark harvested"/"Mark fertilized"
+completion — the PWA's mark_harvested/mark_fertilized API actions and this
+dashboard's own MarkTreesHarvestedView/MarkTreesFertilizedView/
+quickMarkTreeDone — only ever accepted a date, and wrote it by overwriting
+Tree.last_harvested_at/last_fertilized_at directly. A second completion
+erased any trace the first one had happened at all; there was no quantity
+capture and no history to look at.
+
+**Fixed with one new model, `apps/trees/models.py::TreeCareRecord`** — an
+append-only per-tree log (kind, date, quantity, recorded_by), written
+alongside the existing date stamp rather than replacing it. Quantity is
+optional everywhere it's captured, since not every recording knows the
+amount at the time. Two new denormalized fields on Tree itself,
+`last_harvest_quantity`/`last_fertilizer_quantity`, hold the latest value
+so read paths (TreeSerializer, the offline sync pull) don't pay an extra
+per-tree query for it — a real farm block can hold over a thousand trees
+(see the "B4" block in the field screenshot this was reported against), so
+an N+1 there would have been a genuine cost, not a theoretical one.
+
+**Dashboard.** The bulk "Record harvest/fertilizer directly" and "Mark
+trees needing X" checklist now shows a per-tree quantity input next to
+each CHECKED row — deliberately per-tree, not one shared field for the
+whole selection, since different trees yield different amounts. It's
+absent for the two stage-1 assignment modes (mark_need_harvest/
+mark_need_fertilize), where nothing has happened yet and a quantity has no
+meaning. The single-tree "Mark harvested/fertilized (today)" quick action
+on the tree detail panel no longer posts on click — it expands into the
+same optional-quantity input plus Save/Cancel. A new "Harvest & fertilizer
+history" section (mirroring the existing on-demand "Health history"
+section's fetch-after-render pattern, via a new TreeCareHistoryView) lists
+every TreeCareRecord for the open tree, newest first, with quantity and
+who recorded it.
+
+**PWA field app.** The single "Mark harvested"/"Mark fertilized" button on
+the tree detail screen's stage-2 completion banner now expands into the
+same inline optional-quantity form instead of posting immediately. The
+"Last harvested: DATE" line shows the quantity when one was recorded
+(`DATE (N bunches)`), degrading to plain `DATE` when it wasn't. Full
+history browsing was judged not worth the added offline-sync/IndexedDB
+surface for this pass — the quantity capture and the "last known amount"
+display are the field-app-side half of the same fix; the dashboard is
+where a Manager actually reviews history over time.
+
+**Caught while wiring this up:** a genuine, if small, accessibility
+regression — the PWA quick-mark form's "Cancel" control uses `.btn-text`,
+which is `--primary` (forest green) text on transparent, fine against the
+cream page background (9.7:1) but only 4.33:1 against the amber banner
+fill it now sits inside, just under the 4.5:1 AA floor for that size/weight
+(19.8px/600 doesn't clear WCAG's large-bold threshold, which starts at
+700). Fixed by making that one context use `--text` instead (6.39:1,
+matching the pill label already on the same banner).
+
+14 new tests (`apps/trees/tests.py`, `apps/dashboard/tests.py`) cover:
+quantity capture with/without a value, an unparseable quantity degrading
+to "not provided" rather than a 400, two different trees in one bulk
+submission getting two different quantities, repeated markings
+accumulating history instead of overwriting it, and scope enforcement on
+the new TreeCareHistoryView. All 326 tests pass; `ruff check` and
+`makemigrations --check --dry-run` are clean.
+
+## Bulk quantity entry for harvest/fertilizer marking
+
+Follow-up to the quantity-capture work above, requested directly: a way to
+record harvest/fertilizer quantity across a multi-tree selection in bulk,
+with quantity staying optional per tree.
+
+**"Bulk quantity" row**, shown above the per-tree checklist only in the two
+completion modes (mark_harvested/mark_fertilized — never the mark_need_*
+assignment modes, where nothing has happened yet and a quantity has no
+meaning). Type one value, click "Apply to all selected," and every
+currently-checked tree's row gets that value. This is a client-side
+fill-in, not a new write path — it just populates the exact same
+`selectedTreeQuantities` map (and `quantity_<id>` form fields) the
+per-tree inputs already fed into MarkTreesHarvestedView/
+MarkTreesFertilizedView, so no server-side change was needed and the
+existing per-tree quantity tests already cover the path this feeds.
+
+**Deliberately not live-bound.** Typing into the bulk field doesn't touch
+any tree's value until "Apply to all selected" is clicked — an explicit
+action, not something that could silently clobber a value a Manager is
+still typing into a specific row. It's a "fill down," not a lock: every
+per-tree row stays individually editable afterward, so a tree that
+actually yielded a different amount can be corrected, and any tree can
+still be left blank — quantity was already optional per tree, and bulk
+entry doesn't change that (applying a blank bulk value is itself a quick
+way to clear quantities across a selection).
+
+Verified end to end against live Postgres: selecting all 4 trees in a
+block, bulk-applying 15, then manually overriding one tree to 22 and
+clearing another back to blank, submitted correctly — `last_harvest_quantity`
+came back 15/22/None/15 across the four trees, with a TreeCareRecord
+logged for each. No new Python tests — this is a client-side convenience
+over an unchanged write path already covered by the per-tree quantity
+tests added alongside TreeCareRecord.
+
 ## Known gaps in what's built (not blockers, but don't forget these)
 
 **Update — FK write-scope validation: fixed.** The gap below (no viewset

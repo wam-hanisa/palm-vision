@@ -241,7 +241,7 @@
   {% if not images %}
     <p class="empty-state">No images uploaded yet.</p>
   {% else %}
-    <table class="data-table">
+    <div class="table-scroll"><table class="data-table">
       <thead><tr><th>Preview</th><th>Farm</th><th>Blocks</th><th>Uploaded</th><th>Georeference status</th><th>Format</th><th>Storage</th><th>Uploaded by</th><th></th></tr></thead>
       <tbody>
         {% for image in images %}
@@ -303,7 +303,7 @@
         </tr>
         {% endfor %}
       </tbody>
-    </table>
+    </table></div>
   {% endif %}
 </section>
 {% endblock %}

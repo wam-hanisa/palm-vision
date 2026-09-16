@@ -1,3 +1,18 @@
+/* Public Sans, vendored as a variable woff2 (latin subset, 26KB) rather than
+   linked from the Google Fonts CDN — docs/09-design-system.md asks for a
+   humanist sans, but the font-family below had no @font-face anywhere in the
+   project, so every screen silently rendered in a system fallback. A CDN
+   <link> would do the same thing in exactly the offline case this PWA exists
+   for, so the file is served same-origin and precached by the service
+   worker's APP_SHELL. */
+@font-face {
+  font-family: "Public Sans";
+  font-style: normal;
+  font-weight: 100 900;          /* one variable file covers every weight used */
+  font-display: swap;
+  src: url("/pwa/fonts/public-sans-latin.woff2") format("woff2");
+}
+
 /* Field PWA styles — docs/09-design-system.md § Two distinct densities:
    "larger single-column forms, big numeric steppers instead of small text
    inputs, high-contrast text, an always-visible offline/sync status chip." */
@@ -9,11 +24,19 @@
   --primary-hover: #3E6049;
   --accent: #D9A441;
   --text: #2B2A25;
-  --text-muted: #8A8578;
-  --success: #6B8F71;
-  --warning-fg: #8F6B2E;
+  /* Contrast-corrected TEXT tokens. The values in docs/09-design-system.md
+     are the surface palette; used as small text they failed WCAG AA when
+     measured on a real render — muted 3.47:1 on cream and 3.14:1 on card,
+     danger 4.24:1, warning-fg 3.84:1, white-on-moss 3.63:1 (the sync chip,
+     the one element that must stay readable in direct sun). Each is the
+     same hue darkened by the minimum amount that clears 4.5:1 against every
+     background it actually sits on. Surface tokens above are untouched. */
+  --text-muted: #656258;         /* was #8A8578 — 5.75:1 cream, 5.21:1 card, 4.53:1 pill */
+  --success: #5E7E63;            /* was #6B8F71 — 4.53:1 with white chip text */
+  --warning-fg: #816029;         /* was #8F6B2E — 4.54:1 on --warning-bg */
   --warning-bg: #EFE3CE;
-  --danger: #B85C4A;
+  --danger: #A65343;             /* was #B85C4A — 5.04:1 cream, 4.57:1 card */
+  --focus-ring: #2F4A38;
 }
 
 * { box-sizing: border-box; }
@@ -36,13 +59,24 @@ h2 { font-size: 1.1rem; color: var(--primary); }
 
 .screen { padding: 1rem 1rem 2rem; max-width: 480px; margin: 0 auto; }
 
+/* Title first and left-aligned; trailing controls are pushed to the far end
+   by an auto margin rather than by space-between, which previously reversed
+   the visual order on every screen whose back button preceded the <h1> —
+   flinging block and form titles against the right edge. nowrap stops the
+   back link collapsing onto two lines at 390px, which it did on the
+   harvest/fertilizer forms. */
 .screen-header {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
+  align-items: baseline;
+  gap: 0.75rem;
   margin-bottom: 1rem;
 }
+
+.screen-header h1 { flex: 1 1 auto; min-width: 0; order: 1; }
+.screen-header .btn-text { flex: 0 0 auto; white-space: nowrap; }
+.screen-header .btn-text--back { order: 0; padding-left: 0; }
+.screen-header .btn-text--end,
+.screen-header__actions { order: 2; margin-left: auto; }
 
 button, .btn-text {
   font-size: 1.1rem;
@@ -85,31 +119,60 @@ input, select {
   color: var(--text);
 }
 
-input:focus, select:focus { border-color: var(--primary); outline: none; }
+/* Never remove the focus indicator outright — the previous rule set
+   `outline: none` and relied on a border-colour change alone, the weakest
+   possible affordance, failing WCAG 2.4.7. */
+input:focus-visible,
+select:focus-visible,
+button:focus-visible,
+[role="button"]:focus-visible,
+a:focus-visible {
+  outline: 3px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+input:focus, select:focus { border-color: var(--primary); }
 
 /* treeDetailScreen()'s edit form — the "update_location" checkbox reads as
    a sentence ("Update pin to my current GPS position…"), so it needs the
    checkbox and its label text side by side, not the stacked
    label-above-field layout the rest of this file's `label` rule gives
    text/select inputs. */
+/* The whole row is the hit area, not just the 22px box — this is the
+   gloves-in-sunlight surface, where 44px is the floor. Clicking the label
+   already toggles the input (it wraps it), so padding the label is what
+   actually makes the target big; the box itself is enlarged too so it is
+   visible at arm's length. */
 .checkbox-label {
   flex-direction: row;
   align-items: center;
   gap: 0.6rem;
   font-weight: 500;
+  min-height: 44px;
+  padding: 0.35rem 0;
+  cursor: pointer;
 }
 
 .checkbox-label input[type="checkbox"] {
-  width: 1.4rem;
-  height: 1.4rem;
+  width: 1.75rem;
+  height: 1.75rem;
   flex-shrink: 0;
   accent-color: var(--primary);
 }
 
 .checkbox-label input[type="checkbox"]:disabled { opacity: 0.5; }
 
-.action-row { display: flex; flex-wrap: wrap; gap: 0.6rem; margin: 1rem 0; }
-.action-row button { flex: 1 1 auto; }
+/* Equal columns rather than `flex: 1 1 auto`, which sized each button to its
+   own label and left a ragged row with one button stranded. A trailing odd
+   button spans the full width instead of sitting beside dead space. */
+.action-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+  gap: 0.6rem;
+  margin: 1rem 0;
+}
+
+.action-row button:last-child:nth-child(odd) { grid-column: 1 / -1; }
 
 .block-list, .tree-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.6rem; }
 
@@ -137,6 +200,10 @@ input:focus, select:focus { border-color: var(--primary); outline: none; }
 .pill--accent { background: var(--accent); color: var(--text); }
 .pill--warning { background: var(--warning-bg); color: var(--warning-fg); }
 
+/* The children were bare text nodes, so `justify-content: space-between`
+   treated each run of text as its own flex item and tore the sentence into
+   three widely-spaced fragments. Copy now lives in one
+   .proximity-prompt__text element (see app.js) and the container stacks. */
 .proximity-prompt {
   background: var(--warning-bg);
   color: var(--warning-fg);
@@ -144,11 +211,12 @@ input:focus, select:focus { border-color: var(--primary); outline: none; }
   padding: 1rem;
   margin-bottom: 1rem;
   display: flex;
-  align-items: center;
-  justify-content: space-between;
+  flex-direction: column;
+  align-items: stretch;
   gap: 0.75rem;
-  flex-wrap: wrap;
 }
+
+.proximity-prompt__text { margin: 0; }
 
 .proximity-prompt button { background: var(--accent); color: var(--text); min-height: 44px; }
 
@@ -177,6 +245,26 @@ input:focus, select:focus { border-color: var(--primary); outline: none; }
 .mark-banner .pill { margin-top: 0; background: transparent; padding: 0; font-weight: 600; }
 .mark-banner button { min-height: 44px; flex-shrink: 0; }
 
+/* Expanded state — markBanner() swaps the single "Mark X" button for an
+   inline optional-quantity form in place, rather than posting immediately
+   with no way to record how much was actually done. Row layout doesn't
+   work once there's a form to fit, so this switches to a stacked column. */
+.mark-banner--open {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.mark-banner--open form { margin-top: 0.6rem; }
+
+/* The Cancel control here is .btn-text, which uses --primary (forest
+   green) text on a transparent background — fine on the cream page
+   background (9.7:1) but only 4.33:1 on this banner's amber fill, just
+   under the 4.5:1 AA floor for text this size/weight (19.8px/600 doesn't
+   clear WCAG's bold-text large-text bar, which starts at 700). --text
+   matches the pill label already on this banner (6.39:1) and reads as
+   consistent rather than a special case. */
+.mark-banner--open .btn-text { color: var(--text); }
+
 /* Always-visible offline/sync status chip — docs/09-design-system.md is
    explicit this must never be buried in a menu. */
 .sync-chip {
@@ -184,8 +272,9 @@ input:focus, select:focus { border-color: var(--primary); outline: none; }
   top: 0;
   z-index: 10;
   text-align: center;
-  padding: 0.4rem;
-  font-size: 0.85rem;
+  padding: 0.6rem 0.75rem;
+  font-size: 1rem;        /* was 0.85rem (13.6px) — too small for the one
+                             element that must stay readable in direct sun */
   font-weight: 700;
   color: white;
 }
@@ -217,7 +306,10 @@ input:focus, select:focus { border-color: var(--primary); outline: none; }
 .unsynced-banner button {
   background: var(--primary);
   color: white;
-  min-height: 36px;
+  /* Was 36px. This sits in the field PWA, used with gloves, where 44px is
+     the floor — every other control here already clears it via the base
+     button rule's min-height: 48px; this one overrode it. */
+  min-height: 44px;
   padding: 0.3rem 0.8rem;
   font-size: 0.85rem;
   flex-shrink: 0;
@@ -275,3 +367,31 @@ input:focus, select:focus { border-color: var(--primary); outline: none; }
 }
 
 .map-legend-note { font-size: 0.85rem; }
+
+/* --- Empty states -------------------------------------------------------
+   Previously bare muted text — one of them an `<li class="muted">` inside
+   the record list, i.e. a list item pretending to be a message. A dashed
+   outline (not a filled card) so an empty block never looks like it holds
+   a record. */
+.empty-state {
+  border: 2px dashed #D8D3C4;
+  border-radius: 0.6rem;
+  padding: 1.5rem 1.25rem;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.empty-state__title {
+  display: block;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 0.35rem;
+}
+
+.empty-state__hint { font-size: 0.95rem; margin: 0; }
+
+.loading-state {
+  padding: 2rem 1rem;
+  text-align: center;
+  color: var(--text-muted);
+}

@@ -60,3 +60,24 @@ def test_pwa_icons_served():
     for size in ("192", "512"):
         response = Client().get(f"/pwa/icons/icon-{size}.png")
         assert response.status_code == 200
+
+
+def test_vendored_webfont_is_served():
+    """docs/09-design-system.md asks for a humanist sans (Inter/Public Sans).
+    The font is vendored into pwa/fonts/ rather than linked from the Google
+    Fonts CDN, because an external stylesheet would fall back to a system
+    font in exactly the offline case this PWA exists for. If this route
+    breaks, that fallback happens silently — nothing else would catch it.
+    """
+    response = Client().get("/pwa/fonts/public-sans-latin.woff2")
+    assert response.status_code == 200
+    body = b"".join(response.streaming_content)
+    # woff2 files start with the signature 'wOF2'.
+    assert body[:4] == b"wOF2"
+
+
+def test_service_worker_precaches_the_webfont():
+    """A font that is served but not precached still fails offline."""
+    response = Client().get("/service-worker.js")
+    body = b"".join(response.streaming_content).decode()
+    assert "/pwa/fonts/public-sans-latin.woff2" in body

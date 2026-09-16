@@ -30,14 +30,14 @@
         {% elif audit.overall_status == "failed" %}<span class="tag tag-danger">Failed</span>
         {% else %}<span class="tag tag-warning">Conditional</span>{% endif %}
       </summary>
-      <table class="data-table">
+      <div class="table-scroll"><table class="data-table">
         <tbody>
           <tr><th>Auditor</th><td>{{ audit.auditor_name }} ({{ audit.get_auditor_type_display }})</td></tr>
           <tr><th>Next audit due</th><td>{{ audit.next_audit_due|default:"—" }}</td></tr>
         </tbody>
-      </table>
+      </table></div>
       {% if audit.results.all %}
-      <table class="data-table">
+      <div class="table-scroll"><table class="data-table">
         <thead><tr><th>Checklist item</th><th>Result</th><th>Notes</th></tr></thead>
         <tbody>
           {% for result in audit.results.all %}
@@ -52,7 +52,7 @@
           </tr>
           {% endfor %}
         </tbody>
-      </table>
+      </table></div>
       {% else %}
       <p class="empty-state">No per-item results recorded for this audit.</p>
       {% endif %}

@@ -1,17 +1,31 @@
 /*
  * docs/09-design-system.md — "agriculture modern minimalism." Colors,
  * densities, and layout principles below are taken directly from that doc's
- * tables, not invented here. One deliberate deviation, flagged rather than
- * silently done: the doc suggests "Inter or Public Sans" loaded as a real
- * font; this stays on a system-font stack instead (no external font file),
- * since this project's local-dev/offline-first stance (CLAUDE.md) shouldn't
- * quietly grow a hard dependency on an internet connection just to render
- * the office dashboard's text. Line icons (also mentioned in that doc) are
+ * tables, not invented here.
+ *
+ * The doc's "Inter or Public Sans" is now actually delivered, not just
+ * named. It previously stayed on a system stack to avoid a hard dependency
+ * on an internet connection (CLAUDE.md's local-first rule) — sound
+ * reasoning, but it meant no screen ever rendered in the specified
+ * typeface. Public Sans is instead vendored as a variable woff2 served from
+ * this app's own static files, which satisfies the offline requirement and
+ * the design system at the same time. The same file is vendored for the
+ * field PWA at pwa/fonts/ (that surface is served outside staticfiles and
+ * has to precache it in its service worker, so the two copies are
+ * deliberate, not an oversight). Line icons (also mentioned in that doc) are
  * built — see .nav-icon below and the <symbol> sprite defined once in
  * base.html — as small, original stroke-based SVGs rather than an external
  * icon font, keeping the same no-external-font-dependency reasoning as the
  * point above.
  */
+
+@font-face {
+  font-family: "Public Sans";
+  font-style: normal;
+  font-weight: 100 900;          /* one variable file covers every weight used */
+  font-display: swap;
+  src: url("fonts/public-sans-latin.woff2") format("woff2");
+}
 
 :root {
   --bg: #FAF8F3;
@@ -20,11 +34,19 @@
   --primary-hover: #3E6049;
   --accent: #D9A441;
   --text: #2B2A25;
-  --text-muted: #8A8578;
-  --success: #6B8F71;
+  /* Contrast-corrected text tokens. docs/09-design-system.md's values are
+     the SURFACE palette; used as small text they failed WCAG AA when
+     measured on a real render — muted 3.14:1 on card and 3.47:1 on the page
+     background, at 12-13px. Each is the same hue darkened by the minimum
+     amount clearing 4.5:1 on every background it sits on. The PWA carries
+     the identical values so the two surfaces stay in step. */
+  --text-muted: #656258;         /* was #8A8578 */
+  --success: #5E7E63;            /* was #6B8F71 — 4.53:1 with white text */
   --warning-bg: #EFE3CE;
-  --warning-text: #8F6B2E;
-  --danger: #B85C4A;
+  --warning-text: #816029;       /* was #8F6B2E — 4.54:1 on --warning-bg */
+  --danger: #A65343;             /* was #B85C4A */
+  --focus-ring: #2F4A38;
+  --focus-ring-on-dark: #D9A441;
 }
 
 * { box-sizing: border-box; }
@@ -33,7 +55,10 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font-family: Inter, "Public Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  /* Same order as the field PWA's stack — the two surfaces previously
+     disagreed (dashboard led with Inter, PWA with Public Sans), so they
+     could render in different typefaces on the same machine. */
+  font-family: "Public Sans", Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   font-size: 15px;
   line-height: 1.5;
 }
@@ -132,13 +157,28 @@ a { color: var(--primary); }
   margin-bottom: 8px;
 }
 
+/* Used in two different contexts, which the single hardcoded colour below
+   did not survive: the dark sidebar (base.html's "Log out") and ordinary
+   light page bodies (block_boundary.html's "Cancel",
+   imagery_list.html's "Process against block(s)"). The sidebar's cream
+   #E7E4D8 measured 1.09:1 against the page background on the light pages —
+   effectively invisible, on what is a primary action in the imagery list's
+   case. The default is now the readable ink colour and the sidebar opts
+   into the light one. */
 .link-button {
   background: none;
   border: none;
-  color: #E7E4D8;
+  color: var(--primary);
   text-decoration: underline;
   cursor: pointer;
-  padding: 0;
+  /* Was `padding: 0`, giving a 43x15 hit area — under every pointer-target
+     guideline even for a mouse, and this is the log-out control.
+     inline-flex because min-height does nothing on an inline <a>, which is
+     how this class is used on the form pages ("Cancel"). */
+  display: inline-flex;
+  align-items: center;
+  padding: 8px 6px;
+  min-height: 36px;
   font-size: 13px;
 }
 
@@ -214,13 +254,20 @@ a { color: var(--primary); }
 }
 
 .subnav a {
-  padding: 5px 12px;
+  /* 5px vertical padding produced 30px-tall pills; these are the primary
+     navigation between the five compliance screens. */
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 8px 14px;
   border-radius: 999px;
   font-size: 13px;
   text-decoration: none;
   color: var(--text-muted);
   background: var(--card);
 }
+
+.subnav a:hover { background: #E8E4D6; color: var(--text); }
 
 .subnav a.active {
   color: white;
@@ -327,9 +374,18 @@ a.tag-link:hover {
   color: var(--warning-text);
 }
 
+/* Was plain muted text sitting loose in the panel, which read as a
+   rendering failure rather than a deliberate "nothing here yet" state.
+   Dashed (not filled) so an empty region never looks like it holds a
+   record. */
 .empty-state {
   color: var(--text-muted);
   font-size: 14px;
+  border: 1px dashed #D8D3C4;
+  border-radius: 8px;
+  padding: 18px 16px;
+  text-align: center;
+  margin: 8px 0;
 }
 
 /* --- Notifications --- */
@@ -500,7 +556,14 @@ a.tag-link:hover {
   border: 1px solid #D8D3C3;
   border-radius: 4px;
   font-size: 14px;
-  background: #fff;
+  /* background-color, not the `background` shorthand: the shorthand resets
+     background-image too, which silently removed the select chevron set
+     further down. */
+  background-color: #fff;
+  /* Restated here because this rule's own `padding` shorthand outranks the
+     bare `select` rule — without it a long option label runs under the
+     chevron. Harmless on the inputs this selector also matches. */
+  padding-right: 34px;
   color: var(--text);
 }
 
@@ -686,24 +749,41 @@ a.tag-link:hover {
 
 /* --- Map panel --- */
 
+/* Wraps rather than overflowing. Inside .farm-map-float the panel is 380px
+   wide, so "Farm [select] Block [select] [Upload imagery]" could not fit on
+   one line — the button ran past the panel's edge and was cut off by its
+   `overflow: hidden`. */
 .map-toolbar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 12px;
   font-size: 13px;
 }
 
+.map-toolbar select { flex: 1 1 7rem; min-width: 0; }
+.map-toolbar button { flex: 0 0 auto; }
+
 .map-toolbar select {
   padding: 6px 8px;
   border: 1px solid #D8D3C3;
   border-radius: 4px;
-  background: #fff;
+  background-color: #fff;   /* not the shorthand — see .stacked-form above */
+  padding-right: 30px;      /* clear of the chevron; this rule sets its own padding */
   font-size: 13px;
   color: var(--text);
 }
 
-#dashboard-map, #confirm-blocks-map {
+/* `#dashboard-map` matched nothing — no template has ever used that id, so
+   this rule only ever sized the imagery-confirm map. The two that were
+   missed, #tree-map (the "Add tree" form) and #boundary-map (the "Edit
+   boundary" screen), therefore rendered at height 0: invisible, and
+   unclickable, so neither a tree nor a boundary could actually be placed.
+   The zero height also made Leaflet throw during layer setup, which aborted
+   the rest of each page's init script — see the setView note in
+   tree_form.html. Listing the ids that genuinely exist. */
+#tree-map, #boundary-map, #confirm-blocks-map {
   width: 100%;
   height: 560px;
   border-radius: 6px;
@@ -790,9 +870,12 @@ a.tag-link:hover {
   border: 2px solid;
 }
 
-.legend-swatch-ring-dashed {
-  border-style: dashed;
-}
+/* The legend mirrors treeIndicatorStyle()'s stroke patterns, so the shape
+   cue is learnable from the legend rather than only visible on the map. */
+.legend-swatch-ring-thick { border-width: 4px; }
+.legend-swatch-ring-dashed { border-style: dashed; }
+.legend-swatch-ring-dotted { border-style: dotted; border-width: 3px; }
+.legend-swatch-ring-sparse { border-style: dotted; }
 
 .map-popup-title {
   font-weight: 600;
@@ -893,7 +976,12 @@ body.farm-map-fullpage .flash {
   max-width: calc(100% - 32px);
   background: var(--card);
   border-radius: 8px;
-  box-shadow: 0 2px 16px rgba(43, 42, 37, 0.22);
+  /* docs/09-design-system.md § Layout principles: "Flat surfaces, no drop
+     shadows or gradients — separation comes from a slightly darker card
+     fill against the cream page background." These panels float over the
+     map, so they do need an edge; a 1px border in the palette's own ink
+     provides it without reintroducing a shadow. */
+  border: 1px solid #D8D3C4;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -923,7 +1011,12 @@ body.farm-map-fullpage .flash {
   background: var(--card);
   padding: 12px 16px;
   border-radius: 8px;
-  box-shadow: 0 2px 16px rgba(43, 42, 37, 0.22);
+  /* docs/09-design-system.md § Layout principles: "Flat surfaces, no drop
+     shadows or gradients — separation comes from a slightly darker card
+     fill against the cream page background." These panels float over the
+     map, so they do need an edge; a 1px border in the palette's own ink
+     provides it without reintroducing a shadow. */
+  border: 1px solid #D8D3C4;
   z-index: 1000;
 }
 
@@ -1074,3 +1167,229 @@ body.farm-map-fullpage .flash {
   gap: 8px;
   font-size: 13px;
 }
+
+/* Wraps each checklist row: the checkbox+name <label> and (only while a
+   completion mode with a quantity unit is active — see
+   renderTreeSelectionChecklist()) a per-tree quantity input, as siblings
+   rather than the input nested inside the label — see that function's own
+   comment for why nesting a form control inside a label that already
+   wraps a checkbox is worth avoiding. */
+.tree-checklist-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.tree-checklist-item label {
+  flex: 1;
+  min-width: 0;
+}
+
+.tree-checklist-qty {
+  width: 84px;
+  flex-shrink: 0;
+  padding: 6px 8px;
+  border: 1px solid #D8D3C3;
+  border-radius: 4px;
+  background-color: #fff;
+  font-size: 13px;
+  color: var(--text);
+}
+
+/* "Apply to all selected" bulk-fill row — renderTreeSelectionChecklist()'s
+   own comment has the reasoning. Sits above the per-tree rows it fills;
+   wraps on narrow widths rather than squeezing the input. */
+.bulk-qty-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px dashed #D8D3C3;
+}
+
+.bulk-qty-label {
+  font-size: 13px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.bulk-qty-row .tree-checklist-qty {
+  width: 96px;
+}
+
+/* Single-tree "Mark harvested/fertilized (today)" quick action, expanded
+   in place of its button — see renderTreeDetailPanel()'s
+   renderQuickMarkRow(). Same optional-quantity idea as the bulk checklist
+   above, just for one tree instead of several. */
+.quick-mark-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.quick-mark-form .tree-checklist-qty {
+  width: 100px;
+}
+
+/* The dark-sidebar context this colour was originally written for. */
+.sidebar .link-button { color: #E7E4D8; }
+
+/* --- Focus visibility ----------------------------------------------------
+   There were no focus rules at all, leaving the browser default — a black
+   ring that is effectively invisible against the dark forest-green sidebar,
+   where the log-out and every nav item live. */
+:focus-visible {
+  outline: 3px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.sidebar :focus-visible,
+.sidebar a:focus-visible,
+.sidebar .link-button:focus-visible {
+  outline-color: var(--focus-ring-on-dark);
+}
+
+/* --- Form control target size -------------------------------------------
+   The map toolbar's farm/block selects rendered 31px tall. */
+select,
+input[type="text"],
+input[type="date"],
+input[type="number"],
+input[type="password"],
+input[type="email"] {
+  min-height: 40px;
+}
+
+/* --- Chart panels --------------------------------------------------------
+   With no data, each chart canvas rendered as a large blank rectangle with
+   no explanation — three of them stacked on the overview. This gives the
+   "nothing to plot yet" case somewhere to say so. */
+.chart-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 220px;
+  padding: 24px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 14px;
+  border: 1px dashed #D8D3C4;
+  border-radius: 8px;
+}
+
+/* --- Narrow-viewport behaviour -------------------------------------------
+   This dashboard is desktop-first by design (docs/09-design-system.md's two
+   densities), but every compliance/imagery/reports screen pushed the whole
+   PAGE sideways on a phone — scrollWidth 904px against a 390px viewport on
+   the overview — because wide data tables and the metric grid have no
+   narrow-width behaviour at all. A manager checking something from a phone
+   got a horizontally-sliding page where the sidebar and headings drift off
+   screen, which is different from (and much worse than) a table that
+   scrolls inside its own box.
+
+   The rule is: wide content scrolls within its own container; the page
+   itself never does. */
+.table-scroll,
+.data-table-wrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+@media (max-width: 720px) {
+  /* The root cause of the sideways-sliding page: .shell is a flex row with a
+     fixed 240px sidebar that never collapsed, so on a 390px viewport the
+     content column was pushed to x=240 and still demanded its full width —
+     dragging the whole page to 668-904px wide. Stacking the shell puts the
+     nav above the content and lets the content column be the viewport width.
+     `min-width: 0` on .content is the part that actually lets a flex/grid
+     child shrink below its content size. */
+  .shell { flex-direction: column; }
+
+  .sidebar {
+    width: 100%;
+    flex-shrink: 1;
+    padding: 12px 0;
+  }
+
+  .sidebar nav {
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 4px;
+    padding: 0 12px;
+  }
+
+  .content {
+    min-width: 0;
+    padding: 20px 16px;
+  }
+
+  /* Tables keep their real column widths and scroll inside the wrapper the
+     templates put around them, rather than forcing the body wider. */
+  .data-table { min-width: 560px; }
+
+  /* The compliance sub-nav is five pills; let it wrap and scroll rather
+     than stretch the page. */
+  .subnav { flex-wrap: wrap; }
+
+  /* Metric cards stack instead of forcing a multi-column grid wider than
+     the viewport. */
+  .card-grid { grid-template-columns: 1fr 1fr; }
+
+  .chart-grid { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 460px) {
+  .card-grid { grid-template-columns: 1fr; }
+}
+
+/* --- Remaining target sizes --------------------------------------------- */
+.secondary-button { min-height: 36px; }
+
+/* Leaflet's own zoom buttons default to 30x30. leaflet.css is loaded after
+   this file on the map pages, so an equal-specificity rule lost on source
+   order — hence the extra .leaflet-container qualifier. */
+.leaflet-container .leaflet-bar a,
+.leaflet-touch.leaflet-container .leaflet-bar a {   /* compound: same element carries both classes */
+  width: 40px;
+  height: 40px;
+  line-height: 40px;
+}
+
+/* Django renders CheckboxSelectMultiple as bare 13px native checkboxes;
+   the report-subscriber list is a real multi-select control people use. */
+.form-field input[type="checkbox"],
+input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  min-height: 18px;
+  vertical-align: middle;
+}
+
+/* --- Select controls -----------------------------------------------------
+   Native select arrows are browser chrome: they differ per OS/browser and
+   sit outside this palette entirely, which is the one thing
+   docs/09-design-system.md's "line icons only, used sparingly" rule is
+   meant to prevent. They also render unreliably here — Chromium painted the
+   arrow detached from its control, leaving stray chevrons over the sidebar
+   on any page with several selects.
+
+   `appearance: none` plus an inline-SVG chevron in the palette's own muted
+   ink gives one consistent control everywhere. The SVG is a data: URI so it
+   costs no extra request and still works offline. Keyboard behaviour and
+   the native dropdown are untouched — only the arrow is ours. */
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8' fill='none' stroke='%23656258' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  padding-right: 34px;
+}
+
+/* Firefox keeps a focus ring inside the control unless this is cleared. */
+select:-moz-focusring { color: transparent; text-shadow: 0 0 0 var(--text); }

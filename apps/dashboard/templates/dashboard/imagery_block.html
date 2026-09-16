@@ -15,7 +15,7 @@
   {% if not overlapping_images %}
     <p class="empty-state">No georeferenced images intersect this block's boundary yet. <a href="{% url 'dashboard:imagery' %}">Upload one</a>.</p>
   {% else %}
-    <table class="data-table">
+    <div class="table-scroll"><table class="data-table">
       <thead><tr><th>Preview</th><th>Uploaded</th><th>Captured</th><th></th><th></th></tr></thead>
       <tbody>
         {% for image in overlapping_images %}
@@ -38,7 +38,7 @@
         </tr>
         {% endfor %}
       </tbody>
-    </table>
+    </table></div>
   {% endif %}
 </section>
 
@@ -47,7 +47,7 @@
   {% if not runs %}
     <p class="empty-state">No processing runs yet for this block.</p>
   {% else %}
-    <table class="data-table">
+    <div class="table-scroll"><table class="data-table">
       <thead><tr><th>Started</th><th>Status</th><th>Detected</th><th>New candidates</th><th></th></tr></thead>
       <tbody>
         {% for run in runs %}
@@ -64,7 +64,7 @@
         </tr>
         {% endfor %}
       </tbody>
-    </table>
+    </table></div>
   {% endif %}
 </section>
 {% endblock %}

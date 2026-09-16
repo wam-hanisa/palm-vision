@@ -10,3 +10,5 @@ test_media/
 backups/*.dump
 celerybeat-schedule
 .ruff_cache/
+.venv/
+venv/

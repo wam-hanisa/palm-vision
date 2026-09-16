@@ -10,9 +10,12 @@ this aims at for the dashboard specifically: can a Manager sign in, see
 correctly-scoped data, and can a PIC Block user (who has no dashboard
 journey per docs/10-user-journeys.md) not get in at all.
 """
+import pathlib
+import re
 import numpy as np
 import pytest
 import rasterio
+from django.conf import settings
 from django.contrib.gis.geos import Point
 from django.core.files import File
 from django.urls import reverse
@@ -33,7 +36,7 @@ from apps.imagery.models import Image, ImageProcessingRun, TreeDetection
 from apps.notifications.models import Notification, NotificationCategory
 from apps.operations.models import Fertilizer, Harvest
 from apps.reporting.models import ReportDefinition, ReportRun
-from apps.trees.models import Tree
+from apps.trees.models import Tree, TreeCareRecord
 
 # Same synthetic-raster technique as apps/imagery/tests.py (see that file's
 # module docstring for why: real rasterio I/O, not mocked, without needing
@@ -1712,3 +1715,239 @@ def test_ajax_write_actions_still_enforce_scope(client, manager, farm_role_manag
     )
     assert response.status_code == 404  # not in this manager's scoped FarmBlockViewSet queryset at all
     assert FarmBlock.objects.filter(id=other_block.id).exists()
+
+
+# --- Harvest/fertilizer marking: quantity capture + history -------------
+# Reported directly: "current harvest and fertilize only marking the trees
+# giving date without telling how many quantities and there are no history
+# too." MarkTreesHarvestedView/MarkTreesFertilizedView previously only ever
+# stamped a date on the Tree row; TreeCareHistoryView didn't exist at all.
+
+@pytest.fixture
+def tree_b(db, block_a, pic_block):
+    return Tree.objects.create(
+        farm_block=block_a,
+        name="Tree A2",
+        location=Point(101.4415, 0.5315, srid=4326),
+        created_by=pic_block,
+        updated_by=pic_block,
+    )
+
+
+def test_mark_trees_harvested_accepts_a_quantity_per_tree(client, manager, farm_role_manager, block_a, tree_in_block_a, tree_b):
+    """Two trees selected in the same submission, with two different
+    quantities — the whole reason quantity is keyed per tree_id rather than
+    one shared field for the submission.
+    """
+    client.login(username="manager", password="manager12345")
+    response = client.post(
+        reverse("dashboard:trees-mark-harvested", kwargs={"block_id": block_a.id}),
+        {
+            "tree_ids": [str(tree_in_block_a.id), str(tree_b.id)],
+            "date": "2026-01-15",
+            f"quantity_{tree_in_block_a.id}": "8",
+            f"quantity_{tree_b.id}": "11.5",
+        },
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+
+    tree_in_block_a.refresh_from_db()
+    tree_b.refresh_from_db()
+    assert tree_in_block_a.last_harvest_quantity == 8
+    assert tree_b.last_harvest_quantity == 11.5
+
+    record_a = TreeCareRecord.objects.get(tree=tree_in_block_a, kind=TreeCareRecord.KIND_HARVEST)
+    record_b = TreeCareRecord.objects.get(tree=tree_b, kind=TreeCareRecord.KIND_HARVEST)
+    assert record_a.quantity == 8
+    assert record_b.quantity == 11.5
+    assert record_a.recorded_by == manager
+
+
+def test_mark_trees_harvested_without_any_quantity_still_succeeds(client, manager, farm_role_manager, block_a, tree_in_block_a):
+    """Quantity is optional on this path too — a Manager who doesn't know
+    the amount shouldn't be blocked from recording that the work happened."""
+    client.login(username="manager", password="manager12345")
+    response = client.post(
+        reverse("dashboard:trees-mark-harvested", kwargs={"block_id": block_a.id}),
+        {"tree_ids": [str(tree_in_block_a.id)], "date": "2026-01-15"},
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    assert response.status_code == 200
+    tree_in_block_a.refresh_from_db()
+    assert tree_in_block_a.last_harvest_quantity is None
+    assert TreeCareRecord.objects.filter(tree=tree_in_block_a, kind=TreeCareRecord.KIND_HARVEST, quantity__isnull=True).exists()
+
+
+def test_mark_trees_fertilized_quantity_is_independent_of_harvest(client, manager, farm_role_manager, block_a, tree_in_block_a):
+    client.login(username="manager", password="manager12345")
+    response = client.post(
+        reverse("dashboard:trees-mark-fertilized", kwargs={"block_id": block_a.id}),
+        {"tree_ids": [str(tree_in_block_a.id)], "date": "2026-01-15", f"quantity_{tree_in_block_a.id}": "2.25"},
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    assert response.status_code == 200
+    tree_in_block_a.refresh_from_db()
+    assert tree_in_block_a.last_fertilizer_quantity == 2.25
+    assert tree_in_block_a.last_harvest_quantity is None
+    assert TreeCareRecord.objects.filter(tree=tree_in_block_a, kind=TreeCareRecord.KIND_FERTILIZER).count() == 1
+
+
+def test_repeated_dashboard_marking_accumulates_history(client, manager, farm_role_manager, block_a, tree_in_block_a):
+    client.login(username="manager", password="manager12345")
+    for date, qty in [("2026-01-01", "5"), ("2026-01-15", "9")]:
+        client.post(
+            reverse("dashboard:trees-mark-harvested", kwargs={"block_id": block_a.id}),
+            {"tree_ids": [str(tree_in_block_a.id)], "date": date, f"quantity_{tree_in_block_a.id}": qty},
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+    records = list(
+        TreeCareRecord.objects.filter(tree=tree_in_block_a, kind=TreeCareRecord.KIND_HARVEST).order_by("date")
+    )
+    assert [r.quantity for r in records] == [5, 9]
+    tree_in_block_a.refresh_from_db()
+    assert tree_in_block_a.last_harvest_quantity == 9  # most recent wins on the denormalized Tree field
+
+
+def test_tree_care_history_returns_both_kinds_newest_first(client, manager, farm_role_manager, block_a, tree_in_block_a):
+    client.login(username="manager", password="manager12345")
+    TreeCareRecord.objects.create(tree=tree_in_block_a, kind=TreeCareRecord.KIND_HARVEST, date="2026-01-01", quantity=5)
+    TreeCareRecord.objects.create(tree=tree_in_block_a, kind=TreeCareRecord.KIND_FERTILIZER, date="2026-01-10", quantity=None)
+    TreeCareRecord.objects.create(tree=tree_in_block_a, kind=TreeCareRecord.KIND_HARVEST, date="2026-01-20", quantity=12)
+
+    response = client.get(reverse("dashboard:tree-care-history", kwargs={"tree_id": tree_in_block_a.id}))
+    assert response.status_code == 200
+    history = response.json()["history"]
+    assert [h["date"] for h in history] == ["2026-01-20", "2026-01-10", "2026-01-01"]
+    assert history[0]["kind"] == "harvest"
+    assert history[0]["quantity"] == 12
+    assert history[1]["quantity"] is None
+
+
+def test_tree_care_history_empty_when_no_records(client, manager, farm_role_manager, tree_in_block_a):
+    client.login(username="manager", password="manager12345")
+    response = client.get(reverse("dashboard:tree-care-history", kwargs={"tree_id": tree_in_block_a.id}))
+    assert response.status_code == 200
+    assert response.json()["history"] == []
+
+
+def test_unrelated_manager_cannot_view_care_history_outside_their_scope(client, manager, farm_role_manager, tmp_path):
+    other_farm = Farm.objects.create(name="Someone else's farm")
+    other_block = FarmBlock.objects.create(farm=other_farm, name="Not managed")
+    other_tree = Tree.objects.create(farm_block=other_block, name="Other tree", location=Point(0, 0, srid=4326))
+    client.login(username="manager", password="manager12345")
+    response = client.get(reverse("dashboard:tree-care-history", kwargs={"tree_id": other_tree.id}))
+    assert response.status_code == 404
+
+
+def test_mark_trees_ajax_scope_still_enforced_for_the_new_quantity_path(client, manager, farm_role_manager):
+    """Same scoping check as test_ajax_write_actions_still_enforce_scope
+    above, specifically for the quantity-carrying path added to this view —
+    a manager can't mark trees (with or without a quantity) in a block they
+    don't manage.
+    """
+    other_farm = Farm.objects.create(name="Someone else's farm")
+    other_block = FarmBlock.objects.create(farm=other_farm, name="Not managed")
+    other_tree = Tree.objects.create(farm_block=other_block, name="Sneaky tree", location=Point(0, 0, srid=4326))
+    client.login(username="manager", password="manager12345")
+    response = client.post(
+        reverse("dashboard:trees-mark-harvested", kwargs={"block_id": other_block.id}),
+        {"tree_ids": [str(other_tree.id)], "date": "2026-01-15", f"quantity_{other_tree.id}": "99"},
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    assert response.status_code == 404
+    other_tree.refresh_from_db()
+    assert other_tree.last_harvest_quantity is None
+
+
+# --- Vendored front-end assets -------------------------------------------
+# The dashboard's Leaflet/Chart.js/webfont assets are served from this app's
+# own static files rather than a CDN (CLAUDE.md's local-first rule). Nothing
+# else would catch a regression here: if a URL breaks, the Farm Map silently
+# falls back to its "Leaflet failed to load" no-op and renders an empty box,
+# and the page still returns 200.
+
+def _dashboard_static(*parts):
+    return pathlib.Path(settings.BASE_DIR, "apps", "dashboard", "static", "dashboard", *parts)
+
+
+def test_vendored_frontend_assets_exist_on_disk():
+    for rel in [
+        ("vendor", "leaflet", "leaflet.js"),
+        ("vendor", "leaflet", "leaflet.css"),
+        ("vendor", "leaflet", "leaflet.draw.js"),
+        ("vendor", "leaflet", "leaflet.draw.css"),
+        ("vendor", "leaflet", "leaflet.markercluster.js"),
+        ("vendor", "leaflet", "MarkerCluster.css"),
+        ("vendor", "leaflet", "MarkerCluster.Default.css"),
+        ("vendor", "chartjs", "chart.umd.js"),
+        ("fonts", "public-sans-latin.woff2"),
+    ]:
+        path = _dashboard_static(*rel)
+        assert path.exists(), f"missing vendored asset: {path}"
+        assert path.stat().st_size > 0, f"empty vendored asset: {path}"
+
+
+def test_no_dashboard_template_loads_frontend_code_from_a_cdn():
+    """A CDN <script>/<link> makes the map and charts depend on internet
+    reachability, which CLAUDE.md's local-first rule rules out. Prose inside
+    {% comment %} blocks explaining the decision is fine; live tags are not.
+    """
+    template_dir = pathlib.Path(settings.BASE_DIR, "apps", "dashboard", "templates", "dashboard")
+    offenders = []
+    for path in template_dir.rglob("*.html"):
+        for lineno, line in enumerate(path.read_text().splitlines(), 1):
+            stripped = line.strip()
+            if not (stripped.startswith("<script") or stripped.startswith("<link")):
+                continue
+            if "cdnjs.cloudflare.com" in line or "unpkg.com" in line or "fonts.googleapis.com" in line:
+                offenders.append(f"{path.name}:{lineno}")
+    assert not offenders, f"CDN-loaded front-end code found at: {offenders}"
+
+
+def test_every_leaflet_map_container_has_a_height_rule():
+    """A Leaflet container with no CSS height renders at 0px: invisible, and
+    unclickable, so nothing can be placed on it. Worse, it makes Leaflet
+    throw while adding the first vector layer, which aborts the rest of that
+    page's init script and takes the form's other wiring down with it.
+
+    That is exactly what happened to #tree-map and #boundary-map: the
+    stylesheet sized `#dashboard-map`, an id no template has ever used, so
+    the "Add tree" and "Edit boundary" screens were both silently broken
+    while still returning 200. Nothing else catches this — no view test, no
+    template test, and `manage.py check` sees nothing wrong.
+
+    Discovery is deliberately tied to what Leaflet is actually mounted on:
+    the variable handed to `L.map(...)`, resolved back to the id it was
+    read from. That way a renamed container fails here instead of silently
+    losing its height rule again.
+    """
+    template_dir = pathlib.Path(settings.BASE_DIR, "apps", "dashboard", "templates", "dashboard")
+    css = pathlib.Path(
+        settings.BASE_DIR, "apps", "dashboard", "static", "dashboard", "style.css"
+    ).read_text()
+    # Strip /* ... */ comments first. Without this the check passes on the
+    # strength of a comment that merely *mentions* the id — including the
+    # one above this very rule explaining why it exists.
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+
+    mounted = {}
+    for path in template_dir.rglob("*.html"):
+        text = path.read_text()
+        for var in re.findall(r"L\.map\(\s*([A-Za-z_$][\w$]*)", text):
+            match = re.search(
+                rf"\b{re.escape(var)}\s*=\s*document\.getElementById\(\s*[\"']([^\"']+)[\"']",
+                text,
+            )
+            if match:
+                mounted[match.group(1)] = path.name
+
+    assert mounted, "no Leaflet map containers discovered — has the markup changed?"
+
+    missing = sorted(f"#{i} ({f})" for i, f in mounted.items() if f"#{i}" not in css)
+    assert not missing, (
+        "Leaflet map container(s) with no height rule in style.css: "
+        f"{missing}. They render at height 0, and the surrounding page's "
+        "JavaScript breaks when the first layer is added."
+    )

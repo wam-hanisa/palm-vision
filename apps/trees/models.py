@@ -81,6 +81,24 @@ class Tree(gis_models.Model):
         blank=True,
         help_text="Fertilizer counterpart to last_harvested_at above — see that field's help_text.",
     )
+    last_harvest_quantity = models.FloatField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Quantity (bunches) recorded at the same time as last_harvested_at, if the person doing the "
+            "marking captured one — the mark-harvested action has never required a quantity (it's a "
+            "'when was this last serviced' interval tracker, not the yield-reporting pipeline; see "
+            "last_harvested_at's own help_text), so this is nullable and denormalized here rather than a "
+            "join, to keep read paths like TreeSerializer and the offline sync pull free of an extra "
+            "per-tree query — a farm block can hold over a thousand trees (see the 'B4' block in the "
+            "field). The full log of every marking, not just the latest one, lives in TreeCareRecord below."
+        ),
+    )
+    last_fertilizer_quantity = models.FloatField(
+        null=True,
+        blank=True,
+        help_text="Fertilizer counterpart to last_harvest_quantity above — see that field's help_text.",
+    )
     harvest_marked_at = models.DateTimeField(
         null=True,
         blank=True,
@@ -201,3 +219,56 @@ class Tree(gis_models.Model):
         if self.fertilizer_marked_at:
             return self.STAGE_MARKED
         return self.fertilizer_status()
+
+
+class TreeCareRecord(models.Model):
+    """Append-only log of every harvest/fertilizer completion recorded
+    against a tree — one row per "mark harvested"/"mark fertilized" action
+    (apps/trees/views.py TreeViewSet._mark_done, reached from the PWA, and
+    apps/dashboard/views.py's MarkTreesHarvestedView/MarkTreesFertilizedView,
+    the office equivalent), alongside stamping Tree.last_harvested_at/
+    last_fertilized_at (and last_harvest_quantity/last_fertilizer_quantity)
+    themselves.
+
+    Before this model existed, every mark simply overwrote the previous
+    date on the Tree row with no trace of it ever having happened, and
+    captured no quantity at all — reported directly as a UI/UX gap:
+    "current harvest and fertilize only marking the trees giving date
+    without telling how many quantities and there are no history too."
+
+    Deliberately NOT apps.operations.models.Harvest/ActualHarvest/
+    HarvestTree — that pipeline is the compliance/yield-reporting system,
+    gated behind an approved Harvest plan (PlanApprovalService) and is
+    where the authoritative per-tree yield figures for reporting/export
+    belong (docs/03-data-model.md, docs/07-compliance.md). This is the
+    audit trail for the much lighter interval tracker (last_harvested_at's
+    help_text) — quantity here is optional and informal, since not every
+    marking captures one, and it exists so a Manager reviewing a tree can
+    actually see what happened over time instead of only "last done: date."
+    """
+
+    KIND_HARVEST = "harvest"
+    KIND_FERTILIZER = "fertilizer"
+    KIND_CHOICES = [
+        (KIND_HARVEST, "Harvest"),
+        (KIND_FERTILIZER, "Fertilizer"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tree = models.ForeignKey(Tree, on_delete=models.CASCADE, related_name="care_records")
+    kind = models.CharField(max_length=16, choices=KIND_CHOICES)
+    date = models.DateField(help_text="The date the work was done, not necessarily today (a backdated mark is allowed, same as last_harvested_at).")
+    quantity = models.FloatField(
+        null=True,
+        blank=True,
+        help_text="Bunches for a harvest record, kilograms for a fertilizer record. Optional — not every recording captures this.",
+    )
+    recorded_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL)
+    recorded_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-date", "-recorded_at"]
+        indexes = [models.Index(fields=["tree", "kind"])]
+
+    def __str__(self):
+        return f"{self.get_kind_display()} — {self.tree} — {self.date}"

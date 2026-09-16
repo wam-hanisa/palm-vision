@@ -11,7 +11,7 @@ from django.utils import timezone
 from rest_framework import status
 
 from apps.farms.models import FarmBlock
-from apps.trees.models import Tree
+from apps.trees.models import Tree, TreeCareRecord
 
 
 @pytest.mark.django_db
@@ -405,6 +405,85 @@ def test_mark_harvested_response_reflects_new_stage(as_pic_block, tree_in_block_
     response = as_pic_block.post(f"/api/trees/{tree_in_block_a.id}/mark_harvested/", {}, format="json")
     assert response.data["harvest_stage"] == Tree.INTERVAL_OK
     assert response.data["harvest_marked_at"] is None
+
+
+# --- Quantity capture + TreeCareRecord history — reported directly:
+# "current harvest and fertilize only marking the trees giving date
+# without telling how many quantities and there are no history too." ---
+
+@pytest.mark.django_db
+def test_mark_harvested_with_quantity_stores_it_and_creates_a_care_record(as_pic_block, tree_in_block_a):
+    response = as_pic_block.post(
+        f"/api/trees/{tree_in_block_a.id}/mark_harvested/", {"quantity": "12.5"}, format="json"
+    )
+    assert response.status_code == status.HTTP_200_OK
+    assert response.data["last_harvest_quantity"] == 12.5
+
+    tree_in_block_a.refresh_from_db()
+    assert tree_in_block_a.last_harvest_quantity == 12.5
+
+    record = TreeCareRecord.objects.get(tree=tree_in_block_a, kind=TreeCareRecord.KIND_HARVEST)
+    assert record.quantity == 12.5
+    assert record.date == tree_in_block_a.last_harvested_at
+
+
+@pytest.mark.django_db
+def test_mark_harvested_without_quantity_leaves_it_null_but_still_logs_a_record(as_pic_block, tree_in_block_a, pic_block):
+    """Quantity is optional — this completion action has never required
+    one — so omitting it must still succeed and still create a history
+    entry (with quantity=None), not skip logging altogether.
+    """
+    response = as_pic_block.post(f"/api/trees/{tree_in_block_a.id}/mark_harvested/", {}, format="json")
+    assert response.status_code == status.HTTP_200_OK
+    assert response.data["last_harvest_quantity"] is None
+
+    record = TreeCareRecord.objects.get(tree=tree_in_block_a, kind=TreeCareRecord.KIND_HARVEST)
+    assert record.quantity is None
+    assert record.recorded_by == pic_block
+
+
+@pytest.mark.django_db
+def test_mark_harvested_with_unparseable_quantity_is_treated_as_not_provided(as_pic_block, tree_in_block_a):
+    """A garbage quantity value degrades to "no quantity," not a 400 — this
+    is an optional field, not user input worth blocking a real completion
+    over."""
+    response = as_pic_block.post(
+        f"/api/trees/{tree_in_block_a.id}/mark_harvested/", {"quantity": "not-a-number"}, format="json"
+    )
+    assert response.status_code == status.HTTP_200_OK
+    assert response.data["last_harvest_quantity"] is None
+
+
+@pytest.mark.django_db
+def test_mark_fertilized_with_quantity_is_independent_of_harvest_quantity(as_pic_block, tree_in_block_a):
+    response = as_pic_block.post(
+        f"/api/trees/{tree_in_block_a.id}/mark_fertilized/", {"quantity": "3"}, format="json"
+    )
+    assert response.status_code == status.HTTP_200_OK
+    tree_in_block_a.refresh_from_db()
+    assert tree_in_block_a.last_fertilizer_quantity == 3.0
+    assert tree_in_block_a.last_harvest_quantity is None
+    assert TreeCareRecord.objects.filter(tree=tree_in_block_a, kind=TreeCareRecord.KIND_FERTILIZER).count() == 1
+    assert TreeCareRecord.objects.filter(tree=tree_in_block_a, kind=TreeCareRecord.KIND_HARVEST).count() == 0
+
+
+@pytest.mark.django_db
+def test_repeated_marking_accumulates_history_rather_than_overwriting_it(as_pic_block, tree_in_block_a):
+    """The whole point of TreeCareRecord: before it existed, a second
+    marking silently erased any trace of the first. Two completions must
+    leave two rows.
+    """
+    as_pic_block.post(f"/api/trees/{tree_in_block_a.id}/mark_harvested/", {"quantity": "10"}, format="json")
+    as_pic_block.post(f"/api/trees/{tree_in_block_a.id}/mark_harvested/", {"quantity": "14"}, format="json")
+
+    tree_in_block_a.refresh_from_db()
+    assert tree_in_block_a.last_harvest_quantity == 14  # latest value denormalized onto Tree
+
+    records = list(
+        TreeCareRecord.objects.filter(tree=tree_in_block_a, kind=TreeCareRecord.KIND_HARVEST).order_by("recorded_at")
+    )
+    assert len(records) == 2
+    assert [r.quantity for r in records] == [10, 14]
 
 
 # --- sync_tree_health management command — the one-time backfill for the

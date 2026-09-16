@@ -7,7 +7,7 @@
 {% if not runs %}
   <p class="empty-state">No runs yet. Use "Run now" on the report definitions page to start one.</p>
 {% else %}
-  <table class="data-table">
+  <div class="table-scroll"><table class="data-table">
     <thead><tr><th>Started</th><th>Status</th><th>Triggered by</th><th>File</th></tr></thead>
     <tbody>
       {% for run in runs %}
@@ -24,6 +24,6 @@
       </tr>
       {% endfor %}
     </tbody>
-  </table>
+  </table></div>
 {% endif %}
 {% endblock %}

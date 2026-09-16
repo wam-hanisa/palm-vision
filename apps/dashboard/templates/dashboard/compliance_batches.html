@@ -14,7 +14,7 @@
 <section class="panel">
   <h2 class="section-heading">Due-diligence package — batch {{ export_batch_id }}</h2>
   <p class="panel-note">Exported. This block: {{ export_result.farm_block.name }} ({{ export_result.farm_block.area_hectares|default:"—" }} ha).</p>
-  <table class="data-table">
+  <div class="table-scroll"><table class="data-table">
     <tbody>
       <tr><th>Period</th><td>{{ export_result.period_start }} – {{ export_result.period_end }}</td></tr>
       <tr><th>Total quantity</th><td>{{ export_result.total_quantity }}</td></tr>
@@ -32,7 +32,7 @@
         <td>{{ export_result.plot_geometry.properties.requires_geojson_polygon_per_eudr_4ha_rule|yesno:"Yes,No" }}</td></tr>
       <tr><th>Generated at</th><td>{{ export_result.generated_at }}</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p class="panel-note">Risk assessment, supplier, and HS code are not yet collected by this system and are left blank in the filed package.</p>
 </section>
 {% endif %}
@@ -42,7 +42,7 @@
   {% if not batches %}
     <p class="empty-state">No harvest batches yet.</p>
   {% else %}
-    <table class="data-table">
+    <div class="table-scroll"><table class="data-table">
       <thead><tr><th>Block</th><th>Period</th><th>Export status</th><th></th></tr></thead>
       <tbody>
         {% for batch in batches %}
@@ -63,7 +63,7 @@
         </tr>
         {% endfor %}
       </tbody>
-    </table>
+    </table></div>
   {% endif %}
 </section>
 {% endblock %}

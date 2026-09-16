@@ -65,7 +65,7 @@ from apps.operations.views import ActualHarvestViewSet, FertilizerViewSet, Harve
 from apps.reporting.models import ReportRun
 from apps.reporting.tasks import generate_report_task
 from apps.reporting.views import ReportDefinitionViewSet
-from apps.trees.models import Tree
+from apps.trees.models import Tree, TreeCareRecord
 from apps.trees.views import TreeViewSet
 
 from .forms import (
@@ -540,6 +540,9 @@ def _build_farm_map_data(request):
             ),
             "tree_health_history": reverse(
                 "dashboard:tree-health-history", kwargs={"tree_id": _URL_PLACEHOLDER_UUID}
+            ),
+            "tree_care_history": reverse(
+                "dashboard:tree-care-history", kwargs={"tree_id": _URL_PLACEHOLDER_UUID}
             ),
             "farm_map": reverse("dashboard:farms"),
         },
@@ -1161,6 +1164,43 @@ class TreeHealthHistoryView(ManagerOrSuperAdminRequiredMixin, View):
         return JsonResponse({"history": history})
 
 
+class TreeCareHistoryView(ManagerOrSuperAdminRequiredMixin, View):
+    """On-demand per-tree harvest/fertilizer marking history —
+    TreeCareRecord rows (apps/trees/models.py), one per "mark
+    harvested"/"mark fertilized" completion from either surface (the PWA's
+    mark_harvested/mark_fertilized API actions, or this dashboard's own
+    MarkTreesHarvestedView/MarkTreesFertilizedView). Mirrors
+    TreeHealthHistoryView immediately above — same on-demand-fetch shape,
+    same reasoning for not baking this into _build_farm_map_data() (a farm
+    block can hold over a thousand trees; see that view's own docstring).
+
+    Both kinds are returned together, newest first, with `kind` on each
+    entry so the panel can label/group them — a tree's harvest and
+    fertilizer history are usually looked at side by side, unlike health
+    history which has no fertilizer/harvest equivalent to interleave with.
+    """
+
+    def get(self, request, tree_id):
+        tree = get_object_or_404(_viewset_queryset(TreeViewSet, request), id=tree_id)
+        _require_manager_for_farm(request.user, tree.farm_block.farm)
+        records = (
+            TreeCareRecord.objects.filter(tree_id=tree.id)
+            .select_related("recorded_by")
+            .order_by("-date", "-recorded_at")[:20]
+        )
+        history = [
+            {
+                "date": r.date.isoformat(),
+                "kind": r.kind,
+                "kind_display": r.get_kind_display(),
+                "quantity": r.quantity,
+                "recorded_by_name": r.recorded_by.get_full_name() or r.recorded_by.username if r.recorded_by else None,
+            }
+            for r in records
+        ]
+        return JsonResponse({"history": history})
+
+
 class HarvestPlanCreateView(ManagerOrSuperAdminRequiredMixin, TemplateView):
     """Creates a block-level Harvest plan from the Farm Map panel — this is
     the "choosing trees for harvest/field logging" entry point from the
@@ -1385,9 +1425,29 @@ class _MarkTreesView(_MarkTreesActionMixin, ManagerOrSuperAdminRequiredMixin, Vi
     """
 
     date_field = None  # "last_harvested_at" or "last_fertilized_at" — set by subclass
+    quantity_field = None  # "last_harvest_quantity" or "last_fertilizer_quantity" — set by subclass
     marked_at_field = None  # the stage-1 field this completion clears — set by subclass
     marked_by_field = None  # ditto — set by subclass
     verb = None  # "harvested" or "fertilized" — set by subclass
+    kind = None  # TreeCareRecord.KIND_HARVEST or KIND_FERTILIZER — set by subclass
+
+    def _quantity_for(self, request, tree_id):
+        """Reads `quantity_<tree_id>` — one optional field per row in the
+        selection checklist (renderMarkTreesSection() in farm_map.html),
+        not a single value shared across every selected tree. Different
+        trees yield different amounts; a lone quantity field applied to a
+        whole multi-tree selection would either be wrong for most of them
+        or silently encourage typing in a total and calling it per-tree.
+        Blank/missing/unparseable is a normal input for this optional
+        field, not an error — same reasoning as the API path's _mark_done().
+        """
+        raw = request.POST.get(f"quantity_{tree_id}")
+        if raw in (None, ""):
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
 
     def post(self, request, *args, **kwargs):
         block = self._get_block()
@@ -1398,13 +1458,19 @@ class _MarkTreesView(_MarkTreesActionMixin, ManagerOrSuperAdminRequiredMixin, Vi
         marked_date = parse_date(request.POST.get("date") or "") or timezone.localdate()
         count = 0
         for tree in trees:
+            quantity = self._quantity_for(request, tree.id)
             setattr(tree, self.date_field, marked_date)
+            setattr(tree, self.quantity_field, quantity)
             setattr(tree, self.marked_at_field, None)
             setattr(tree, self.marked_by_field, None)
             tree.updated_by = request.user
             tree.save(update_fields=[
-                self.date_field, self.marked_at_field, self.marked_by_field, "updated_by", "updated_at",
+                self.date_field, self.quantity_field, self.marked_at_field, self.marked_by_field,
+                "updated_by", "updated_at",
             ])
+            TreeCareRecord.objects.create(
+                tree=tree, kind=self.kind, date=marked_date, quantity=quantity, recorded_by=request.user,
+            )
             count += 1
 
         message = f"Marked {count} tree{'s' if count != 1 else ''} as {self.verb} ({marked_date.isoformat()})."
@@ -1413,16 +1479,20 @@ class _MarkTreesView(_MarkTreesActionMixin, ManagerOrSuperAdminRequiredMixin, Vi
 
 class MarkTreesHarvestedView(_MarkTreesView):
     date_field = "last_harvested_at"
+    quantity_field = "last_harvest_quantity"
     marked_at_field = "harvest_marked_at"
     marked_by_field = "harvest_marked_by"
     verb = "harvested"
+    kind = TreeCareRecord.KIND_HARVEST
 
 
 class MarkTreesFertilizedView(_MarkTreesView):
     date_field = "last_fertilized_at"
+    quantity_field = "last_fertilizer_quantity"
     marked_at_field = "fertilizer_marked_at"
     marked_by_field = "fertilizer_marked_by"
     verb = "fertilized"
+    kind = TreeCareRecord.KIND_FERTILIZER
 
 
 class NotificationListView(ManagerOrSuperAdminRequiredMixin, TemplateView):

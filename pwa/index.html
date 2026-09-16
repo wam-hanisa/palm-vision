@@ -7,11 +7,15 @@
   <link rel="manifest" href="/manifest.webmanifest">
   <meta name="theme-color" content="#2F4A38">
   <link rel="apple-touch-icon" href="/pwa/icons/icon-192.png">
+  <link rel="icon" href="/pwa/icons/icon-192.png">
+  <!-- Preloaded so the first paint uses Public Sans rather than flashing a
+       system fallback; the file is same-origin and precached by the SW. -->
+  <link rel="preload" href="/pwa/fonts/public-sans-latin.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="/pwa/css/app.css">
 </head>
 <body>
   <div id="app">
-    <div class="screen"><p class="muted">Loading…</p></div>
+    <div class="screen"><div class="loading-state" role="status" aria-live="polite">Loading your blocks…</div></div>
   </div>
 
   <!-- Load order matters: db.js and geo.js have no dependencies; api.js

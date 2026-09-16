@@ -21,7 +21,7 @@
   {% if not baselines %}
     <p class="empty-state">No deforestation baselines recorded yet.</p>
   {% else %}
-    <table class="data-table">
+    <div class="table-scroll"><table class="data-table">
       <thead><tr><th>Block</th><th>Cutoff date</th><th>Source</th><th>Status</th><th>Verified by</th><th>Update status</th></tr></thead>
       <tbody>
         {% for baseline in baselines %}
@@ -50,7 +50,7 @@
         </tr>
         {% endfor %}
       </tbody>
-    </table>
+    </table></div>
   {% endif %}
 </section>
 {% endblock %}

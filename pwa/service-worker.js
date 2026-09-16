@@ -12,7 +12,7 @@
  * whole origin; the fetch handler below is what keeps that safe.
  */
 
-const CACHE_NAME = "palmvision-shell-v1";
+const CACHE_NAME = "palmvision-shell-v2";
 const APP_SHELL = [
   "/field/",
   "/pwa/css/app.css",
@@ -21,6 +21,9 @@ const APP_SHELL = [
   "/pwa/js/sync.js",
   "/pwa/js/geo.js",
   "/pwa/js/app.js",
+  // Vendored webfont — must be precached, or the app falls back to a system
+  // font in exactly the offline case this PWA is built for.
+  "/pwa/fonts/public-sans-latin.woff2",
   "/manifest.webmanifest",
 ];
 
