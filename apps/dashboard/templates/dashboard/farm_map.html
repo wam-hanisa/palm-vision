@@ -1881,9 +1881,19 @@ scripted.
   function quickMarkTreeDone(tree, block, mode, quantity) {
     var cfg = MARK_MODE_CONFIG[mode];
     var formData = new FormData();
-    formData.append("tree_ids", tree.id);
+    // tree_ids/quantities are JSON-encoded, not one POST field per tree —
+    // see submitMarkTrees()'s own comment below for why (this is a
+    // single-tree call, so it wasn't the one that hit the field-count
+    // limit, but the server reads both bulk and single-tree calls through
+    // the same _tree_ids_from_request()/_quantities_from_request(), so
+    // the shape has to match).
+    formData.append("tree_ids", JSON.stringify([tree.id]));
     formData.append("date", new Date().toISOString().slice(0, 10));
-    if (quantity !== undefined && quantity !== "") formData.append("quantity_" + tree.id, quantity);
+    if (quantity !== undefined && quantity !== "") {
+      var quantities = {};
+      quantities[tree.id] = quantity;
+      formData.append("quantities", JSON.stringify(quantities));
+    }
     formData.append("csrfmiddlewaretoken", CSRF_TOKEN);
     postJson(buildUrl(data.urls[cfg.url], block.id), formData).then(function (json) {
       if (json.ok) {
@@ -1906,25 +1916,33 @@ scripted.
     var cfg = MARK_MODE_CONFIG[mode];
     var url = data.urls[cfg.url];
     var formData = new FormData();
+    // Sent as ONE JSON-encoded "tree_ids" field and ONE JSON-encoded
+    // "quantities" field, not one POST field per tree. Reported directly,
+    // with a real reproduction: lasso-selecting roughly half of a
+    // ~1000-tree block for "Record harvest directly" (which also sent a
+    // quantity_<id> field per tree) pushed the total POST field count
+    // past Django's DATA_UPLOAD_MAX_NUMBER_FIELDS (1000) — the whole
+    // request 400'd before the view ever ran, which the frontend could
+    // only report as a generic "couldn't save." See
+    // _tree_ids_from_request()'s docstring in views.py.
+    formData.append("tree_ids", JSON.stringify(treeIds));
+    var quantities = {};
     treeIds.forEach(function (id) {
-      formData.append("tree_ids", id);
-      // One optional quantity field PER tree — see
-      // renderTreeSelectionChecklist()'s own comment for why this isn't a
-      // single shared value. Blank entries are simply omitted; the server
-      // treats a missing quantity_<id> the same as an explicitly blank one.
-      //
-      // Falls back to the bulk-quantity box (state.bulkQuantityValue) for
-      // any tree that never got its own value — reported directly: typing
-      // a number into "Bulk quantity" and submitting straight away,
-      // without first clicking "Apply to all selected," silently dropped
-      // it entirely ("the quantity bunch not shown in anywhere"). The
-      // "Apply" button still exists as a way to pre-fill the visible
-      // per-tree boxes, but the submit itself no longer depends on having
-      // clicked it.
+      // Different trees still yield different amounts — this is a dict,
+      // not a single shared value; see renderTreeSelectionChecklist()'s
+      // own comment. Falls back to the bulk-quantity box
+      // (state.bulkQuantityValue) for any tree that never got its own
+      // value — reported directly: typing a number into "Bulk quantity"
+      // and submitting straight away, without first clicking "Apply to
+      // all selected," silently dropped it entirely ("the quantity bunch
+      // not shown in anywhere"). The "Apply" button still exists as a way
+      // to pre-fill the visible per-tree boxes, but the submit itself no
+      // longer depends on having clicked it.
       var qty = state.selectedTreeQuantities[id];
       if ((qty === undefined || qty === "") && state.bulkQuantityValue) qty = state.bulkQuantityValue;
-      if (qty !== undefined && qty !== "") formData.append("quantity_" + id, qty);
+      if (qty !== undefined && qty !== "") quantities[id] = qty;
     });
+    if (Object.keys(quantities).length) formData.append("quantities", JSON.stringify(quantities));
     if (dateValue) formData.append("date", dateValue);
     formData.append("csrfmiddlewaretoken", CSRF_TOKEN);
     postJson(buildUrl(url, block.id), formData).then(function (json) {

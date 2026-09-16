@@ -1232,23 +1232,46 @@ class BlockCareHistoryView(ManagerOrSuperAdminRequiredMixin, View):
     (see TreeCareRecord's own docstring), so grouping by it here is enough
     to reconstruct "one action" without a separate batch table.
 
-    Pulls a wider raw slice than the old flat cap (400 records, not 50) —
-    several trees now collapse into a single history entry, so the same
-    record budget needs to cover more ground before being capped down to
-    50 *batches*. Both kinds are still returned together and the client
-    filters to the one the open panel cares about, same as before.
+    Two passes, not one capped slice — a single bulk action can now cover
+    however many trees a block actually holds (confirmed directly: a
+    600-tree "Record harvest directly" selection, the exact scale the
+    tree_ids/quantities JSON-payload fix above exists for). A single
+    `[:N]` slice on the raw TreeCareRecord rows would risk cutting off
+    partway through one large batch and silently under-reporting its own
+    tree_count/total_quantity — reproduced exactly that during testing (a
+    600-tree batch showed as "400 trees, 5000 bunches" under the old
+    400-row cap). So: pass 1 walks the ordered rows only far enough to
+    collect the 50 most recent DISTINCT batch_ids (cheap — most batches
+    are a handful of trees), then pass 2 fetches every row belonging to
+    just those batches, however many that turns out to be, so each
+    batch's own totals are always complete.
     """
+
+    HISTORY_BATCH_LIMIT = 50
 
     def get(self, request, block_id):
         block = get_object_or_404(_viewset_queryset(FarmBlockViewSet, request), id=block_id)
         _require_manager_for_farm(request.user, block.farm)
-        records = (
+
+        ordered_batch_ids = (
             TreeCareRecord.objects.filter(tree__farm_block_id=block.id)
+            .order_by("-date", "-recorded_at")
+            .values_list("batch_id", flat=True)
+        )
+        recent_batch_ids = []
+        seen = set()
+        for batch_id in ordered_batch_ids.iterator():
+            if batch_id not in seen:
+                seen.add(batch_id)
+                recent_batch_ids.append(batch_id)
+                if len(recent_batch_ids) >= self.HISTORY_BATCH_LIMIT:
+                    break
+
+        records = (
+            TreeCareRecord.objects.filter(batch_id__in=recent_batch_ids)
             .select_related("recorded_by", "tree")
-            .order_by("-date", "-recorded_at")[:400]
         )
         batches = {}
-        batch_order = []
         for r in records:
             batch = batches.get(r.batch_id)
             if batch is None:
@@ -1264,13 +1287,12 @@ class BlockCareHistoryView(ManagerOrSuperAdminRequiredMixin, View):
                     "quantities": [],
                 }
                 batches[r.batch_id] = batch
-                batch_order.append(r.batch_id)
             batch["tree_ids"].append(str(r.tree_id))
             if r.quantity is not None:
                 batch["quantities"].append(r.quantity)
 
         history = []
-        for batch_id in batch_order[:50]:
+        for batch_id in recent_batch_ids:
             batch = batches[batch_id]
             quantities = batch.pop("quantities")
             batch["tree_count"] = len(batch["tree_ids"])
@@ -1411,10 +1433,30 @@ class _MarkTreesActionMixin:
         return block
 
     def _get_selected_trees(self, request, block):
-        tree_ids = request.POST.getlist("tree_ids")
+        tree_ids = self._tree_ids_from_request(request)
         if not tree_ids:
             return None
         return Tree.objects.filter(id__in=tree_ids, farm_block=block, status=Tree.STATUS_ACTIVE)
+
+    def _tree_ids_from_request(self, request):
+        """Reads the selected tree ids from ONE JSON-encoded `tree_ids`
+        field, not one `tree_ids` POST field per tree. Reported directly,
+        with a real reproduction: lasso-selecting roughly half of a
+        ~1000-tree block ("Record harvest directly," which also sends a
+        `quantity_<id>` field per tree — see the old _quantity_for below)
+        pushed the total POST field count past Django's
+        DATA_UPLOAD_MAX_NUMBER_FIELDS (1000), which fails the WHOLE
+        request with a 400 before this view ever runs — the frontend could
+        only report that as a generic "couldn't save." A single JSON field
+        scales to however many trees a block actually holds, independent
+        of the selection size.
+        """
+        raw = request.POST.get("tree_ids") or "[]"
+        try:
+            parsed = _json.loads(raw)
+        except (TypeError, ValueError):
+            return []
+        return [str(i) for i in parsed] if isinstance(parsed, list) else []
 
     def _no_selection_response(self, request, block):
         message = "Select at least one tree first."
@@ -1527,17 +1569,25 @@ class _MarkTreesView(_MarkTreesActionMixin, ManagerOrSuperAdminRequiredMixin, Vi
     verb = None  # "harvested" or "fertilized" — set by subclass
     kind = None  # TreeCareRecord.KIND_HARVEST or KIND_FERTILIZER — set by subclass
 
-    def _quantity_for(self, request, tree_id):
-        """Reads `quantity_<tree_id>` — one optional field per row in the
-        selection checklist (renderMarkTreesSection() in farm_map.html),
-        not a single value shared across every selected tree. Different
-        trees yield different amounts; a lone quantity field applied to a
-        whole multi-tree selection would either be wrong for most of them
-        or silently encourage typing in a total and calling it per-tree.
-        Blank/missing/unparseable is a normal input for this optional
-        field, not an error — same reasoning as the API path's _mark_done().
+    def _quantities_from_request(self, request):
+        """Reads every tree's optional quantity from ONE JSON-encoded
+        `quantities` field (`{tree_id: value}`), not one `quantity_<id>`
+        field per tree — see _tree_ids_from_request()'s docstring above
+        for why one-field-per-tree doesn't scale to a real block's tree
+        count. Different trees still yield different amounts (this is a
+        dict, not a single shared value); a blank/missing/unparseable
+        entry is a normal input for this optional field, not an error —
+        same reasoning as the API path's _mark_done().
         """
-        raw = request.POST.get(f"quantity_{tree_id}")
+        raw = request.POST.get("quantities") or "{}"
+        try:
+            parsed = _json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _quantity_for(self, quantities, tree_id):
+        raw = quantities.get(str(tree_id))
         if raw in (None, ""):
             return None
         try:
@@ -1552,10 +1602,11 @@ class _MarkTreesView(_MarkTreesActionMixin, ManagerOrSuperAdminRequiredMixin, Vi
             return self._no_selection_response(request, block)
 
         marked_date = parse_date(request.POST.get("date") or "") or timezone.localdate()
+        quantities = self._quantities_from_request(request)
         batch_id = uuid.uuid4()
         count = 0
         for tree in trees:
-            quantity = self._quantity_for(request, tree.id)
+            quantity = self._quantity_for(quantities, tree.id)
             setattr(tree, self.date_field, marked_date)
             setattr(tree, self.quantity_field, quantity)
             setattr(tree, self.marked_at_field, None)

@@ -10,6 +10,7 @@ this aims at for the dashboard specifically: can a Manager sign in, see
 correctly-scoped data, and can a PIC Block user (who has no dashboard
 journey per docs/10-user-journeys.md) not get in at all.
 """
+import json
 import pathlib
 import re
 import uuid
@@ -1744,10 +1745,9 @@ def test_mark_trees_harvested_accepts_a_quantity_per_tree(client, manager, farm_
     response = client.post(
         reverse("dashboard:trees-mark-harvested", kwargs={"block_id": block_a.id}),
         {
-            "tree_ids": [str(tree_in_block_a.id), str(tree_b.id)],
+            "tree_ids": json.dumps([str(tree_in_block_a.id), str(tree_b.id)]),
             "date": "2026-01-15",
-            f"quantity_{tree_in_block_a.id}": "8",
-            f"quantity_{tree_b.id}": "11.5",
+            "quantities": json.dumps({str(tree_in_block_a.id): "8", str(tree_b.id): "11.5"}),
         },
         HTTP_X_REQUESTED_WITH="XMLHttpRequest",
     )
@@ -1772,7 +1772,7 @@ def test_mark_trees_harvested_without_any_quantity_still_succeeds(client, manage
     client.login(username="manager", password="manager12345")
     response = client.post(
         reverse("dashboard:trees-mark-harvested", kwargs={"block_id": block_a.id}),
-        {"tree_ids": [str(tree_in_block_a.id)], "date": "2026-01-15"},
+        {"tree_ids": json.dumps([str(tree_in_block_a.id)]), "date": "2026-01-15"},
         HTTP_X_REQUESTED_WITH="XMLHttpRequest",
     )
     assert response.status_code == 200
@@ -1785,7 +1785,11 @@ def test_mark_trees_fertilized_quantity_is_independent_of_harvest(client, manage
     client.login(username="manager", password="manager12345")
     response = client.post(
         reverse("dashboard:trees-mark-fertilized", kwargs={"block_id": block_a.id}),
-        {"tree_ids": [str(tree_in_block_a.id)], "date": "2026-01-15", f"quantity_{tree_in_block_a.id}": "2.25"},
+        {
+            "tree_ids": json.dumps([str(tree_in_block_a.id)]),
+            "date": "2026-01-15",
+            "quantities": json.dumps({str(tree_in_block_a.id): "2.25"}),
+        },
         HTTP_X_REQUESTED_WITH="XMLHttpRequest",
     )
     assert response.status_code == 200
@@ -1800,7 +1804,11 @@ def test_repeated_dashboard_marking_accumulates_history(client, manager, farm_ro
     for date, qty in [("2026-01-01", "5"), ("2026-01-15", "9")]:
         client.post(
             reverse("dashboard:trees-mark-harvested", kwargs={"block_id": block_a.id}),
-            {"tree_ids": [str(tree_in_block_a.id)], "date": date, f"quantity_{tree_in_block_a.id}": qty},
+            {
+                "tree_ids": json.dumps([str(tree_in_block_a.id)]),
+                "date": date,
+                "quantities": json.dumps({str(tree_in_block_a.id): qty}),
+            },
             HTTP_X_REQUESTED_WITH="XMLHttpRequest",
         )
     records = list(
@@ -1951,7 +1959,7 @@ def test_mark_trees_need_harvest_creates_one_batch_of_needed_care_records(client
     client.login(username="manager", password="manager12345")
     response = client.post(
         reverse("dashboard:trees-mark-need-harvest", kwargs={"block_id": block_a.id}),
-        {"tree_ids": [str(tree_in_block_a.id), str(tree_b.id)]},
+        {"tree_ids": json.dumps([str(tree_in_block_a.id), str(tree_b.id)])},
         HTTP_X_REQUESTED_WITH="XMLHttpRequest",
     )
     assert response.status_code == 200
@@ -1981,7 +1989,11 @@ def test_mark_trees_ajax_scope_still_enforced_for_the_new_quantity_path(client, 
     client.login(username="manager", password="manager12345")
     response = client.post(
         reverse("dashboard:trees-mark-harvested", kwargs={"block_id": other_block.id}),
-        {"tree_ids": [str(other_tree.id)], "date": "2026-01-15", f"quantity_{other_tree.id}": "99"},
+        {
+            "tree_ids": json.dumps([str(other_tree.id)]),
+            "date": "2026-01-15",
+            "quantities": json.dumps({str(other_tree.id): "99"}),
+        },
         HTTP_X_REQUESTED_WITH="XMLHttpRequest",
     )
     assert response.status_code == 404
