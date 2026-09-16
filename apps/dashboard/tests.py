@@ -1841,6 +1841,59 @@ def test_unrelated_manager_cannot_view_care_history_outside_their_scope(client, 
     assert response.status_code == 404
 
 
+# --- Block-wide care history — same TreeCareRecord rows as above, across
+# every tree in the block, backing the new Harvest/Fertilizer section
+# panels (renderBlockSectionPanel() in farm_map.html). ---
+
+def test_block_care_history_spans_every_tree_in_the_block(client, manager, farm_role_manager, block_a, tree_in_block_a, tree_b):
+    client.login(username="manager", password="manager12345")
+    TreeCareRecord.objects.create(tree=tree_in_block_a, kind=TreeCareRecord.KIND_HARVEST, date="2026-01-05", quantity=10)
+    TreeCareRecord.objects.create(tree=tree_b, kind=TreeCareRecord.KIND_HARVEST, date="2026-01-15", quantity=14)
+    TreeCareRecord.objects.create(tree=tree_b, kind=TreeCareRecord.KIND_FERTILIZER, date="2026-01-10", quantity=2)
+
+    response = client.get(reverse("dashboard:block-care-history", kwargs={"block_id": block_a.id}))
+    assert response.status_code == 200
+    history = response.json()["history"]
+    assert [h["date"] for h in history] == ["2026-01-15", "2026-01-10", "2026-01-05"]
+    # newest entry belongs to tree_b's harvest — confirms each row is
+    # correctly labelled with WHICH tree, the whole point of this endpoint
+    assert history[0]["tree_id"] == str(tree_b.id)
+    assert history[0]["tree_name"] == tree_b.name
+    assert history[0]["kind"] == "harvest"
+    assert history[1]["kind"] == "fertilizer"
+
+
+def test_block_care_history_excludes_other_blocks(client, manager, farm_role_manager, block_a, block_b, tree_in_block_a):
+    """A record against a tree in a DIFFERENT block in the same farm must
+    not leak into this block's history — the query filters on
+    tree__farm_block_id, not tree__farm_block__farm_id."""
+    other_block_tree = Tree.objects.create(farm_block=block_b, name="B-block tree", location=Point(101.448, 0.532, srid=4326))
+    TreeCareRecord.objects.create(tree=tree_in_block_a, kind=TreeCareRecord.KIND_HARVEST, date="2026-01-05", quantity=10)
+    TreeCareRecord.objects.create(tree=other_block_tree, kind=TreeCareRecord.KIND_HARVEST, date="2026-01-06", quantity=99)
+
+    client.login(username="manager", password="manager12345")
+    response = client.get(reverse("dashboard:block-care-history", kwargs={"block_id": block_a.id}))
+    assert response.status_code == 200
+    history = response.json()["history"]
+    assert len(history) == 1
+    assert history[0]["quantity"] == 10
+
+
+def test_block_care_history_empty_when_no_records(client, manager, farm_role_manager, block_a):
+    client.login(username="manager", password="manager12345")
+    response = client.get(reverse("dashboard:block-care-history", kwargs={"block_id": block_a.id}))
+    assert response.status_code == 200
+    assert response.json()["history"] == []
+
+
+def test_unrelated_manager_cannot_view_block_care_history_outside_their_scope(client, manager, farm_role_manager):
+    other_farm = Farm.objects.create(name="Someone else's farm")
+    other_block = FarmBlock.objects.create(farm=other_farm, name="Not managed")
+    client.login(username="manager", password="manager12345")
+    response = client.get(reverse("dashboard:block-care-history", kwargs={"block_id": other_block.id}))
+    assert response.status_code == 404
+
+
 def test_mark_trees_ajax_scope_still_enforced_for_the_new_quantity_path(client, manager, farm_role_manager):
     """Same scoping check as test_ajax_write_actions_still_enforce_scope
     above, specifically for the quantity-carrying path added to this view —

@@ -51,6 +51,13 @@
 
 * { box-sizing: border-box; }
 
+/* Chromium/WebKit's default tap-highlight is a translucent blue flash on
+   any clickable element — reported as "the drone image highlights blue
+   when clicked" (the imagery picker's actual .selected state below is
+   --primary green, not blue, so this default was the real cause). Never
+   reset anywhere in this file before. */
+* { -webkit-tap-highlight-color: transparent; }
+
 body {
   margin: 0;
   background: var(--bg);
@@ -636,6 +643,22 @@ a.tag-link:hover {
   border: 1px solid var(--primary);
   border-radius: 4px;
   cursor: pointer;
+}
+
+/* Toggled-on state for a button that represents an active mode rather than
+   a one-shot action — currently just the lasso-select button (farm_map.html)
+   while a drag is armed. Filled + inset, like a pressed toolbar button,
+   distinct from :hover/:focus so "this is on" reads at a glance. Contrast:
+   #FAF8F3 on --primary is the same pairing already used by the sidebar
+   (verified AA elsewhere in this file), so no new contrast check needed. */
+.secondary-button--pressed {
+  background: var(--primary);
+  color: #FAF8F3;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.35);
+}
+
+.secondary-button--pressed:hover {
+  background: var(--primary-hover);
 }
 
 .tag-success {

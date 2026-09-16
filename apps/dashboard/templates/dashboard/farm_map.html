@@ -679,6 +679,15 @@ scripted.
     // left (selectTree()/clearSelection() etc. all call renderPanel(),
     // which is enough since this only matters while that panel is open).
     quickMarkOpenMode: null,
+    // Which drill-down section is open under the current block —
+    // null | "harvest" | "fertilizer". Harvest/Fertilizer used to be
+    // stacked inline in the block panel alongside boundary/imagery/tree
+    // list; reported directly as a wall of content with no room for a
+    // real block-wide history, this gives each its own breadcrumb level
+    // (renderBlockSectionPanel()) reached from a summary row on the block
+    // panel. Reset to null by selectFarm()/selectTree()/clearSelection(),
+    // and by selectBlock() unless a section is explicitly passed in.
+    blockSection: null,
     // Which overlapping image (if any) to display for a given block, keyed
     // by block id — chosen from the block panel's imagery picker (see
     // renderImageryPickerSection()) instead of always stacking every
@@ -832,6 +841,7 @@ scripted.
   function selectFarm(farmId) {
     exitInteractiveModes();
     state.farmId = farmId; state.blockId = null; state.treeId = null;
+    state.blockSection = null;
     state.planningBlockId = null; state.selectionMode = null;
     farmSelect.value = farmId || "";
     repopulateBlockOptions(farmId);
@@ -840,11 +850,16 @@ scripted.
     renderPanel();
   }
 
-  function selectBlock(blockId) {
+  // `section` (optional — "harvest" | "fertilizer") lands directly on that
+  // block's drill-down section instead of the plain block panel; every
+  // existing caller passes just the block id, so section defaults to null
+  // and behaves exactly as before. See renderBlockSectionPanel().
+  function selectBlock(blockId, section) {
     var block = blocksById[blockId];
     if (!block) return;
     exitInteractiveModes();
     state.farmId = block.farm_id; state.blockId = blockId; state.treeId = null;
+    state.blockSection = section || null;
     state.planningBlockId = null; state.selectionMode = null;
     farmSelect.value = state.farmId;
     repopulateBlockOptions(state.farmId);
@@ -858,6 +873,7 @@ scripted.
     if (!tree) return;
     exitInteractiveModes();
     state.farmId = tree.farm_id; state.blockId = tree.block_id; state.treeId = treeId;
+    state.blockSection = null;
     state.planningBlockId = null; state.selectionMode = null;
     state.quickMarkOpenMode = null; // don't carry an open quick-mark form over from a previously viewed tree
     farmSelect.value = state.farmId;
@@ -870,6 +886,7 @@ scripted.
   function clearSelection() {
     exitInteractiveModes();
     state.farmId = null; state.blockId = null; state.treeId = null;
+    state.blockSection = null;
     state.planningBlockId = null; state.selectionMode = null;
     farmSelect.value = "";
     repopulateBlockOptions(null);
@@ -897,7 +914,10 @@ scripted.
     if (focus && focus.type === "tree" && treesById[focus.id]) {
       selectTree(focus.id);
     } else if (focus && focus.type === "block" && blocksById[focus.id]) {
-      selectBlock(focus.id);
+      // `focus.section` (optional) lands on that block's Harvest/Fertilizer
+      // drill-down instead of the plain block panel — see submitMarkTrees()
+      // below, which is the only caller that sets it.
+      selectBlock(focus.id, focus.section);
       if (focus.then === "boundary") startBoundaryEdit(blocksById[focus.id]);
     } else if (focus && focus.type === "farm" && farmsById[focus.id]) {
       selectFarm(focus.id);
@@ -982,7 +1002,16 @@ scripted.
         if (json.ok) {
           exitInteractiveModes();
           showFlash(json.message, "success");
-          refreshData(json.farm_map_data, json.focus);
+          // opts.focusSection (set by startHarvestPlanForm/
+          // startFertilizerPlanForm below) lands back on the Harvest/
+          // Fertilizer section this form was opened from, not the plain
+          // block panel — every other form leaves it unset and behaves
+          // exactly as before.
+          var focus = json.focus;
+          if (opts.focusSection && focus && focus.type === "block") {
+            focus = Object.assign({}, focus, { section: opts.focusSection });
+          }
+          refreshData(json.farm_map_data, focus);
         } else {
           showFlash(json.message, "error");
           rerender(json.html);
@@ -1313,7 +1342,10 @@ scripted.
   function startHarvestPlanForm(block) {
     exitInteractiveModes();
     getJson(buildUrl(data.urls.harvest_plan_add, block.id)).then(function (json) {
-      openForm("Add harvest plan", blockBreadcrumb(block), json.html, { onCancel: function () { selectBlock(block.id); } });
+      openForm("Add harvest plan", blockBreadcrumb(block), json.html, {
+        onCancel: function () { selectBlock(block.id, "harvest"); },
+        focusSection: "harvest",
+      });
     });
   }
 
@@ -1327,7 +1359,10 @@ scripted.
   function startFertilizerPlanForm(block) {
     exitInteractiveModes();
     getJson(buildUrl(data.urls.fertilizer_plan_add, block.id)).then(function (json) {
-      openForm("Add fertilizer plan", blockBreadcrumb(block), json.html, { onCancel: function () { selectBlock(block.id); } });
+      openForm("Add fertilizer plan", blockBreadcrumb(block), json.html, {
+        onCancel: function () { selectBlock(block.id, "fertilizer"); },
+        focusSection: "fertilizer",
+      });
     });
   }
 
@@ -1683,9 +1718,18 @@ scripted.
       actionButton(
         lassoing ? "Drag on the map… (click to cancel)" : "Lasso select on map",
         function () {
+          // Reported directly: clicking this button did nothing visible —
+          // startLassoSelect() below only wires up map listeners and never
+          // re-rendered the panel itself, so neither the label nor (now)
+          // the pressed state ever appeared on the first click; only a
+          // completed drag (applyLassoSelection(), which does re-render)
+          // ever showed it, and even then already back in the "off" state.
           if (lassoing) { exitInteractiveModes(); renderPanel(); }
-          else startLassoSelect(block.id);
-        }
+          else { startLassoSelect(block.id); renderPanel(); }
+        },
+        // secondary-button--pressed (style.css) dims/insets it while
+        // active, same idea as a toggled toolbar button elsewhere.
+        lassoing ? "secondary-button secondary-button--pressed" : "secondary-button"
       ),
       actionButton("Select all", function () {
         trees.forEach(function (t) { state.selectedTreeIds[t.id] = true; });
@@ -1845,7 +1889,11 @@ scripted.
       if (json.ok) {
         state.quickMarkOpenMode = null;
         showFlash(json.message, "success");
-        refreshData(json.farm_map_data, json.focus);
+        // Confirmed directly: stay on this tree's own detail page rather
+        // than following the server's default block-level focus — this is
+        // a one-tree shortcut fired FROM the tree detail panel, so bouncing
+        // away from it on save would be jarring.
+        refreshData(json.farm_map_data, { type: "tree", id: tree.id });
       } else {
         showFlash(json.message || "Couldn't save that.", "error");
       }
@@ -1878,7 +1926,16 @@ scripted.
         state.selectedTreeQuantities = {};
         state.bulkQuantityValue = "";
         showFlash(json.message, "success");
-        refreshData(json.farm_map_data, json.focus);
+        // Land back on the Harvest/Fertilizer section this action was
+        // started from, not the plain block panel — see applyFocus()'s
+        // handling of focus.section.
+        var focus = json.focus;
+        if (focus && focus.type === "block") {
+          focus = Object.assign({}, focus, {
+            section: HARVEST_SELECTION_MODES.indexOf(mode) !== -1 ? "harvest" : "fertilizer",
+          });
+        }
+        refreshData(json.farm_map_data, focus);
       } else {
         showFlash(json.message || "Couldn't save that.", "error");
       }
@@ -1939,6 +1996,177 @@ scripted.
     panelEl.appendChild(list);
   }
 
+  // Mode strings that belong to each drill-down section — used both to
+  // decide which tree-selection flow (if any) is currently active for a
+  // section, and nowhere else, so this stays a small lookup rather than a
+  // third parallel copy of MARK_MODE_CONFIG's own kind/noun mapping.
+  var HARVEST_SELECTION_MODES = ["harvest_plan", "mark_need_harvest", "mark_harvested"];
+  var FERTILIZER_SELECTION_MODES = ["mark_need_fertilize", "mark_fertilized"];
+
+  // One clickable row per section on the main block panel — "how's
+  // harvest doing on this block" at a glance (a pending-count teaser, and
+  // for harvest, the most recent yield date) without opening the section.
+  // Clicking navigates into renderBlockSectionPanel() via selectBlock()'s
+  // optional second argument.
+  function sectionSummaryRow(block, kind) {
+    var isHarvest = kind === "harvest";
+    var stageField = isHarvest ? "harvest_stage" : "fertilizer_stage";
+    var pendingCount = (treesByBlock[block.id] || []).filter(function (t) { return t[stageField] === "marked"; }).length;
+    var metaBits = [];
+    if (pendingCount) metaBits.push(pendingCount + " need" + (pendingCount === 1 ? "s" : "") + " " + kind);
+    if (isHarvest && block.recent_yield && block.recent_yield.length) {
+      metaBits.push("last recorded " + new Date(block.recent_yield[0].date).toLocaleDateString());
+    }
+    var btn = el("button", { type: "button", class: "panel-list-button" }, [
+      el("span", { text: isHarvest ? "Harvest" : "Fertilizer" }),
+      // "Nothing pending" rather than "no activity" — this row only knows
+      // about pending count and recent_yield (already in data.blocks), not
+      // completed TreeCareRecord markings (that's the full, block-wide
+      // history behind an on-demand fetch, see renderBlockCareHistory()),
+      // so it must not claim there's no history when there could well be.
+      el("span", { class: "panel-list-meta", text: metaBits.join(" · ") || "Nothing pending right now" }),
+    ]);
+    btn.addEventListener("click", function () { selectBlock(block.id, kind); });
+    return btn;
+  }
+
+  // The Harvest/Fertilizer drill-down itself — reached from
+  // sectionSummaryRow() above. Shows, in order: whichever tree-selection
+  // flow is active for this block+section (unchanged content, just
+  // relocated from the old inline block-panel layout), or — the default
+  // view — the three action buttons, which trees are currently marked as
+  // needing this (click one to open its own detail page), the block's
+  // yield history (harvest only — no fertilizer-application equivalent
+  // exists yet, see _recent_yield_by_block()'s own docstring), and the
+  // block-wide marking history (renderBlockCareHistory() below).
+  function renderBlockSectionPanel(kind) {
+    var block = blocksById[state.blockId];
+    var farm = farmsById[state.farmId];
+    var isHarvest = kind === "harvest";
+    var sectionLabel = isHarvest ? "Harvest" : "Fertilizer";
+    panelEl.innerHTML = "";
+    panelEl.appendChild(breadcrumb([
+      { label: "All farms", onClick: clearSelection },
+      { label: farm ? farm.name : "Farm", onClick: function () { selectFarm(state.farmId); } },
+      { label: block ? block.name : "Block", onClick: function () { selectBlock(state.blockId); } },
+    ]));
+    panelEl.appendChild(el("h2", { class: "panel-heading", text: sectionLabel }));
+
+    var relevantModes = isHarvest ? HARVEST_SELECTION_MODES : FERTILIZER_SELECTION_MODES;
+    var inSelectionFlow = state.planningBlockId === block.id && relevantModes.indexOf(state.selectionMode) !== -1;
+
+    if (inSelectionFlow && state.selectionMode === "harvest_plan") {
+      renderHarvestPlanningSection(block);
+    } else if (inSelectionFlow) {
+      renderMarkTreesSection(block, state.selectionMode);
+    } else {
+      if (isHarvest) {
+        panelEl.appendChild(el("div", { class: "panel-actions" }, [
+          actionButton("Plan harvest — select trees", function () { startTreeSelection(block.id, "harvest_plan"); }, "primary-button-small"),
+          actionButton("Mark trees needing harvest", function () { startTreeSelection(block.id, "mark_need_harvest"); }),
+          actionButton("Record harvest directly", function () { startTreeSelection(block.id, "mark_harvested"); }),
+        ]));
+      } else {
+        panelEl.appendChild(el("div", { class: "panel-actions" }, [
+          actionButton("Plan fertilizer application", function () { startFertilizerPlanForm(block); }, "primary-button-small"),
+          actionButton("Mark trees needing fertilizer", function () { startTreeSelection(block.id, "mark_need_fertilize"); }),
+          actionButton("Record fertilizer directly", function () { startTreeSelection(block.id, "mark_fertilized"); }),
+        ]));
+      }
+
+      // Needs-action list — trees currently carrying the stage-1 flag
+      // (Tree.harvest_marked_at's help_text), not yet completed. A plain
+      // client-side filter over data already in `data.trees` — unlike the
+      // marking history below, nothing here reaches further back than
+      // what's already on the Tree record, so no extra endpoint is needed.
+      var stageField = isHarvest ? "harvest_stage" : "fertilizer_stage";
+      var markedAtField = isHarvest ? "harvest_marked_at" : "fertilizer_marked_at";
+      var pendingTrees = (treesByBlock[block.id] || []).filter(function (t) { return t[stageField] === "marked"; });
+      panelEl.appendChild(el("p", { class: "panel-subheading", text: "Needs " + kind, style: "margin-top:14px;" }));
+      if (!pendingTrees.length) {
+        panelEl.appendChild(el("p", { class: "panel-empty", text: "No trees currently marked as needing " + kind + "." }));
+      } else {
+        var pendingList = el("ul", { class: "panel-list" });
+        pendingTrees.forEach(function (tree) {
+          var assignedWhen = tree[markedAtField] ? new Date(tree[markedAtField]).toLocaleDateString() : "recently";
+          var btn = el("button", { type: "button", class: "panel-list-button" }, [
+            el("span", { text: tree.name }),
+            el("span", { class: "panel-list-meta", text: "assigned " + assignedWhen }),
+          ]);
+          // Confirmed directly: clicking a pending tree opens its own
+          // detail page (full context — edit, health history, the
+          // quick-mark-done shortcut — rather than acting on it inline
+          // here and duplicating that UI).
+          btn.addEventListener("click", function () { selectTree(tree.id); });
+          pendingList.appendChild(el("li", {}, [btn]));
+        });
+        panelEl.appendChild(pendingList);
+      }
+
+      // Yield history — moved here unchanged from the old inline block
+      // panel layout; harvest only, see this function's own docstring for
+      // why fertilizer has no equivalent.
+      if (isHarvest) {
+        panelEl.appendChild(el("p", { class: "panel-subheading", text: "Yield history", style: "margin-top:14px;" }));
+        if (block.recent_yield && block.recent_yield.length) {
+          var yieldList = el("ul", { class: "panel-list" });
+          block.recent_yield.forEach(function (entry) {
+            yieldList.appendChild(el("li", { class: "panel-list-button" }, [
+              el("span", { text: new Date(entry.date).toLocaleDateString() }),
+              el("span", { class: "panel-list-meta", text: "Qty " + entry.quantity }),
+            ]));
+          });
+          panelEl.appendChild(yieldList);
+        } else {
+          panelEl.appendChild(el("p", { class: "panel-empty", text: "No harvest yield recorded for this block yet." }));
+        }
+      }
+    }
+
+    renderBlockCareHistory(block.id, kind);
+  }
+
+  // On-demand block-wide marking history — TreeCareRecord rows across
+  // every tree in the block, backing renderBlockSectionPanel() above. Same
+  // fetch-after-render shape as renderTreeCareHistory()/
+  // renderTreeHealthHistory() further down, and the same reasoning for not
+  // baking it into _build_farm_map_data() (see BlockCareHistoryView's own
+  // docstring in views.py). Both kinds come back from the one endpoint;
+  // filtered here to just the one this panel is showing.
+  function renderBlockCareHistory(blockId, kind) {
+    var heading = (kind === "harvest" ? "Harvest" : "Fertilizer") + " marking history";
+    var container = el("div", {}, [
+      el("h2", { class: "panel-heading", text: heading, style: "margin-top:20px;" }),
+      el("p", { class: "panel-empty", text: "Loading…" }),
+    ]);
+    panelEl.appendChild(container);
+    getJson(buildUrl(data.urls.block_care_history, blockId)).then(function (json) {
+      if (state.blockId !== blockId || state.blockSection !== kind) return; // navigated away before this resolved
+      container.innerHTML = "";
+      container.appendChild(el("h2", { class: "panel-heading", text: heading, style: "margin-top:20px;" }));
+      var entries = (json.history || []).filter(function (h) { return h.kind === kind; });
+      if (!entries.length) {
+        container.appendChild(el("p", { class: "panel-empty", text: "No " + kind + " completions recorded yet for this block." }));
+        return;
+      }
+      var unit = kind === "harvest" ? "bunches" : "kg";
+      var list = el("ul", { class: "panel-list" });
+      entries.forEach(function (entry) {
+        var qtyText = entry.quantity === null || entry.quantity === undefined
+          ? "no quantity recorded"
+          : entry.quantity + " " + unit;
+        var meta = qtyText + (entry.recorded_by_name ? " · " + entry.recorded_by_name : "");
+        var btn = el("button", { type: "button", class: "panel-list-button" }, [
+          el("span", { text: new Date(entry.date + "T00:00:00").toLocaleDateString() + " — " + entry.tree_name }),
+          el("span", { class: "panel-list-meta", text: meta }),
+        ]);
+        btn.addEventListener("click", function () { selectTree(entry.tree_id); });
+        list.appendChild(el("li", {}, [btn]));
+      });
+      container.appendChild(list);
+    });
+  }
+
   function renderBlockDetailPanel() {
     var block = blocksById[state.blockId];
     var farm = farmsById[state.farmId];
@@ -1960,24 +2188,20 @@ scripted.
 
     renderImageryPickerSection(block);
 
-    // Yield history — surfaces ActualHarvest rows that were already being
-    // recorded by the harvest-logging pipeline (apps/operations/models.py)
-    // but had no dashboard visibility until now; see
-    // _recent_yield_by_block() in views.py. Read-only, bounded to the 10
-    // most recent per block.
-    panelEl.appendChild(el("p", { class: "panel-subheading", text: "Yield history", style: "margin-top:14px;" }));
-    if (block.recent_yield && block.recent_yield.length) {
-      var yieldList = el("ul", { class: "panel-list" });
-      block.recent_yield.forEach(function (entry) {
-        yieldList.appendChild(el("li", { class: "panel-list-button" }, [
-          el("span", { text: new Date(entry.date).toLocaleDateString() }),
-          el("span", { class: "panel-list-meta", text: "Qty " + entry.quantity }),
-        ]));
-      });
-      panelEl.appendChild(yieldList);
-    } else {
-      panelEl.appendChild(el("p", { class: "panel-empty", text: "No harvest yield recorded for this block yet." }));
-    }
+    // Harvest/Fertilizer used to be stacked inline here — heading, three
+    // buttons, heading, three buttons — right below a "Yield history" list,
+    // making this panel a long wall mixing boundary/imagery/yield/marking
+    // all together, with no room for a real history of WHICH trees had
+    // been harvested/fertilized (that only existed per-tree, one click
+    // away from being lost track of). Reported directly. Each now gets its
+    // own drill-down level (renderBlockSectionPanel()) — this is just a
+    // one-line summary row linking into it, so "how's harvest doing on
+    // this block" is still answerable at a glance without opening it.
+    panelEl.appendChild(el("p", { class: "panel-subheading", text: "Harvest & Fertilizer", style: "margin-top:14px;" }));
+    panelEl.appendChild(el("ul", { class: "panel-list" }, [
+      el("li", {}, [sectionSummaryRow(block, "harvest")]),
+      el("li", {}, [sectionSummaryRow(block, "fertilizer")]),
+    ]));
 
     panelEl.appendChild(el("div", { class: "panel-actions" }, [
       actionButton(block.has_boundary ? "Edit boundary" : "Draw boundary", function () { startBoundaryEdit(block); }, "primary-button-small"),
@@ -1985,25 +2209,6 @@ scripted.
       el("a", { href: buildUrl(data.urls.imagery_block, block.id), class: "secondary-button", text: "Imagery" }),
       actionButton("Delete block", function () { startBlockDelete(block); }),
     ]));
-
-    if (state.planningBlockId === block.id && state.selectionMode === "harvest_plan") {
-      renderHarvestPlanningSection(block);
-    } else if (state.planningBlockId === block.id && state.selectionMode) {
-      renderMarkTreesSection(block, state.selectionMode);
-    } else {
-      panelEl.appendChild(el("p", { class: "panel-subheading", text: "Harvest", style: "margin-top:14px;" }));
-      panelEl.appendChild(el("div", { class: "panel-actions" }, [
-        actionButton("Plan harvest — select trees", function () { startTreeSelection(block.id, "harvest_plan"); }, "primary-button-small"),
-        actionButton("Mark trees needing harvest", function () { startTreeSelection(block.id, "mark_need_harvest"); }),
-        actionButton("Record harvest directly", function () { startTreeSelection(block.id, "mark_harvested"); }),
-      ]));
-      panelEl.appendChild(el("p", { class: "panel-subheading", text: "Fertilizer", style: "margin-top:14px;" }));
-      panelEl.appendChild(el("div", { class: "panel-actions" }, [
-        actionButton("Plan fertilizer application", function () { startFertilizerPlanForm(block); }, "primary-button-small"),
-        actionButton("Mark trees needing fertilizer", function () { startTreeSelection(block.id, "mark_need_fertilize"); }),
-        actionButton("Record fertilizer directly", function () { startTreeSelection(block.id, "mark_fertilized"); }),
-      ]));
-    }
 
     // <details>/<summary> instead of always-expanded — a block with a real
     // farm's worth of trees (dozens to hundreds, per the cluster counts on
@@ -2184,6 +2389,7 @@ scripted.
 
   function renderPanel() {
     if (state.treeId) renderTreeDetailPanel();
+    else if (state.blockId && state.blockSection) renderBlockSectionPanel(state.blockSection);
     else if (state.blockId) renderBlockDetailPanel();
     else if (state.farmId) renderFarmDetailPanel();
     else renderFarmListPanel();

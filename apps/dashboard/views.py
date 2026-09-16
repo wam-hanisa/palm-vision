@@ -544,6 +544,9 @@ def _build_farm_map_data(request):
             "tree_care_history": reverse(
                 "dashboard:tree-care-history", kwargs={"tree_id": _URL_PLACEHOLDER_UUID}
             ),
+            "block_care_history": reverse(
+                "dashboard:block-care-history", kwargs={"block_id": _URL_PLACEHOLDER_UUID}
+            ),
             "farm_map": reverse("dashboard:farms"),
         },
         "url_placeholder": _URL_PLACEHOLDER_UUID,
@@ -1194,6 +1197,46 @@ class TreeCareHistoryView(ManagerOrSuperAdminRequiredMixin, View):
                 "kind": r.kind,
                 "kind_display": r.get_kind_display(),
                 "quantity": r.quantity,
+                "recorded_by_name": r.recorded_by.get_full_name() or r.recorded_by.username if r.recorded_by else None,
+            }
+            for r in records
+        ]
+        return JsonResponse({"history": history})
+
+
+class BlockCareHistoryView(ManagerOrSuperAdminRequiredMixin, View):
+    """Block-wide harvest/fertilizer marking history — the same
+    TreeCareRecord rows TreeCareHistoryView above returns for one tree, but
+    across every tree in the block, each entry labelled with which tree it
+    belongs to. Backs the Harvest/Fertilizer section panels
+    (farm_map.html's renderBlockSectionPanel()) — reported directly that
+    reviewing "which trees have been harvested/fertilized" for a block
+    meant opening every tree individually to piece it together, since the
+    only history view was tree-scoped.
+
+    Both kinds are returned together (like TreeCareHistoryView), and the
+    client filters to the one the open panel cares about — a block's
+    harvest and fertilizer records both fit comfortably under the [:50]
+    cap below, so a second near-identical endpoint wasn't worth it just to
+    split them server-side.
+    """
+
+    def get(self, request, block_id):
+        block = get_object_or_404(_viewset_queryset(FarmBlockViewSet, request), id=block_id)
+        _require_manager_for_farm(request.user, block.farm)
+        records = (
+            TreeCareRecord.objects.filter(tree__farm_block_id=block.id)
+            .select_related("recorded_by", "tree")
+            .order_by("-date", "-recorded_at")[:50]
+        )
+        history = [
+            {
+                "date": r.date.isoformat(),
+                "kind": r.kind,
+                "kind_display": r.get_kind_display(),
+                "quantity": r.quantity,
+                "tree_id": str(r.tree_id),
+                "tree_name": r.tree.name or str(r.tree_id)[:8],
                 "recorded_by_name": r.recorded_by.get_full_name() or r.recorded_by.username if r.recorded_by else None,
             }
             for r in records
