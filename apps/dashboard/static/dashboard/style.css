@@ -985,6 +985,27 @@ body.farm-map-fullpage .flash {
   cursor: crosshair;
 }
 
+/* Tree cluster marker (buildLayers()'s iconCreateFunction in farm_map.html)
+   — a plain dot, no count label. Reported directly, with a screenshot: the
+   vendored Leaflet.markercluster default (a numbered circle in a pale
+   yellow-green fill, MarkerCluster.Default.css, no longer loaded at all)
+   read as noise and nearly disappeared against a real green plantation
+   canopy photo. A solid dark fill with a light ring reads clearly against
+   green foliage from any angle — same flat, no-shadow treatment as every
+   other marker on this map. */
+.tree-cluster-dot {
+  width: 24px;
+  height: 24px;
+}
+.tree-cluster-dot div {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  background: var(--text);
+  border: 2px solid var(--bg);
+  box-sizing: border-box;
+}
+
 /* The floating toolbar + drill-down panel card — top-left, like Google
    Maps' own search+results panel. bottom:16px (not a fixed height) so it
    naturally fills the available vertical space and lets .farm-map-panel's
