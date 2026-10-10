@@ -5,12 +5,26 @@
 {% if not notifications %}
   <p class="empty-state">No notifications yet.</p>
 {% endif %}
+{% if unread_count %}
+<form method="post" class="inline-form" style="margin-bottom:16px;">
+  {% csrf_token %}
+  <button type="submit" class="secondary-button">Mark all as read ({{ unread_count }})</button>
+</form>
+{% endif %}
 <ul class="notification-list">
   {% for note in notifications %}
   <li class="notification-item{% if not note.read %} notification-unread{% endif %}">
-    <div class="notification-title">{{ note.title }}</div>
+    {# Only dashboard links are rendered: notifications created before links were moved off the raw API still point at /api/ JSON. #}
+    <div class="notification-title">{% if note.link|slice:":11" == "/dashboard/" %}<a href="{{ note.link }}">{{ note.title }}</a>{% else %}{{ note.title }}{% endif %}</div>
     <div class="notification-message">{{ note.message }}</div>
-    <div class="notification-meta">{{ note.get_category_display }} · {{ note.created_at }}</div>
+    <div class="notification-meta">{{ note.get_category_display }} · {{ note.created_at|date:"j M Y, H:i" }}</div>
+    {% if not note.read %}
+    <form method="post" class="inline-form">
+      {% csrf_token %}
+      <input type="hidden" name="notification_id" value="{{ note.id }}">
+      <button type="submit" class="link-button">Mark as read</button>
+    </form>
+    {% endif %}
   </li>
   {% endfor %}
 </ul>

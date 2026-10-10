@@ -87,7 +87,7 @@
              views, URLs, data) is untouched and still directly reachable
              by URL — this is a navigation-only hide, not a deletion. -->
         <a href="{% url 'dashboard:reports' %}" class="nav-link{% if request.resolver_match.url_name == 'reports' or request.resolver_match.url_name == 'report-runs' %} active{% endif %}"><svg class="nav-icon"><use href="#icon-reports"></use></svg>Reports</a>
-        <a href="{% url 'dashboard:notifications' %}" class="nav-link{% if request.resolver_match.url_name == 'notifications' %} active{% endif %}"><svg class="nav-icon"><use href="#icon-notifications"></use></svg>Notifications</a>
+        <a href="{% url 'dashboard:notifications' %}" class="nav-link{% if request.resolver_match.url_name == 'notifications' %} active{% endif %}"><svg class="nav-icon"><use href="#icon-notifications"></use></svg>Notifications{% if nav_unread_count %}<span class="nav-badge" aria-label="{{ nav_unread_count }} unread">{{ nav_unread_count }}</span>{% endif %}</a>
       </nav>
       <div class="sidebar-footer">
         <div class="user-chip">{{ user.get_full_name|default:user.username }}</div>

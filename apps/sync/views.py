@@ -12,6 +12,7 @@ same code — duplicating the Q-filter logic here would be exactly the kind
 of drift risk that caused the cross-scope bug fixed in
 apps/common/mixins.py (see that file's docstring).
 """
+from django.db.models import Q
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from rest_framework.exceptions import ValidationError
@@ -19,6 +20,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.common.scoping import managed_farm_ids
 from apps.farms.serializers import FarmBlockSerializer, FarmSerializer
 from apps.farms.views import FarmBlockViewSet, FarmViewSet
 from apps.operations.serializers import (
@@ -40,7 +42,7 @@ from apps.operations.views import (
 from apps.trees.serializers import TreeSerializer
 from apps.trees.views import TreeViewSet
 
-from .models import SyncCheckIn
+from .models import SyncCheckIn, SyncTombstone
 
 
 def _scoped_queryset(viewset_cls, request):
@@ -53,6 +55,26 @@ def _scoped_queryset(viewset_cls, request):
     viewset.kwargs = {}
     viewset.format_kwarg = None
     return viewset.get_queryset()
+
+
+def _scoped_tombstones(user, since):
+    """Deletions of any of the 8 client-cached resources (see
+    pwa/js/sync.js's SYNC_KEY_TO_STORE — "farms" is deliberately never
+    cached there, so its tombstones would have nothing to reconcile and
+    aren't queried at all) that this user was scoped to see, since `since`.
+
+    Mirrors apps/common/scoping.py's scoped_to_user_blocks() rule (pic OR
+    a farm they manage) against the snapshot fields SyncTombstone captured
+    at delete time (apps/sync/signals.py) rather than a live FK chain,
+    since the real row is gone by the time this runs.
+    """
+    qs = SyncTombstone.objects.filter(deleted_at__gt=since).exclude(resource="farms")
+    if not user.is_superuser:
+        qs = qs.filter(Q(pic_user_id=user.id) | Q(farm_id__in=managed_farm_ids(user)))
+    return [
+        {"resource": t.resource, "object_id": str(t.object_id), "deleted_at": t.deleted_at.isoformat()}
+        for t in qs
+    ]
 
 
 # (viewset, serializer, response key, field to filter "changed since" on).
@@ -87,6 +109,15 @@ class SyncPullView(APIView):
     (clock skew) or taken as "the latest updated_at seen in this response"
     (a record that changes concurrently, between this request's queries,
     would then be silently skipped forever instead of appearing next pull).
+
+    `tombstones` — added after a real gap was reported ("in pwa log
+    harvest previous harvest plan are still showing"): a hard-deleted
+    Harvest/Fertilizer/etc. row simply stops appearing in the per-resource
+    lists above, but nothing ever told a client that had already synced it
+    to remove its own copy. Omitted entirely on the initial full pull
+    (`since` absent) — there's nothing to reconcile on a from-scratch
+    cache, only on an incremental one. See SyncTombstone's own docstring
+    (apps/sync/models.py) for how these get created.
     """
 
     permission_classes = [IsAuthenticated]
@@ -109,6 +140,8 @@ class SyncPullView(APIView):
             if since is not None:
                 queryset = queryset.filter(**{f"{ts_field}__gt": since})
             payload[key] = serializer_cls(queryset, many=True, context={"request": request}).data
+
+        payload["tombstones"] = _scoped_tombstones(request.user, since) if since is not None else []
 
         return Response(payload)
 

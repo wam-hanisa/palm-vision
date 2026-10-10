@@ -29,3 +29,49 @@ class SyncCheckIn(models.Model):
 
     def __str__(self):
         return f"{self.user} / {self.device_id} — {self.pending_count} pending"
+
+
+class SyncTombstone(models.Model):
+    """Records a hard delete of an offline-synced resource, so a PWA client
+    that already cached it can find out and remove its own copy.
+
+    Before this model existed, SyncPullView's per-resource queries
+    (`filter(updated_at__gt=since)`, etc.) had no way to represent "this
+    row is gone" — a deleted Harvest/Fertilizer/etc. simply stopped
+    appearing in future pulls, but nothing ever told a client that had
+    already synced it to remove its own copy, so it lingered in that
+    device's IndexedDB forever. Reported directly: "in pwa log harvest
+    previous harvest plan are still showing."
+
+    `resource` matches a key in apps/sync/views.py's _SYNC_RESOURCES (e.g.
+    "harvests") so the client knows which IndexedDB store to remove
+    `object_id` from — see pwa/js/sync.js's pullChanges(). `farm_id`/
+    `pic_user_id` are a snapshot of the deleted row's own farm_block
+    scoping (its block's farm and pic — see apps/common/scoping.py's
+    scoped_to_user_blocks(), the same rule every live queryset already
+    uses), captured at delete time by apps/sync/signals.py's pre_delete
+    receivers: by the time a tombstone is being recorded the real row (and
+    its live FK chain) may already be gone, so scoping has to be captured
+    up front rather than computed on read like every other resource.
+
+    No expiry/pruning yet — same "known limit, not hidden" tradeoff
+    documented on apps/dashboard/views.py's _recent_yield_by_block(): a
+    farm running for years would eventually want old tombstones pruned
+    once every device has long since synced past them, but that's not
+    needed to close the gap this model exists for.
+    """
+
+    resource = models.CharField(max_length=50, db_index=True)
+    object_id = models.UUIDField()
+    farm_id = models.UUIDField(null=True, blank=True, db_index=True)
+    pic_user_id = models.BigIntegerField(
+        null=True, blank=True, db_index=True,
+        help_text="Snapshot of the deleted row's farm_block.pic_id — not a live FK (see class docstring).",
+    )
+    deleted_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-deleted_at"]
+
+    def __str__(self):
+        return f"{self.resource}/{self.object_id} deleted {self.deleted_at}"

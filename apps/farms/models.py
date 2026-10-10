@@ -220,6 +220,10 @@ class UserFarmRole(models.Model):
     role = models.CharField(max_length=32, choices=ROLE_CHOICES)
     created_at = models.DateTimeField(auto_now_add=True)
 
+    # docs/12-security-ops.md § Audit logging lists role/permission
+    # assignments as needing real history.
+    history = HistoricalRecords()
+
     class Meta:
         unique_together = ("user", "farm", "role")
 

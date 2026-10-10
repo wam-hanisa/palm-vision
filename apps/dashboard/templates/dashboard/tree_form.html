@@ -47,10 +47,12 @@ clicked again.
   // see farm_map.html's matching comment for why (OSM's own tile server
   // blocks exactly this kind of embedded, repeatedly-reloaded use under
   // its usage policy; this page hit the same block).
-  L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
+  // CARTO now requires an API key (every tile came back "API KEY
+  // REQUIRED"); Esri's keyless street map, same as farm_map.html.
+  L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}", {
     maxZoom: 21,
-    subdomains: "abcd",
-    attribution: "&copy; OpenStreetMap contributors &copy; CARTO",
+    maxNativeZoom: 19,
+    attribution: "Tiles &copy; Esri — Source: Esri, HERE, Garmin, USGS, and others",
   }).addTo(map);
 
   var boundsSources = [];
@@ -65,7 +67,7 @@ clicked again.
     var marker = L.circleMarker([coords[1], coords[0]], {
       radius: 5, color: "#8A8578", fillColor: "#8A8578", fillOpacity: 0.6, weight: 1,
     });
-    marker.bindPopup(t.name);
+    marker.bindPopup(Object.assign(document.createElement("span"), { textContent: t.name }));
     marker.addTo(map);
     boundsSources.push(marker);
   });

@@ -17,7 +17,7 @@
       <img src="{{ image.preview_file.url }}" alt="" class="image-thumb-large">
     {% endif %}
     <p class="panel-note">
-      Uploaded {{ image.created_at }} to {{ image.farm.name }}.
+      Uploaded {{ image.created_at|date:"j M Y, H:i" }} to {{ image.farm.name }}.
       {% if run_count %}
         This will permanently delete {{ run_count }} processing run{{ run_count|pluralize }} and
         {{ detection_count }} detection{{ detection_count|pluralize }} (and any health

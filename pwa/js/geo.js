@@ -79,6 +79,17 @@ function proximityCandidate(lat, lon, trees) {
   return null;
 }
 
+/** The nearest 2–3 trees, but only when the nearest is within
+ * PROXIMITY_THRESHOLD_M — CLAUDE.md's hard rule is to show several candidates
+ * and require a manual pick, because palms are ~9m apart and GPS error can be
+ * larger than that, so the single nearest tree is often the wrong one.
+ */
+function proximityCandidates(lat, lon, trees, limit = 3) {
+  const nearest = nearestTrees(lat, lon, trees, limit);
+  if (!nearest.length || nearest[0].distanceM > PROXIMITY_THRESHOLD_M) return [];
+  return nearest;
+}
+
 /** Thin wrapper around watchPosition that the caller is responsible for
  * clearing (clearWatch) when navigating away from a geo-aware screen —
  * see docs/05-offline-sync.md: "should only run while the relevant screen
@@ -108,6 +119,7 @@ window.PalmVisionGeo = {
   findContainingBlock,
   nearestTrees,
   proximityCandidate,
+  proximityCandidates,
   watchLocation,
   stopWatchingLocation,
 };

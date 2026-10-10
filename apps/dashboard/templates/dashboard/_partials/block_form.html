@@ -35,14 +35,18 @@ full-page render.
   {{ form.pic }}
   {% if form.pic.errors %}<div class="field-error">{{ form.pic.errors.0 }}</div>{% endif %}
 
-  <label for="{{ form.tree_match_threshold_m.id_for_label }}">Tree-match distance threshold, meters (optional — falls back to the site default)</label>
-  {{ form.tree_match_threshold_m }}
-
   <label for="{{ form.harvest_interval_days.id_for_label }}">Harvest interval, days (optional — falls back to the site default)</label>
   {{ form.harvest_interval_days }}
 
   <label for="{{ form.fertilizer_interval_days.id_for_label }}">Fertilizer interval, days (optional — falls back to the site default)</label>
   {{ form.fertilizer_interval_days }}
+
+
+  <details class="panel-help"{% if form.tree_match_threshold_m.errors or form.crown_detection_iou_threshold.errors or form.detection_target_gsd_m.errors %} open{% endif %}>
+    <summary>Advanced: image-detection tuning</summary>
+    <p class="field-hint">Leave these blank to use the site defaults — they only matter if tree detection looks consistently off for this block.</p>
+  <label for="{{ form.tree_match_threshold_m.id_for_label }}">Tree-match distance threshold, meters (optional — falls back to the site default)</label>
+  {{ form.tree_match_threshold_m }}
 
   <label for="{{ form.crown_detection_iou_threshold.id_for_label }}">Crown-detection overlap threshold, 0–1 (optional — falls back to the site default)</label>
   {{ form.crown_detection_iou_threshold }}
@@ -51,6 +55,8 @@ full-page render.
   <label for="{{ form.detection_target_gsd_m.id_for_label }}">Detection target ground resolution, meters/pixel (optional — falls back to the site default)</label>
   {{ form.detection_target_gsd_m }}
   <p class="field-hint">The orthomosaic is resampled to roughly this resolution before crown detection runs, so a real crown appears about the pixel size the model was trained to recognize. Too fine (a small number) and it detects individual fronds instead of whole crowns; too coarse (a large number) and small/young palms may be missed or merged together. 0.06 (6cm/pixel) is a starting estimate, not a calibrated value — adjust per block if results look consistently too fragmented or too coarse.</p>
+  </details>
+
 
   <div class="panel-actions">
     <button type="submit" class="primary-button primary-button-inline">{% if is_create %}Create block{% else %}Save changes{% endif %}</button>

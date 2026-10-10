@@ -7,7 +7,7 @@ writes require Manager or Super Admin, checked server-side, never trusted
 from the client — the same non-negotiable rule CLAUDE.md states for
 approvals elsewhere in this app.
 """
-from django.db.models import Q
+from django.db.models import ProtectedError, Q
 from django.utils import timezone
 from rest_framework import viewsets
 from rest_framework.decorators import action
@@ -142,6 +142,10 @@ class DeforestationBaselineViewSet(viewsets.ModelViewSet):
         _require_manager_or_superadmin_for_farm(self.request.user, farm_block.farm)
         serializer.save()
 
+    def perform_destroy(self, instance):
+        _require_manager_or_superadmin_for_farm(self.request.user, instance.farm_block.farm)
+        instance.delete()
+
     @action(detail=True, methods=["post"])
     def verify(self, request, pk=None):
         """Manager/Super Admin marks a baseline as reviewed — sets
@@ -160,15 +164,10 @@ class DeforestationBaselineViewSet(viewsets.ModelViewSet):
         return Response(DeforestationBaselineSerializer(baseline).data)
 
 
-class ComplianceAuditTemplateViewSet(viewsets.ModelViewSet):
-    """Templates aren't farm-scoped (they're reusable across farms), but
-    creating/editing one is still a management action, not open to anyone
-    authenticated — Manager-on-any-farm or Super Admin.
+class _AnyManagerWritesMixin:
+    """Writes on farm-independent compliance config (audit templates and
+    their checklist items) — Manager-on-any-farm or Super Admin.
     """
-
-    serializer_class = ComplianceAuditTemplateSerializer
-    permission_classes = [IsAuthenticated]
-    queryset = ComplianceAuditTemplate.objects.prefetch_related("checklist_items")
 
     def _require_any_manager(self):
         user = self.request.user
@@ -187,10 +186,29 @@ class ComplianceAuditTemplateViewSet(viewsets.ModelViewSet):
 
     def perform_destroy(self, instance):
         self._require_any_manager()
-        instance.delete()
+        try:
+            instance.delete()
+        except ProtectedError:
+            raise ValidationError("This is used by existing audits, so it can't be deleted.")
 
 
-class ChecklistItemViewSet(viewsets.ModelViewSet):
+class ComplianceAuditTemplateViewSet(_AnyManagerWritesMixin, viewsets.ModelViewSet):
+    """Templates aren't farm-scoped (they're reusable across farms), but
+    creating/editing one is still a management action, not open to anyone
+    authenticated — Manager-on-any-farm or Super Admin.
+    """
+
+    serializer_class = ComplianceAuditTemplateSerializer
+    permission_classes = [IsAuthenticated]
+    queryset = ComplianceAuditTemplate.objects.prefetch_related("checklist_items")
+
+
+class ChecklistItemViewSet(_AnyManagerWritesMixin, viewsets.ModelViewSet):
+    """Same rule as the template it belongs to — previously had no write
+    check at all, so any authenticated user could rewrite or delete the
+    checklist every audit is scored against.
+    """
+
     serializer_class = ChecklistItemSerializer
     permission_classes = [IsAuthenticated]
     queryset = ChecklistItem.objects.select_related("template")
@@ -214,6 +232,10 @@ class ComplianceAuditViewSet(viewsets.ModelViewSet):
         _require_manager_or_superadmin_for_farm(self.request.user, farm_block.farm)
         serializer.save()
 
+    def perform_destroy(self, instance):
+        _require_manager_or_superadmin_for_farm(self.request.user, instance.farm_block.farm)
+        instance.delete()
+
 
 class AuditResultViewSet(viewsets.ModelViewSet):
     serializer_class = AuditResultSerializer
@@ -227,6 +249,15 @@ class AuditResultViewSet(viewsets.ModelViewSet):
         audit = serializer.validated_data["audit"]
         _require_manager_or_superadmin_for_farm(self.request.user, audit.farm_block.farm)
         serializer.save()
+
+    def perform_update(self, serializer):
+        audit = serializer.validated_data.get("audit", serializer.instance.audit)
+        _require_manager_or_superadmin_for_farm(self.request.user, audit.farm_block.farm)
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        _require_manager_or_superadmin_for_farm(self.request.user, instance.audit.farm_block.farm)
+        instance.delete()
 
 
 class HarvestBatchViewSet(viewsets.ModelViewSet):
@@ -247,6 +278,15 @@ class HarvestBatchViewSet(viewsets.ModelViewSet):
         farm_block = serializer.validated_data["farm_block"]
         _require_manager_or_superadmin_for_farm(self.request.user, farm_block.farm)
         serializer.save()
+
+    def perform_update(self, serializer):
+        farm_block = serializer.validated_data.get("farm_block", serializer.instance.farm_block)
+        _require_manager_or_superadmin_for_farm(self.request.user, farm_block.farm)
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        _require_manager_or_superadmin_for_farm(self.request.user, instance.farm_block.farm)
+        instance.delete()
 
     @action(detail=True, methods=["post"], url_path="export-due-diligence")
     def export_due_diligence(self, request, pk=None):

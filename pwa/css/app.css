@@ -162,6 +162,42 @@ input:focus, select:focus { border-color: var(--primary); }
 
 .checkbox-label input[type="checkbox"]:disabled { opacity: 0.5; }
 
+/* actualFormScreen()'s "Log against a plan / without a plan" choice
+   (pwa/js/app.js) — same large-hit-area reasoning as .checkbox-label
+   above, radio buttons instead of a checkbox since exactly one applies. */
+fieldset {
+  border: 2px solid var(--text-muted);
+  border-radius: 0.5rem;
+  padding: 0.75rem 1rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+fieldset legend {
+  font-weight: 600;
+  padding: 0 0.4rem;
+}
+
+.radio-label {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.6rem;
+  font-weight: 500;
+  min-height: 44px;
+  padding: 0.35rem 0;
+  cursor: pointer;
+}
+
+.radio-label input[type="radio"] {
+  width: 1.75rem;
+  height: 1.75rem;
+  flex-shrink: 0;
+  accent-color: var(--primary);
+}
+
+.radio-label input[type="radio"]:disabled { opacity: 0.5; }
+
 /* Equal columns rather than `flex: 1 1 auto`, which sized each button to its
    own label and left a ragged row with one button stranded. A trailing odd
    button spans the full width instead of sitting beside dead space. */
@@ -176,17 +212,35 @@ input:focus, select:focus { border-color: var(--primary); }
 
 .block-list, .tree-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.6rem; }
 
+/* blockScreen()'s "Needs action (N)" heading + "Show all trees"/"Show
+   marked only" toggle, on one row — same pattern as .screen-header's
+   heading-plus-button layout, scoped separately since this isn't a page
+   header. */
+.tree-list-header { display: flex; align-items: baseline; justify-content: space-between; gap: 0.75rem; }
+.tree-list-header h2 { margin: 0; }
+.tree-list-header .btn-text { white-space: nowrap; }
+
+/* Real <button>s (inside each <li>) so they're reachable and operable by
+   keyboard — they used to be clickable <li>s. Resets the global button
+   rule's filled-green look back to a card. */
 .block-item, .tree-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  color: var(--text);
   background: var(--card);
   border-radius: 0.6rem;
   padding: 1rem;
   cursor: pointer;
 }
 
+.block-item:hover, .tree-item:hover { background: #E6E2D5; }
+
 .block-item--here { border: 2px solid var(--accent); }
 
-.block-item__name, .tree-item__name { font-weight: 700; font-size: 1.1rem; }
-.block-item__meta, .tree-item__meta { color: var(--text-muted); font-size: 0.95rem; }
+.block-item__name, .tree-item__name { display: block; font-weight: 700; font-size: 1.1rem; }
+.block-item__meta, .tree-item__meta { display: block; color: var(--text-muted); font-size: 0.95rem; }
 
 .pill {
   display: inline-block;
@@ -296,12 +350,21 @@ input:focus, select:focus { border-color: var(--primary); }
   padding: 0.6rem 0.9rem;
   font-size: 0.9rem;
   font-weight: 600;
+}
+
+.unsynced-banner__row {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 0.75rem;
   flex-wrap: wrap;
 }
+
+.unsynced-banner__row + .unsynced-banner__row { margin-top: 0.5rem; }
+
+/* Rejected items never clear on their own — shown in the danger colour so
+   they don't blend into the ordinary "waiting to sync" line above. */
+.unsynced-banner__row--failed { color: var(--danger); }
 
 .unsynced-banner button {
   background: var(--primary);
@@ -318,6 +381,21 @@ input:focus, select:focus { border-color: var(--primary); }
 .unsynced-banner button:disabled {
   background: var(--text-muted);
 }
+
+.resync-note { margin-top: 1.5rem; font-size: 0.9rem; }
+.resync-note .btn-text { padding: 0; min-height: 44px; }
+
+.sync-issue-list { list-style: none; padding: 0; margin: 0; }
+
+.sync-issue {
+  background: var(--card);
+  border-radius: 8px;
+  padding: 0.8rem 0.9rem;
+  margin-bottom: 0.75rem;
+}
+
+.sync-issue__what { font-weight: 600; }
+.sync-issue__why { color: var(--danger); margin: 0.25rem 0; }
 
 .screen--login { padding-top: 3rem; text-align: center; }
 .screen--login form { text-align: left; }
@@ -368,6 +446,54 @@ input:focus, select:focus { border-color: var(--primary); }
 
 .map-legend-note { font-size: 0.85rem; }
 
+/* Block-level offline map (screen--block-map) — app.js's blockMapScreen().
+   Individual tree pins on top of the same block-boundary/GPS-dot drawing
+   mapScreen() already uses; see that function's own docstring for why pin
+   tap doubles as bulk-select. */
+.map-tree { cursor: pointer; }
+
+/* Invisible larger hit-area behind the visible 7px pin — gloved-thumb
+   tap targets need real size (docs/09-design-system.md), but a literal
+   16px-radius *visible* dot per tree would turn a dense block into a
+   solid mass of color with no room to read individual ring states. */
+.map-tree-hit { fill: transparent; }
+
+.map-tree-selected-ring {
+  fill: none;
+  stroke: var(--primary);
+  stroke-width: 3;
+}
+
+.map-tree-pin { pointer-events: none; } /* clicks handled by the parent <g>/.map-tree-hit, not the small visible dot itself */
+
+/* Sticky footer bar, same "always visible, never buried" treatment as
+   .sync-chip/.unsynced-banner above — appears only once at least one tree
+   is tapped-selected (see blockMapScreen()), so it's never shown "just in
+   case" on a screen with nothing selected yet. */
+.bulk-action-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 8;
+  background: var(--card);
+  border-top: 2px solid var(--primary);
+  padding: 0.75rem 1rem;
+  margin: 0.75rem -1rem -1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.bulk-action-bar__count { font-weight: 700; }
+
+.bulk-action-bar__buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.bulk-action-bar__buttons button { min-height: 44px; flex: 1 1 auto; }
+.bulk-action-bar__buttons .btn-text { flex: 0 0 auto; }
+
 /* --- Empty states -------------------------------------------------------
    Previously bare muted text — one of them an `<li class="muted">` inside
    the record list, i.e. a list item pretending to be a message. A dashed
@@ -395,3 +521,14 @@ input:focus, select:focus { border-color: var(--primary); }
   text-align: center;
   color: var(--text-muted);
 }
+
+/* Block tree list search (blockScreen()). 44px tall — same touch-target bar as every other control here. */
+.tree-search { width: 100%; min-height: 44px; margin: 0.5rem 0 0.75rem; font-size: 1rem; }
+#block-tree-more-btn { width: 100%; margin: 0.25rem 0 1rem; }
+
+/* Block map zoom/pan (app.js wireBlockMap()). touch-action:none so a drag
+   pans the drawing instead of scrolling the page; the zoom buttons are 44px. */
+.map-wrap { position: relative; }
+.map-svg--interactive { touch-action: none; cursor: grab; user-select: none; }
+.map-zoom { position: absolute; right: 0.5rem; top: 1.25rem; display: flex; flex-direction: column; gap: 0.35rem; }
+.map-zoom button { width: 44px; min-height: 44px; padding: 0; font-size: 1.4rem; line-height: 1; }

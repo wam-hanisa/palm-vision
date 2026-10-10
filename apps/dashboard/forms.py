@@ -19,6 +19,7 @@ from apps.farms.models import Farm, FarmBlock, UserFarmRole
 from apps.imagery.models import Image
 from apps.operations.models import Fertilizer, Harvest
 from apps.reporting.models import ReportDefinition
+from apps.reporting.services import IMPLEMENTED_REPORT_TYPES, eligible_subscribers
 from apps.trees.models import Tree
 
 
@@ -36,7 +37,22 @@ class DashboardAuthenticationForm(AuthenticationForm):
         )
 
 
-class ImageUploadForm(forms.ModelForm):
+class _PlainEmptyLabelsMixin:
+    """Replaces Django's default "---------" placeholder in dropdowns with
+    words. Runs after the form's own __init__, so querysets narrowed there
+    are kept."""
+
+    EMPTY_LABELS = {"farm": "Choose a farm…", "farm_block": "Choose a block…", "pic": "No PIC Block assigned"}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        for name, label in self.EMPTY_LABELS.items():
+            field = self.fields.get(name)
+            if field is not None and getattr(field, "empty_label", None) is not None:
+                field.empty_label = label
+
+
+class ImageUploadForm(_PlainEmptyLabelsMixin, forms.ModelForm):
     """docs/06-ml-pipeline.md: "upload happens once back on real bandwidth,
     from the office dashboard — not the field PWA" — this is that upload
     path, first built here. `farm` is restricted to farms the requesting
@@ -60,7 +76,7 @@ class ImageUploadForm(forms.ModelForm):
             self.fields["farm"].queryset = Farm.objects.filter(id__in=managed_farm_ids(user))
 
 
-class ComplianceDocumentForm(forms.ModelForm):
+class ComplianceDocumentForm(_PlainEmptyLabelsMixin, forms.ModelForm):
     """docs/10-user-journeys.md Manager journey step 5: "Renews a compliance
     document. Uploads a renewal before it lapses." `farm`/`farm_block` are
     both optional at the form level — ComplianceDocument.clean()/save()
@@ -97,7 +113,7 @@ class ComplianceDocumentForm(forms.ModelForm):
             self.fields["farm_block"].queryset = FarmBlock.objects.filter(farm_id__in=managed_ids)
 
 
-class ReportDefinitionForm(forms.ModelForm):
+class ReportDefinitionForm(_PlainEmptyLabelsMixin, forms.ModelForm):
     """docs/10-user-journeys.md Manager journey step 6: "Exports a report."
     `farm` restricted to managed farms, same pattern as the two forms
     above.
@@ -126,17 +142,39 @@ class ReportDefinitionForm(forms.ModelForm):
     def __init__(self, *args, user=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.fields["subscribers"].required = False
-        self.fields["subscribers"].queryset = (
-            get_user_model()
-            .objects.filter(models.Q(is_superuser=True) | models.Q(farm_roles__role=UserFarmRole.ROLE_MANAGER))
-            .distinct()
-            .order_by("username")
-        )
+        # Only people eligible for a farm this user can pick — a Manager no
+        # longer sees (or can subscribe) other farms' Managers. clean() then
+        # checks the choice against the specific farm selected.
+        # Only types that actually generate a file — the form used to offer
+        # all five and explain the difference with a note pointing at
+        # BUILD_STATUS.md.
+        self.fields["report_type"].choices = [
+            (value, label) for value, label in self.fields["report_type"].choices
+            if value in IMPLEMENTED_REPORT_TYPES
+        ]
+        manager_role = models.Q(farm_roles__role=UserFarmRole.ROLE_MANAGER)
         if user is not None and not user.is_superuser:
             self.fields["farm"].queryset = Farm.objects.filter(id__in=managed_farm_ids(user))
+            manager_role &= models.Q(farm_roles__farm_id__in=managed_farm_ids(user))
+        self.fields["subscribers"].queryset = (
+            get_user_model().objects.filter(models.Q(is_superuser=True) | manager_role).distinct().order_by("username")
+        )
+
+    def clean(self):
+        cleaned = super().clean()
+        farm, subscribers = cleaned.get("farm"), cleaned.get("subscribers")
+        if farm is not None and subscribers:
+            allowed = set(eligible_subscribers(farm).values_list("id", flat=True))
+            outside = [u.username for u in subscribers if u.id not in allowed]
+            if outside:
+                self.add_error(
+                    "subscribers",
+                    f"Not a Manager of {farm.name}: {', '.join(outside)}. Subscribers must manage this report's farm.",
+                )
+        return cleaned
 
 
-class FarmBlockForm(forms.ModelForm):
+class FarmBlockForm(_PlainEmptyLabelsMixin, forms.ModelForm):
     """Manager-facing block create/edit — see FarmBlockCreateView/
     FarmBlockUpdateView in apps/dashboard/views.py. `boundary` is
     deliberately excluded: it's a real PostGIS polygon, and this project's
@@ -291,7 +329,7 @@ class FertilizerPlanForm(forms.ModelForm):
         widgets = {"assessment_date": forms.DateInput(attrs={"type": "date"})}
 
 
-class GrievanceRecordForm(forms.ModelForm):
+class GrievanceRecordForm(_PlainEmptyLabelsMixin, forms.ModelForm):
     """docs/07-compliance.md grievance logging. `farm` restricted to managed
     farms, same pattern as the forms above. `status`/`resolution_notes` are
     deliberately left off this creation form — a new grievance always starts

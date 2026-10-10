@@ -2,7 +2,7 @@ import uuid
 
 from django.conf import settings
 from django.contrib.gis.db import models as gis_models
-from django.db import models
+from django.db import models, transaction
 from django.utils import timezone
 from simple_history.models import HistoricalRecords
 
@@ -60,6 +60,16 @@ class Tree(gis_models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=True)
     farm_block = models.ForeignKey(FarmBlock, on_delete=models.CASCADE, related_name="trees")
     name = models.CharField(max_length=255, blank=True, default="")
+    number = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        editable=False,
+        help_text=(
+            "This tree's number within its block, shown as e.g. B4-0123 wherever it has no name. "
+            "Assigned automatically (next free number in the block) and never reused. Existing "
+            "trees were numbered by position, row by row across the block."
+        ),
+    )
     location = gis_models.PointField(srid=4326)
     source = models.CharField(max_length=32, choices=SOURCE_CHOICES, default=SOURCE_MANUAL)
     status = models.CharField(max_length=32, choices=STATUS_CHOICES, default=STATUS_ACTIVE)
@@ -85,7 +95,7 @@ class Tree(gis_models.Model):
         null=True,
         blank=True,
         help_text=(
-            "Quantity (bunches) recorded at the same time as last_harvested_at, if the person doing the "
+            "Quantity (kg) recorded at the same time as last_harvested_at, if the person doing the "
             "marking captured one — the mark-harvested action has never required a quantity (it's a "
             "'when was this last serviced' interval tracker, not the yield-reporting pipeline; see "
             "last_harvested_at's own help_text), so this is nullable and denormalized here rather than a "
@@ -147,11 +157,52 @@ class Tree(gis_models.Model):
     history = HistoricalRecords()
 
     class Meta:
-        ordering = ["farm_block", "name"]
+        ordering = ["farm_block", "number"]
         indexes = [models.Index(fields=["farm_block", "status"])]
+        constraints = [
+            models.UniqueConstraint(fields=["farm_block", "number"], name="unique_tree_number_per_block"),
+        ]
 
     def __str__(self):
-        return self.name or str(self.id)
+        return self.label
+
+    @property
+    def label(self):
+        """How a tree is identified to people: its name if it has one, else
+        block name + number (B4-0123). Trees used to show as "Unnamed tree"
+        (1,070 identical rows in the field app) or an 8-character id
+        fragment on the dashboard.
+        """
+        if self.name:
+            return self.name
+        if self.number is None:
+            return "New tree"
+        return f"{self.farm_block.name}-{self.number:04d}"
+
+    @classmethod
+    def from_db(cls, db, field_names, values):
+        instance = super().from_db(db, field_names, values)
+        instance._loaded_farm_block_id = instance.__dict__.get("farm_block_id")
+        return instance
+
+    def save(self, *args, **kwargs):
+        moved_block = (
+            not self._state.adding
+            and getattr(self, "_loaded_farm_block_id", self.farm_block_id) != self.farm_block_id
+        )
+        if self.farm_block_id and (self.number is None or moved_block):
+            with transaction.atomic():
+                # Lock the block row so two trees saved at once can't both
+                # take the same "next" number.
+                FarmBlock.objects.select_for_update().filter(pk=self.farm_block_id).first()
+                highest = Tree.objects.filter(farm_block_id=self.farm_block_id).aggregate(models.Max("number"))
+                self.number = (highest["number__max"] or 0) + 1
+                if kwargs.get("update_fields") is not None:
+                    kwargs["update_fields"] = {*kwargs["update_fields"], "number"}
+                super().save(*args, **kwargs)
+        else:
+            super().save(*args, **kwargs)
+        self._loaded_farm_block_id = self.farm_block_id
 
     def is_location_orphaned(self):
         """True if this tree's location falls outside every block boundary
@@ -248,7 +299,7 @@ class TreeCareRecord(models.Model):
     bulk mark/record submission (generated once per request, not per row —
     see MarkTreesHarvestedView/MarkTreesNeedHarvestView etc.), so the
     dashboard can group rows back into one history entry per action
-    ("3 trees marked needing harvest" / "3 trees harvested, 42.5 bunches
+    ("3 trees marked needing harvest" / "3 trees harvested, 42.5 kg
     total") instead of one line per tree. The PWA's single-tree
     mark_harvested/mark_fertilized just gets the field's own uuid4 default
     — a "batch" of one is exactly what it is.
@@ -291,7 +342,7 @@ class TreeCareRecord(models.Model):
     quantity = models.FloatField(
         null=True,
         blank=True,
-        help_text="Bunches for a harvest record, kilograms for a fertilizer record. Optional — not every recording captures this.",
+        help_text="Kilograms, for both a harvest or a fertilizer record. Optional — not every recording captures this.",
     )
     recorded_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL)
     recorded_at = models.DateTimeField(auto_now_add=True)

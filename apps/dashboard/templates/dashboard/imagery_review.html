@@ -3,9 +3,9 @@
 {% block page_title %}Review queue — {{ run.farm_block.name }}{% endblock %}
 {% block content %}
 <p class="panel-note">
-  Run started {{ run.created_at }} · status
+  Run started {{ run.created_at|date:"j M Y, H:i" }} · status
   <span class="tag {% if run.status == 'ready' %}tag-success{% elif run.status == 'failed' %}tag-danger{% else %}tag-warning{% endif %}" id="run-status-tag">{{ run.get_status_display }}</span>
-  · <span id="run-counts">{{ run.detected_tree_count }} detected, {{ run.new_candidate_count }} new candidates.</span>
+  · <span id="run-counts">{{ run.detected_tree_count }} detected, {{ run.new_candidate_count }} not matched to an existing tree.</span>
 </p>
 
 {% if run.status == "failed" %}
@@ -18,7 +18,7 @@
      exist even when the run is still "pending"/"clipping" (no percent
      yet) at initial page load, since progress can start appearing on the
      very next poll. -->
-<div class="upload-progress" id="run-progress" {% if run.progress_percent is None %}hidden{% endif %}>
+<div class="upload-progress" id="run-progress" {% if run.progress_percent is None or run.status == "ready" or run.status == "failed" %}hidden{% endif %}>
   <div class="upload-progress-track"><div class="upload-progress-fill" id="run-progress-fill" style="width:{{ run.progress_percent|default:0 }}%;"></div></div>
   <span class="upload-progress-label" id="run-progress-label">{{ run.progress_percent|default:0 }}%</span>
 </div>
@@ -50,7 +50,7 @@
           return;
         }
         statusTag.textContent = data.status_display;
-        countsEl.textContent = data.detected_tree_count + " detected, " + data.new_candidate_count + " new candidates.";
+        countsEl.textContent = data.detected_tree_count + " detected, " + data.new_candidate_count + " not matched to an existing tree.";
         if (data.progress_percent !== null) {
           if (progressWrap) progressWrap.hidden = false;
           if (progressFill) progressFill.style.width = data.progress_percent + "%";
@@ -66,17 +66,22 @@
 {% endif %}
 
 {% if not detections %}
-  <p class="empty-state">Nothing left to review for this run — every detection is matched or already reviewed.</p>
+  {% if run.status == "ready" %}
+    <p class="empty-state">No detections left to review for this run — every detection is matched or already reviewed.</p>
+  {% elif run.status == "failed" %}
+    <p class="empty-state">This run failed, so there is nothing to review. Start it again from the block's imagery page.</p>
+  {% else %}
+    <p class="empty-state">Still processing — detections will appear here when it finishes.</p>
+  {% endif %}
 {% else %}
+{% if confirmable_count %}
 <form method="post" action="{% url 'dashboard:imagery-run-confirm-all' run_id=run.id %}" class="inline-form" style="margin-bottom:16px;">
   {% csrf_token %}
-  <button type="submit" class="primary-button" {% if not confirmable_count %}disabled{% endif %}>
-    Confirm all new candidates as trees{% if confirmable_count %} ({{ confirmable_count }}){% endif %}
-  </button>
-  {% if not confirmable_count %}
-    <span class="panel-note" style="margin-left:8px;">No plain new-candidate detections left — remaining ones are ambiguous and need individual review.</span>
-  {% endif %}
+  <button type="submit" class="primary-button">Confirm all new candidates as trees ({{ confirmable_count }})</button>
 </form>
+{% else %}
+  <p class="panel-note">The remaining detections are ambiguous (two or more nearby trees, or a possible regrowth) — link each to the right tree or reject it.</p>
+{% endif %}
 <div class="detection-grid">
   {% for detection in detections %}
   <div class="detection-card">
@@ -89,7 +94,7 @@
     <div class="detection-status">
       {% if detection.match_status == "new_candidate" %}<span class="tag tag-warning">New candidate</span>
       {% else %}<span class="tag tag-warning">Ambiguous</span>{% endif %}
-      <span class="detection-confidence">{{ detection.detection_confidence|floatformat:2 }} confidence</span>
+      <span class="detection-confidence">Detection confidence {{ detection.detection_confidence|floatformat:2 }}</span>
     </div>
     <div class="detection-coords">{{ detection.detected_location.y|floatformat:6 }}, {{ detection.detected_location.x|floatformat:6 }}</div>
 
@@ -100,7 +105,7 @@
           {% elif label == "yellow" %}<span class="tag tag-danger">Yellow</span>
           {% else %}<span class="tag">{{ label|title }}</span>{% endif %}
         {% endwith %}
-        <span>{{ detection.classification.confidence|floatformat:2 }} confidence</span>
+        <span>Health confidence {{ detection.classification.confidence|floatformat:2 }}</span>
       </div>
     {% endif %}
 
@@ -121,7 +126,7 @@
       <select name="tree_id">
         <option value="">Link to nearest tree…</option>
         {% for tree in detection.link_candidates %}
-          <option value="{{ tree.id }}">{{ tree.name|default:tree.id }}</option>
+          <option value="{{ tree.id }}">{{ tree.label }}</option>
         {% endfor %}
       </select>
       <button type="submit" class="secondary-button">Link</button>
@@ -131,6 +136,25 @@
     <form method="post" action="{% url 'dashboard:imagery-detection-reject' detection_id=detection.id %}" class="inline-form">
       {% csrf_token %}
       <button type="submit" class="link-button-danger">Reject (false positive)</button>
+    </form>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if health_checks %}
+<h2 class="panel-heading" id="health-checks">Health labels to check ({{ health_checks_total }}{% if health_checks_total > health_checks|length %}, showing the {{ health_checks|length }} least certain{% endif %})</h2>
+<p class="panel-note">The model wasn't confident about these (below 70%). Choose what you see — until checked, they don't change a tree's colour on the map.</p>
+<div class="detection-grid">
+  {% for c in health_checks %}
+  <div class="detection-card">
+    {% if c.patch_image %}<img class="detection-thumb" src="{{ c.patch_image.url }}" alt="Cropped patch">{% else %}<div class="detection-thumb detection-thumb-placeholder">No preview available</div>{% endif %}
+    <div class="detection-classification">Model said <strong>{{ c.health_label|title }}</strong> ({{ c.confidence|floatformat:2 }}){% if c.tree_detection.tree %} · {{ c.tree_detection.tree.label }}{% endif %}</div>
+    <form method="post" action="{% url 'dashboard:imagery-classification-review' classification_id=c.id %}" class="inline-form">
+      {% csrf_token %}
+      <button name="label" value="healthy" class="secondary-button">Healthy</button>
+      <button name="label" value="yellow" class="secondary-button">Yellow</button>
+      <button name="label" value="unknown" class="secondary-button">Unknown</button>
     </form>
   </div>
   {% endfor %}

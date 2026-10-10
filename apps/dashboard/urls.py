@@ -25,9 +25,69 @@ urlpatterns = [
         name="harvest-plan-add",
     ),
     path(
+        "farms/blocks/<uuid:block_id>/harvest-plan/<uuid:harvest_id>/edit/",
+        views.HarvestPlanUpdateView.as_view(),
+        name="harvest-plan-edit",
+    ),
+    path(
+        "farms/blocks/<uuid:block_id>/harvest-plan/<uuid:harvest_id>/delete/",
+        views.HarvestPlanDeleteView.as_view(),
+        name="harvest-plan-delete",
+    ),
+    path(
+        "farms/blocks/<uuid:block_id>/harvest-plan/<uuid:harvest_id>/approve/",
+        views.HarvestPlanApproveView.as_view(),
+        name="harvest-plan-approve",
+    ),
+    path(
         "farms/blocks/<uuid:block_id>/fertilizer-plan/add/",
         views.FertilizerPlanCreateView.as_view(),
         name="fertilizer-plan-add",
+    ),
+    path(
+        "farms/blocks/<uuid:block_id>/fertilizer-plan/<uuid:fertilizer_id>/edit/",
+        views.FertilizerPlanUpdateView.as_view(),
+        name="fertilizer-plan-edit",
+    ),
+    path(
+        "farms/blocks/<uuid:block_id>/fertilizer-plan/<uuid:fertilizer_id>/delete/",
+        views.FertilizerPlanDeleteView.as_view(),
+        name="fertilizer-plan-delete",
+    ),
+    path(
+        "farms/blocks/<uuid:block_id>/fertilizer-plan/<uuid:fertilizer_id>/approve/",
+        views.FertilizerPlanApproveView.as_view(),
+        name="fertilizer-plan-approve",
+    ),
+    path(
+        "farms/blocks/<uuid:block_id>/harvest/record/",
+        views.RecordActualHarvestView.as_view(),
+        name="harvest-record",
+    ),
+    path(
+        "farms/blocks/<uuid:block_id>/harvest/<uuid:actual_id>/edit/",
+        views.ActualHarvestUpdateView.as_view(),
+        name="harvest-actual-edit",
+    ),
+    path(
+        "farms/blocks/<uuid:block_id>/harvest/<uuid:actual_id>/delete/",
+        views.ActualHarvestDeleteView.as_view(),
+        name="harvest-actual-delete",
+    ),
+    path(
+        "farms/blocks/<uuid:block_id>/fertilizer/record/",
+        views.RecordActualFertilizerView.as_view(),
+        name="fertilizer-record",
+    ),
+    path(
+        "farms/blocks/<uuid:block_id>/fertilizer/<uuid:actual_id>/edit/",
+        views.ActualFertilizerUpdateView.as_view(),
+        name="fertilizer-actual-edit",
+    ),
+    path(
+        "farms/blocks/<uuid:block_id>/fertilizer/<uuid:actual_id>/delete/",
+        views.ActualFertilizerDeleteView.as_view(),
+        name="fertilizer-actual-delete",
     ),
     path(
         "farms/blocks/<uuid:block_id>/trees/mark-harvested/",
@@ -103,6 +163,11 @@ urlpatterns = [
         "imagery/detections/<uuid:detection_id>/confirm/",
         views.ConfirmDetectionView.as_view(),
         name="imagery-detection-confirm",
+    ),
+    path(
+        "imagery/classifications/<uuid:classification_id>/review/",
+        views.ReviewClassificationView.as_view(),
+        name="imagery-classification-review",
     ),
     path(
         "imagery/detections/<uuid:detection_id>/reject/",

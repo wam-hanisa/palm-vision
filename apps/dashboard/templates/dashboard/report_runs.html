@@ -12,7 +12,7 @@
     <tbody>
       {% for run in runs %}
       <tr>
-        <td>{{ run.created_at }}</td>
+        <td>{{ run.created_at|date:"j M Y, H:i" }}</td>
         <td>
           {% if run.status == "ready" %}<span class="tag tag-success">Ready</span>
           {% elif run.status == "failed" %}<span class="tag tag-danger">Failed — {{ run.error_message }}</span>

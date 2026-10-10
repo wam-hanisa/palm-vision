@@ -6,7 +6,7 @@ A Progressive Web App, not Flutter/React Native, for the field client:
 
 - No app store submission/approval process — installs via "Add to Home Screen" directly from a browser link.
 - One codebase for Android and iOS browsers.
-- Genuinely works offline via a service worker (caches the app, intercepts network requests) plus IndexedDB (local storage) — the same pattern used by Google Maps, Twitter/X, and other offline-capable web apps.
+- Genuinely works offline via a service worker (caches the app, intercepts network requests) plus IndexedDB (local storage) — the same pattern used by Google Maps, Twitter/X, and other offline-capable web apps. The service worker only handles the field app's own files (`/field/`, `/pwa/*`, the manifest), network-first with the cached copy as the offline fallback; it never touches `/api/`, the office dashboard, or `/media/`, and data never comes from its cache (that's IndexedDB's job).
 
 **Trade-off to know about:** a native app gives smoother camera/GPS integration. Start with the PWA; only move to native if it proves genuinely insufficient in practice — building native first is more expensive up front for a benefit that might not be needed.
 
@@ -29,14 +29,25 @@ This domain is naturally sync-friendly: "actual harvest" and "actual fertilizer"
 - Every synced record carries a client-generated UUID, so two offline devices never collide on ID.
 - The server treats sync as "append this record," not "merge this edit."
 - **Editing an existing record is an online-only action**, not part of the offline queue — this deliberately avoids the harder class of conflict-resolution problems rather than half-solving them.
+- `Harvest`/`Fertilizer` plan *creation* is queueable too, same as the append-only records above (`HarvestViewSet`/`FertilizerViewSet` are idempotent-UUID-create, apps/operations/views.py) — see "Logging without an existing plan" below for why a PIC Block's device needs this.
 
 ## Farm → Block → Tree geo-navigation
 
 Three-tier drill-down using the phone's GPS (browser Geolocation API):
 
 1. **Farm level** — map of all blocks as polygons. The user's live position is shown; if it falls inside a block's boundary, that block is highlighted as "you are here" and offered as the obvious next tap (any block can still be selected manually).
-2. **Block level** — the selected block's boundary plus every tree in it, from pre-cached offline data. Live GPS marker continues updating.
-3. **Tree level** — tapping a tree (or via the proximity prompt below) opens that tree's detail/yield-entry screen.
+2. **Block level** — a plain list by default (`blockScreen()`), plus an optional "Map view" (`blockMapScreen()`) showing the selected block's boundary and every tree in it as a pin, colored/ringed by health and harvest/fertilizer stage — from pre-cached offline data, live GPS marker continues updating. Tapping a pin on the map also toggles that tree into a bulk-selection set; once at least one tree is selected, a bottom action bar offers "Mark harvested"/"Mark fertilized" against the whole selection in one request (`TreeViewSet.bulk_mark_harvested`/`bulk_mark_fertilized`, apps/trees/views.py) — the field-app counterpart to the office dashboard's own bulk "Mark trees harvested/fertilized" action. Like the single-tree mark_harvested/mark_fertilized actions, this is online-only, not queued (see "Editing an existing record" above). The plain list (`blockScreen()`) sorts trees with a stage-1 "needs harvest/fertilizer" flag first, alphabetical within each group — requested directly, so a block's to-do trees aren't buried among however many others the block has.
+3. **Tree level** — tapping a tree in the list (or via the proximity prompt below) opens that tree's detail/yield-entry screen.
+
+## Logging without an existing plan
+
+Block-level and tree-level yield entry both attach to an open `Harvest`/`Fertilizer` plan (`findOrCreatePlan()`, pwa/js/app.js) — originally this required a Manager to have already created one from the office dashboard, blocking a PIC Block from logging anything against a brand-new block until office staff caught up. Reported directly. Now: if the block has no still-open plan (status not yet `done`), the field app creates a minimal one itself — client-generated UUID, `assessment_date` today, `assessment_quantity` seeded from whatever quantity the field worker is about to report (Harvest only; `Fertilizer` has no such field) rather than a bare 0 — the same one-click, no-plan-required behavior the office dashboard's own "Record actual harvest" already has (apps/dashboard/views.py's `_get_open_or_new_plan()`). This is a placeholder estimate, not a real assessment; a Manager can still create/edit the plan's own fields from the office afterward, same as any auto-created plan.
+
+## Logging against an existing plan auto-completes its marked trees
+
+Block-level entry (not tree-level — that flow already targets one specific tree by hand) also offers a choice: log without a plan (the auto-create behavior above), or against one of the block's own open plans, picked from a dropdown. Requested directly: choosing an existing plan should auto-complete every tree in the block still carrying the stage-1 "needs harvest/fertilizer" flag, not leave a Manager's to-do list untouched next to a plan that's now genuinely been executed against.
+
+Mechanically, `submitBlockLevelActual()` (pwa/js/app.js) calls `TreeViewSet.bulk_mark_harvested`/`bulk_mark_fertilized` (apps/trees/views.py) for those trees — **online-only, not queued**, same as every other "edit an existing record" action in this app (see "Conflict handling" above), since this mutates existing `Tree` rows rather than appending a new one. It's called *before* the `ActualHarvest`/`ActualFertilizer` write and allowed to throw straight through on failure (including being offline) — the actual is never even queued in that case, so "actual logged, marked trees left untouched" is never a state this can land in; it's both or neither. The block-level total is split evenly across whichever trees get auto-completed (`total ÷ tree count`, rounded to 2 decimals) — never the same figure copied verbatim into every tree, the exact bug BUILD_STATUS.md documents fixing for the office dashboard's own bulk-quantity field.
 
 ## Proximity prompt for yield entry
 

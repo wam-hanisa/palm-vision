@@ -14,6 +14,8 @@ import json
 from django.contrib.gis.db.models.functions import Distance
 from django.contrib.gis.geos import GEOSGeometry, Point
 from django.contrib.gis.measure import D
+from django.db import transaction
+from django.urls import reverse
 from django.utils import timezone
 
 from apps.trees.models import Tree
@@ -318,23 +320,50 @@ def georeference_image(image: Image) -> Image:
     return image
 
 
-def clip_to_block(image: Image, block):
-    """rasterio.mask.mask() against the block's boundary, reprojected into
-    the raster's native CRS first (rasterio.mask.mask expects geometries
-    in the raster's own CRS, not necessarily 4326). Returns
-    (clipped_array, transform, crs) — the exact contract every detector
-    callable in apps/imagery/ml/detection.py expects.
+def clip_to_block(image: Image, block, max_gsd_m=None):
+    """Clips the image to the block's boundary (reprojected into the
+    raster's native CRS first). Returns (clipped_array, transform, crs) —
+    the exact contract every detector callable in
+    apps/imagery/ml/detection.py expects.
+
+    `max_gsd_m`: if the raster is finer than this (metres/pixel), the clip
+    is read at this resolution instead of native. Found live: a 2 cm
+    orthomosaic block (~640 x 680 m) is ~4 GB of pixels at native
+    resolution, and the worker was SIGKILLed (out of memory) while
+    clipping — every B3 run died there, and sat at "Clipping" until the
+    stale-run sweep. Detection resamples to ~6 cm and classification to
+    ~15 cm anyway, so reading finer than the detection target only costs
+    memory. A decimated windowed read of a COG uses its overviews, so this
+    is also faster. None keeps the native-resolution behaviour.
     """
+    import numpy as np
     import rasterio
+    from rasterio.features import geometry_mask, geometry_window
     from rasterio.mask import mask
+    from rasterio.transform import Affine
     from rasterio.warp import transform_geom
+    from rasterio.windows import transform as window_transform
 
     with rasterio.open(image.raw_file.path) as src:
         boundary_geojson = json.loads(block.boundary.geojson)
         if src.crs is not None and src.crs.to_epsg() != 4326:
             boundary_geojson = transform_geom("EPSG:4326", src.crs, boundary_geojson)
-        out_image, out_transform = mask(src, [boundary_geojson], crop=True)
-        return out_image, out_transform, src.crs
+
+        native_gsd = _native_gsd_m(src.transform, src.crs)
+        if not max_gsd_m or native_gsd >= max_gsd_m * 0.95:
+            out_image, out_transform = mask(src, [boundary_geojson], crop=True)
+            return out_image, out_transform, src.crs
+
+        factor = max_gsd_m / native_gsd
+        window = geometry_window(src, [boundary_geojson]).round_offsets().round_lengths()
+        out_height = max(1, round(window.height / factor))
+        out_width = max(1, round(window.width / factor))
+        data = src.read(window=window, out_shape=(src.count, out_height, out_width), resampling=rasterio.enums.Resampling.average)
+        base = window_transform(window, src.transform)
+        out_transform = base * Affine.scale(window.width / out_width, window.height / out_height)
+        outside = geometry_mask([boundary_geojson], out_shape=(out_height, out_width), transform=out_transform, invert=False)
+        data = np.where(outside[None, :, :], np.zeros((), dtype=data.dtype), data)
+        return data, out_transform, src.crs
 
 
 def persist_clipped_block_imagery(
@@ -911,6 +940,14 @@ def delete_image(image: Image) -> None:
         if classification.patch_image
     ]
 
+    # Each run's clipped COG/preview are files too — the cascade delete of
+    # the runs below doesn't remove them (4+ GB were orphaned this way).
+    for run in ImageProcessingRun.objects.filter(image=image):
+        if run.clipped_cog_file:
+            run.clipped_cog_file.delete(save=False)
+        if run.clipped_preview_file:
+            run.clipped_preview_file.delete(save=False)
+
     if image.raw_file:
         image.raw_file.delete(save=False)
     if image.preview_file:
@@ -1091,7 +1128,7 @@ def classify_detection(detection: TreeDetection, clipped_array, transform, crs=N
     native_patch_size_px = classification_native_patch_size_px(CLASSIFICATION_PATCH_SIZE_PX, native_gsd_m)
     patch = crop_patch(clipped_array, transform, lon, lat, crs=crs, patch_size_px=native_patch_size_px)
     if patch is None:
-        label, confidence = "healthy", 0.0  # unusable patch -> treated exactly like a low-confidence result, always routed to review
+        label, confidence = "unknown", 0.0  # unusable patch -> no guess; always routed to review
     else:
         label, confidence = classifier(patch)
 
@@ -1123,11 +1160,39 @@ def classify_detection(detection: TreeDetection, clipped_array, transform, crs=N
     # an already-matched detection (detection.tree_id set) — a
     # new_candidate detection has no Tree yet at classification time; see
     # confirm_new_candidate()'s matching sync for that case.
-    if detection.tree_id:
+    if detection.tree_id and classification.is_trustworthy:
         detection.tree.current_health = classification.effective_label
-        detection.tree.save(update_fields=["current_health"])
+        detection.tree.save(update_fields=["current_health", "updated_at"])
 
     return classification
+
+
+ACTIVE_RUN_STATUSES = (
+    ImageProcessingRun.STATUS_PENDING,
+    ImageProcessingRun.STATUS_CLIPPING,
+    ImageProcessingRun.STATUS_DETECTING,
+    ImageProcessingRun.STATUS_CLASSIFYING,
+)
+
+
+def start_processing_run(image, block, user):
+    """Creates a run and queues it — unless this image is already being
+    processed against this block, in which case that run is returned
+    unchanged. Two overlapping runs on one block doubled the memory load
+    (B3 had two runs killed together) and produce duplicate detections.
+    Returns (run, started).
+    """
+    from .tasks import run_processing_task
+
+    with transaction.atomic():
+        FarmBlockModel = block.__class__
+        FarmBlockModel.objects.select_for_update().filter(pk=block.pk).first()  # serialise concurrent starts
+        active = ImageProcessingRun.objects.filter(image=image, farm_block=block, status__in=ACTIVE_RUN_STATUSES).first()
+        if active is not None:
+            return active, False
+        run = ImageProcessingRun.objects.create(image=image, farm_block=block, triggered_by=user)
+    run_processing_task.delay(str(run.id))
+    return run, True
 
 
 def run_processing(run: ImageProcessingRun, detector=None, classifier=None) -> ImageProcessingRun:
@@ -1179,7 +1244,9 @@ def run_processing(run: ImageProcessingRun, detector=None, classifier=None) -> I
     run.save(update_fields=["status", "started_at"])
 
     try:
-        clipped_array, clipped_transform, clip_crs = clip_to_block(run.image, block)
+        clipped_array, clipped_transform, clip_crs = clip_to_block(
+            run.image, block, max_gsd_m=block.effective_detection_target_gsd_m()
+        )
     except Exception as exc:  # noqa: BLE001 — any clip failure must land in error_message, not crash the task
         return _fail(f"Clipping failed: {exc}")
 
@@ -1310,10 +1377,7 @@ def _notify_processing_failure(run: ImageProcessingRun):
         NotificationCategory.PROCESSING_FAILURE,
         title=f"Imagery processing failed — {run.farm_block.name}",
         message=run.error_message or "Processing run failed with no error message recorded.",
-        # No standalone processing-run detail endpoint exists — see
-        # apps/imagery/urls.py — so this points at the nearest real one
-        # (that block's run list) rather than a URL that would 404.
-        link=f"/api/farm-blocks/{run.farm_block_id}/processing-runs/",
+        link=reverse("dashboard:imagery-run", kwargs={"run_id": run.id}),
     )
 
 
@@ -1350,15 +1414,38 @@ def confirm_new_candidate(detection: TreeDetection, user, classifier=None, clipp
     DRF confirm action, ConfirmDetectionView) stay unchanged — for one
     detection there's nothing to amortize.
     """
-    tree = Tree.objects.create(
-        farm_block=detection.processing_run.farm_block,
-        location=detection.detected_location,
-        source=Tree.SOURCE_DRONE_DETECTED,
-        created_by=user,
-        updated_by=user,
-    )
-    detection.tree = tree
-    detection.save(update_fields=["tree"])
+    block = detection.processing_run.farm_block
+    with transaction.atomic():
+        # Lock the detection so a double-click or a retried request can't
+        # both pass the check below and each create a tree (proven: confirming
+        # twice used to give two trees).
+        detection = TreeDetection.objects.select_for_update().get(pk=detection.pk)
+        if detection.tree_id:
+            return detection.tree  # already confirmed — idempotent
+
+        # A second run over the same area re-detects palms an earlier
+        # review already turned into trees, and both queues showed them as
+        # "new". Link to the tree already standing there instead of
+        # creating a duplicate.
+        status, existing, distance_m = match_detection(
+            block, detection.detected_location, block.effective_tree_match_threshold_m()
+        )
+        if status == TreeDetection.MATCH_MATCHED:
+            detection.tree = existing
+            detection.match_status = TreeDetection.MATCH_MATCHED
+            detection.matched_distance_m = distance_m
+            detection.save(update_fields=["tree", "match_status", "matched_distance_m"])
+            return existing
+
+        tree = Tree.objects.create(
+            farm_block=block,
+            location=detection.detected_location,
+            source=Tree.SOURCE_DRONE_DETECTED,
+            created_by=user,
+            updated_by=user,
+        )
+        detection.tree = tree
+        detection.save(update_fields=["tree"])
 
     # Cheap existence check before paying for a real rasterio clip — per
     # this function's own docstring, that's the common case now that
@@ -1367,7 +1454,10 @@ def confirm_new_candidate(detection: TreeDetection, user, classifier=None, clipp
     if classification is None:
         try:
             if clipped is None:
-                clipped = clip_to_block(detection.processing_run.image, detection.processing_run.farm_block)
+                clipped = clip_to_block(
+                    detection.processing_run.image, detection.processing_run.farm_block,
+                    max_gsd_m=detection.processing_run.farm_block.effective_detection_target_gsd_m(),
+                )
             clipped_array, clipped_transform, clip_crs = clipped
             classification = classify_detection(
                 detection, clipped_array, clipped_transform, crs=clip_crs, classifier=classifier
@@ -1380,8 +1470,8 @@ def confirm_new_candidate(detection: TreeDetection, user, classifier=None, clipp
     # classified this (new_candidate) detection, so that sync couldn't
     # reach it; this is the other half of the same fix for the
     # new_candidate path.
-    if classification is not None:
+    if classification is not None and classification.is_trustworthy:
         tree.current_health = classification.effective_label
-        tree.save(update_fields=["current_health"])
+        tree.save(update_fields=["current_health", "updated_at"])
 
     return tree

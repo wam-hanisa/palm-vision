@@ -33,7 +33,7 @@ from .serializers import (
     ModelVersionSerializer,
     TreeDetectionSerializer,
 )
-from .tasks import georeference_image_task, run_processing_task
+from .tasks import georeference_image_task
 
 
 def _user_farm_ids(user):
@@ -72,6 +72,12 @@ class ImageViewSet(viewsets.ModelViewSet):
         if not (user.is_superuser or user_role_on_farm(user, farm) == UserFarmRole.ROLE_MANAGER):
             raise PermissionDenied("Only a Manager or Super Admin can edit imagery for this farm.")
         serializer.save()
+
+    def perform_destroy(self, instance):
+        user = self.request.user
+        if not (user.is_superuser or user_role_on_farm(user, instance.farm) == UserFarmRole.ROLE_MANAGER):
+            raise PermissionDenied("Only a Manager or Super Admin can delete imagery for this farm.")
+        instance.delete()
 
 
 class ModelVersionViewSet(viewsets.ModelViewSet):
@@ -124,13 +130,14 @@ class ProcessImageView(APIView):
                 {"image": "This image hasn't finished georeferencing yet — wait for georeference_status=done."}
             )
 
-        run = ImageProcessingRun.objects.create(image=image, farm_block=block, triggered_by=request.user)
-
-        # CELERY_TASK_ALWAYS_EAGER=True in settings.test runs this
+        # CELERY_TASK_ALWAYS_EAGER=True in settings.test runs the task
         # synchronously during tests — see palmvision/settings/test.py.
-        run_processing_task.delay(str(run.id))
+        run, started = services.start_processing_run(image, block, request.user)
         run.refresh_from_db()
-        return Response(ImageProcessingRunSerializer(run).data, status=status.HTTP_201_CREATED)
+        return Response(
+            ImageProcessingRunSerializer(run).data,
+            status=status.HTTP_201_CREATED if started else status.HTTP_200_OK,
+        )
 
 
 class BlockProcessingRunsView(APIView):
@@ -217,6 +224,8 @@ class DetectionActionViewSet(viewsets.GenericViewSet):
     def reject(self, request, pk=None):
         """docs/04-api-spec.md: "Reject a false-positive detection." """
         detection = self.get_object()
+        if detection.tree_id:
+            raise DRFValidationError({"detail": "This detection is already linked to a tree — it can't be rejected."})
         detection.match_status = TreeDetection.MATCH_REJECTED
         detection.save(update_fields=["match_status"])
         return Response(TreeDetectionSerializer(detection).data)
@@ -232,7 +241,9 @@ class DetectionActionViewSet(viewsets.GenericViewSet):
         tree_id = request.data.get("tree_id")
         if not tree_id:
             raise DRFValidationError({"tree_id": "Required."})
-        tree = get_object_or_404(Tree, id=tree_id, farm_block=detection.processing_run.farm_block)
+        tree = get_object_or_404(
+            Tree, id=tree_id, farm_block=detection.processing_run.farm_block, status=Tree.STATUS_ACTIVE
+        )
         detection.tree = tree
         detection.match_status = TreeDetection.MATCH_MATCHED
         detection.save(update_fields=["tree", "match_status"])

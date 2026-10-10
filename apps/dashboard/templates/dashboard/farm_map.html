@@ -152,6 +152,12 @@ scripted.
       </select>
       <label for="map-block-filter">Block</label>
       <select id="map-block-filter"><option value="">All blocks</option></select>
+      <label for="map-color-mode">Colour by</label>
+      <select id="map-color-mode">
+        <option value="health">Health + status ring</option>
+        <option value="harvest">Harvest status</option>
+        <option value="fertilizer">Fertilizer status</option>
+      </select>
       <button type="button" id="upload-imagery-btn" class="secondary-button">Upload imagery</button>
     </div>
     <aside class="farm-map-panel" id="farm-map-panel"></aside>
@@ -160,14 +166,19 @@ scripted.
   <div class="map-legend">
     <div class="map-legend-group"><span class="legend-swatch legend-swatch-line" style="background:#2F4A38;"></span> Block boundary</div>
     <div class="map-legend-group"><span class="legend-swatch legend-swatch-line" style="background:#D9A441;"></span> Image footprint</div>
-    <div class="map-legend-group"><span class="legend-swatch" style="background:#99B29D;"></span> Healthy tree</div>
-    <div class="map-legend-group"><span class="legend-swatch" style="background:#9B4D3E;"></span> Yellowing</div>
-    <div class="map-legend-group"><span class="legend-swatch" style="background:#8A8578;"></span> Unknown health</div>
-    <div class="map-legend-group"><span class="legend-swatch legend-swatch-ring legend-swatch-ring-thick" style="border-color:#3B6FA0;"></span> Needs action (marked by a Manager)</div>
-    <div class="map-legend-group"><span class="legend-swatch legend-swatch-ring legend-swatch-ring-dashed" style="border-color:#C0392B;"></span> Harvest/fertilizer overdue</div>
-    <div class="map-legend-group"><span class="legend-swatch legend-swatch-ring legend-swatch-ring-dotted" style="border-color:#D9A441;"></span> Due soon</div>
-    <div class="map-legend-group"><span class="legend-swatch legend-swatch-ring legend-swatch-ring-sparse" style="border-color:#8A8578;"></span> Never recorded</div>
-    <div class="map-legend-group"><span class="legend-swatch legend-swatch-ring" style="border-color:#1F7A8C;"></span> OK (within interval)</div>
+    <div class="map-legend-group" data-legend="harvest fertilizer" hidden><span class="legend-swatch" style="background:#3B6FA0;"></span> Needs action (marked)</div>
+    <div class="map-legend-group" data-legend="harvest fertilizer" hidden><span class="legend-swatch" style="background:#C0392B;"></span> Overdue</div>
+    <div class="map-legend-group" data-legend="harvest fertilizer" hidden><span class="legend-swatch" style="background:#D9A441;"></span> Due soon</div>
+    <div class="map-legend-group" data-legend="harvest fertilizer" hidden><span class="legend-swatch" style="background:#1F7A8C;"></span> OK (within interval)</div>
+    <div class="map-legend-group" data-legend="harvest fertilizer" hidden><span class="legend-swatch" style="background:#8A8578;"></span> Never recorded</div>
+    <div class="map-legend-group" data-legend="health"><span class="legend-swatch" style="background:#99B29D;"></span> Healthy tree</div>
+    <div class="map-legend-group" data-legend="health"><span class="legend-swatch" style="background:#9B4D3E;"></span> Yellowing</div>
+    <div class="map-legend-group" data-legend="health"><span class="legend-swatch" style="background:#8A8578;"></span> Unknown health</div>
+    <div class="map-legend-group" data-legend="health"><span class="legend-swatch legend-swatch-ring legend-swatch-ring-thick" style="border-color:#3B6FA0;"></span> Needs action (marked by a Manager)</div>
+    <div class="map-legend-group" data-legend="health"><span class="legend-swatch legend-swatch-ring legend-swatch-ring-dashed" style="border-color:#C0392B;"></span> Harvest/fertilizer overdue</div>
+    <div class="map-legend-group" data-legend="health"><span class="legend-swatch legend-swatch-ring legend-swatch-ring-dotted" style="border-color:#D9A441;"></span> Due soon</div>
+    <div class="map-legend-group" data-legend="health"><span class="legend-swatch legend-swatch-ring legend-swatch-ring-sparse" style="border-color:#8A8578;"></span> Never recorded</div>
+    <div class="map-legend-group" data-legend="health"><span class="legend-swatch legend-swatch-ring" style="border-color:#1F7A8C;"></span> OK (within interval)</div>
   </div>
 </div>
 
@@ -197,6 +208,14 @@ scripted.
 
   function buildUrl(template, id) {
     return template.replace(data.url_placeholder, id);
+  }
+
+  // For the handful of URLs with two dynamic UUID segments (block id + a
+  // plan/actual id) — see _URL_PLACEHOLDER_UUID_2's own comment in
+  // views.py for why buildUrl() above can't just be called twice with the
+  // same placeholder.
+  function buildUrl2(template, id1, id2) {
+    return template.replace(data.url_placeholder, id1).replace(data.url_placeholder_2, id2);
   }
 
   // Image footprints are always axis-aligned rectangles (georeference_image()
@@ -264,21 +283,61 @@ scripted.
     setTimeout(function () { if (flashHost.contains(div)) flashHost.removeChild(div); }, 5000);
   }
 
+  // Every view here answers AJAX with JSON — including its own validation
+  // errors — so a non-JSON response means something outside the view went
+  // wrong. Say which, and what to do: the old catch-all "Couldn't save
+  // that — try again" was wrong for an expired session or a stale CSRF
+  // token (trying again can't work; only a reload can), and said "save"
+  // for deletes and approvals too.
+  function explainNonJson(r, bodyText) {
+    if (r.redirected && r.url.indexOf("/login/") !== -1) {
+      return "You've been signed out — reload the page and sign in again. Nothing was changed.";
+    }
+    if (r.status === 403 && bodyText.indexOf("CSRF") !== -1) {
+      return "This page is out of date (you may have signed in again elsewhere) — reload it and try again. Nothing was changed.";
+    }
+    if (r.status === 403) {
+      return "You don't have permission to do that. Nothing was changed.";
+    }
+    if (r.status >= 500) {
+      return "The server hit an error and nothing was changed. Try again; if it keeps happening, report it.";
+    }
+    return "That didn't go through (error " + r.status + "). Nothing was changed.";
+  }
+
+  function isJson(r) {
+    return (r.headers.get("Content-Type") || "").indexOf("application/json") !== -1;
+  }
+
+  var OFFLINE_MESSAGE = "Couldn't reach the server — check your connection and try again. Nothing was changed.";
+
   function getJson(url) {
     return fetch(url, { headers: { "X-Requested-With": "XMLHttpRequest" } })
-      .then(function (r) { return r.json(); })
-      .catch(function (err) {
-        showFlash("Couldn't load that — try again.", "error");
+      .then(function (r) {
+        if (isJson(r)) return r.json();
+        return r.text().then(function (bodyText) {
+          var message = explainNonJson(r, bodyText);
+          showFlash(message, "error");
+          throw new Error(message);
+        });
+      }, function (err) {
+        showFlash(OFFLINE_MESSAGE, "error");
         throw err;
       });
   }
 
+  // Never rejects: a failure resolves to { ok: false, message }, the same
+  // shape the views' own error responses use, so every caller's existing
+  // failure branch shows the message and re-enables its button. It used
+  // to reject, which skipped the caller's .then() entirely and left the
+  // form's submit button disabled until a full reload.
   function postJson(url, formData) {
     return fetch(url, { method: "POST", headers: { "X-Requested-With": "XMLHttpRequest" }, body: formData })
-      .then(function (r) { return r.json(); })
-      .catch(function (err) {
-        showFlash("Couldn't save that — try again.", "error");
-        throw err;
+      .then(function (r) {
+        if (isJson(r)) return r.json();
+        return r.text().then(function (bodyText) { return { ok: false, message: explainNonJson(r, bodyText) }; });
+      }, function () {
+        return { ok: false, message: OFFLINE_MESSAGE };
       });
   }
 
@@ -312,15 +371,16 @@ scripted.
   // Reported directly, with a screenshot: every tile had been replaced
   // with OSM's own "Access blocked" image, confirming the server had
   // deliberately blocked this connection, not a transient network error.
-  // Switched to CARTO's free Voyager basemap (basemaps.cartocdn.com) —
-  // same underlying OSM data, no API key, explicitly supports this kind
-  // of unauthenticated embedded use — same free-no-signup bar the Esri
-  // satellite layer below was already held to.
-  var streetBaseLayer = L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
-    maxZoom: 20,
-    subdomains: "abcd",
-    attribution: "&copy; OpenStreetMap contributors &copy; CARTO",
-  });
+  // Switched to CARTO's free Voyager basemap — but CARTO later started
+  // requiring an API key and now serves an "API KEY REQUIRED" image for
+  // every tile. Now Esri's World Street Map: the same keyless provider
+  // the satellite layer below already uses, so no new third-party
+  // dependency. Tiles exist to zoom 19; maxNativeZoom lets Leaflet
+  // upscale beyond that instead of requesting tiles that don't exist.
+  var streetBaseLayer = L.tileLayer(
+    "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
+    { maxZoom: 20, maxNativeZoom: 19, attribution: "Tiles &copy; Esri — Source: Esri, HERE, Garmin, USGS, and others" }
+  );
   var satelliteBaseLayer = L.tileLayer(
     "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
     { maxZoom: 20, attribution: "Tiles &copy; Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community" }
@@ -403,7 +463,7 @@ scripted.
         var layer = L.geoJSON(block.geometry, {
           style: { color: "#2F4A38", weight: block.suggested ? 3 : 2, fillOpacity: block.suggested ? 0.35 : 0.05 },
         }).addTo(map);
-        layer.bindPopup(block.name);
+        layer.bindPopup(el("span", { text: block.name }));
         layer.on("click", function () {
           var checkbox = list.querySelector('input[value="' + block.id + '"]');
           setBlockChecked(block.id, checkbox ? !checkbox.checked : true);
@@ -455,7 +515,7 @@ scripted.
     panelEl.appendChild(actionButton("Cancel", exitUploadConfirmMode, "secondary-button"));
 
     if (boundsSources.length) {
-      map.fitBounds(L.featureGroup(boundsSources).getBounds().pad(0.15));
+      fitMapTo(L.featureGroup(boundsSources).getBounds());
     } else {
       map.setView([0, 0], 2);
     }
@@ -540,6 +600,25 @@ scripted.
     return { color: "#1F7A8C", weight: 2, dashArray: null };
   }
 
+  // "Colour trees by" — the combined view (health fill + worst-of-both ring)
+  // turned a block where almost every tree is overdue into a solid red mass
+  // that said nothing. Harvest/Fertilizer modes colour the FILL by that one
+  // stage instead (same stage colours the legend already used for rings), so
+  // the actual spread — e.g. 40 OK vs 1,000 overdue — is visible at a glance.
+  var stageColors = { marked: "#3B6FA0", overdue: "#C0392B", due_soon: "#D9A441", never: "#8A8578", ok: "#1F7A8C" };
+
+  function markerPaint(tree) {
+    if (state.colorMode === "harvest" || state.colorMode === "fertilizer") {
+      var stage = state.colorMode === "harvest" ? tree.harvest_stage : tree.fertilizer_stage;
+      return { color: "#2B2A25", weight: 1, dashArray: null, fillColor: stageColors[stage] || stageColors.never };
+    }
+    var indicator = treeIndicatorStyle(tree);
+    return {
+      color: indicator.color, weight: indicator.weight, dashArray: indicator.dashArray,
+      fillColor: healthColors[tree.health] || healthColors.unknown,
+    };
+  }
+
   var intervalStatusLabels = {
     never: "Never recorded", ok: "OK", due_soon: "Due soon", overdue: "Overdue", marked: "Needs action",
   };
@@ -551,14 +630,14 @@ scripted.
   // date on record), or "Never recorded (every 14 days)" (no date yet).
   function formatIntervalDetail(lastAtIso, stage, intervalDays, markedAtIso, markedByName) {
     if (stage === "marked") {
-      var assignedWhen = markedAtIso ? new Date(markedAtIso).toLocaleDateString() : "recently";
+      var assignedWhen = markedAtIso ? new Date(markedAtIso).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }) : "recently";
       return "Needs action — assigned " + assignedWhen + (markedByName ? " by " + markedByName : "") + ".";
     }
     var label = intervalStatusLabels[stage] || stage;
     if (!lastAtIso) return label + " (every " + intervalDays + " days)";
     var lastDate = new Date(lastAtIso + "T00:00:00");
     var daysAgo = Math.round((Date.now() - lastDate.getTime()) / 86400000);
-    var when = lastDate.toLocaleDateString();
+    var when = lastDate.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
     return when + " — " + daysAgo + " day" + (daysAgo === 1 ? "" : "s") + " ago (" + label + ", every " + intervalDays + " days)";
   }
 
@@ -637,13 +716,13 @@ scripted.
     // then removed: reported directly, "show dot as is," not grouped).
     treeMarkers = data.trees.map(function (tree) {
       var coords = tree.geometry.coordinates; // [lon, lat]
-      var indicator = treeIndicatorStyle(tree);
+      var paint = markerPaint(tree);
       var marker = L.circleMarker([coords[1], coords[0]], {
         radius: 6,
-        color: indicator.color,
-        weight: indicator.weight,
-        dashArray: indicator.dashArray,
-        fillColor: healthColors[tree.health] || healthColors.unknown,
+        color: paint.color,
+        weight: paint.weight,
+        dashArray: paint.dashArray,
+        fillColor: paint.fillColor,
         fillOpacity: 0.85,
       });
       marker.on("click", function () {
@@ -651,8 +730,8 @@ scripted.
         else selectTree(tree.id);
       });
       return {
-        farmId: tree.farm_id, blockId: tree.block_id, treeId: tree.id, marker: marker,
-        indicatorWeight: indicator.weight,
+        farmId: tree.farm_id, blockId: tree.block_id, treeId: tree.id, marker: marker, tree: tree,
+        indicatorWeight: paint.weight,
       };
     });
   }
@@ -662,6 +741,7 @@ scripted.
   // (see startTreeSelection() below). The marker click handler above only
   // ever checks planningBlockId, so it stays generic across all three modes.
   var state = {
+    colorMode: "health", // "health" | "harvest" | "fertilizer" — see markerPaint()
     farmId: null, blockId: null, treeId: null,
     planningBlockId: null, selectionMode: null, selectedTreeIds: {},
     // Per-tree quantity typed into renderTreeSelectionChecklist()'s
@@ -680,6 +760,15 @@ scripted.
     // overwrites a per-tree value the Manager is still in the middle of
     // typing. Cleared at the same points selectedTreeQuantities is.
     bulkQuantityValue: "",
+    // Set by startEditActualRecord() below when the current
+    // record_actual_harvest/record_actual_fertilizer checklist is editing
+    // an existing ActualHarvest/ActualFertilizer rather than creating a
+    // new one — submitActualRecord() reads this to pick the *_actual_edit
+    // endpoint instead of *_record, and renderRecordActualSection() reads
+    // editingActualDate to prefill the date field. Cleared on cancel and
+    // on a successful submit, same as the rest of this selection state.
+    editingActualId: null,
+    editingActualDate: null,
     // Which single-tree quick-mark inline form (renderTreeDetailPanel()
     // below) is currently expanded — null, "mark_harvested" or
     // "mark_fertilized". Reset to null whenever the tree detail panel is
@@ -753,6 +842,50 @@ scripted.
     return { farmId: block.farm_id, imageId: imageId, layer: group };
   }
 
+  // Applies colour (per state.colorMode) plus selection/planning emphasis to
+  // one tree marker. Shared by renderMap() and repaintMarkers().
+  function styleMarker(e) {
+    var paint = markerPaint(e.tree);
+    e.indicatorWeight = paint.weight;
+    var isPlanning = state.planningBlockId === e.blockId;
+    var isChecked = !!state.selectedTreeIds[e.treeId];
+    var isSelectedTree = e.treeId === state.treeId;
+    e.marker.setStyle({
+      radius: isSelectedTree || isChecked ? 8 : 6,
+      color: paint.color,
+      dashArray: paint.dashArray,
+      fillColor: paint.fillColor,
+      // Selection bumps the ring's own weight by 1 rather than overriding it.
+      weight: isSelectedTree || isChecked ? paint.weight + 1 : paint.weight,
+      fillOpacity: isPlanning && !isChecked ? 0.4 : 0.85,
+    });
+  }
+
+  // Recolour every marker in place (no re-fit, no layer rebuild) when the
+  // "Colour trees by" switch changes.
+  function repaintMarkers() {
+    treeMarkers.forEach(styleMarker);
+    updateLegend();
+  }
+
+  function updateLegend() {
+    document.querySelectorAll("[data-legend]").forEach(function (node) {
+      var modes = node.getAttribute("data-legend").split(" ");
+      node.hidden = modes.indexOf(state.colorMode) === -1;
+    });
+  }
+
+  // Zoom-to-fit that leaves room for the floating panel. On wide screens the
+  // panel (.farm-map-float) sits ON TOP of the map's left edge, so a plain
+  // fitBounds() centred the data under it and half of a block was hidden.
+  // When the panel is stacked below the map (narrow layout) no padding is needed.
+  function fitMapTo(bounds) {
+    var floatEl = document.querySelector(".farm-map-float");
+    var overlaps = floatEl && window.getComputedStyle(floatEl).position === "absolute";
+    var left = overlaps ? floatEl.offsetWidth + 32 : 16;
+    map.fitBounds(bounds, { paddingTopLeft: [left, 24], paddingBottomRight: [24, 24] });
+  }
+
   function renderMap() {
     clearCurrentMapLayers();
 
@@ -810,17 +943,7 @@ scripted.
     // .getBounds() too (used by the boundsSources fitBounds call below).
     currentTreeLayer = L.featureGroup();
     visibleTrees.forEach(function (e) {
-      var isPlanning = state.planningBlockId === e.blockId;
-      var isChecked = !!state.selectedTreeIds[e.treeId];
-      var isSelectedTree = e.treeId === state.treeId;
-      e.marker.setStyle({
-        radius: isSelectedTree || isChecked ? 8 : 6,
-        // Selection bumps the indicator ring's own weight by 1 rather than
-        // overriding it outright — an overdue tree still reads as overdue
-        // once selected, it just gets a slightly heavier ring on top.
-        weight: isSelectedTree || isChecked ? e.indicatorWeight + 1 : e.indicatorWeight,
-        fillOpacity: isPlanning && !isChecked ? 0.4 : 0.85,
-      });
+      styleMarker(e);
       currentTreeLayer.addLayer(e.marker);
     });
     currentTreeLayer.addTo(map);
@@ -829,18 +952,18 @@ scripted.
       .concat(currentImageLayers.map(function (e) { return e.layer; }));
     if (visibleTrees.length) boundsSources.push(currentTreeLayer);
     if (boundsSources.length) {
-      map.fitBounds(L.featureGroup(boundsSources).getBounds().pad(0.15));
+      fitMapTo(L.featureGroup(boundsSources).getBounds());
     } else {
       map.setView([0, 0], 2);
     }
   }
 
   function repopulateBlockOptions(selectedFarmId) {
-    var options = ['<option value="">All blocks</option>'];
+    blockSelect.innerHTML = "";
+    blockSelect.appendChild(new Option("All blocks", ""));
     data.blocks
       .filter(function (b) { return !selectedFarmId || b.farm_id === selectedFarmId; })
-      .forEach(function (b) { options.push('<option value="' + b.id + '">' + b.name + "</option>"); });
-    blockSelect.innerHTML = options.join("");
+      .forEach(function (b) { blockSelect.appendChild(new Option(b.name, b.id)); });
   }
 
   farmSelect.addEventListener("change", function () { selectFarm(farmSelect.value || null); });
@@ -849,6 +972,12 @@ scripted.
     else selectFarm(state.farmId);
   });
   if (uploadImageryBtn) uploadImageryBtn.addEventListener("click", startImageUpload);
+  var colorModeSelect = document.getElementById("map-color-mode");
+  if (colorModeSelect) colorModeSelect.addEventListener("change", function () {
+    state.colorMode = colorModeSelect.value;
+    repaintMarkers();
+    renderPanel();
+  });
 
   function selectFarm(farmId) {
     exitInteractiveModes();
@@ -945,13 +1074,22 @@ scripted.
   // mechanics (click a marker, check a box, or lasso — see
   // renderTreeSelectionChecklist()/startLassoSelect() below) are
   // identical across all three; only what happens on confirm differs.
-  function startTreeSelection(blockId, mode) {
+  function startTreeSelection(blockId, mode, preserveSelection) {
     exitInteractiveModes();
     state.planningBlockId = blockId;
     state.selectionMode = mode;
-    state.selectedTreeIds = {};
-    state.selectedTreeQuantities = {};
-    state.bulkQuantityValue = "";
+    // preserveSelection: true skips the usual blank-slate reset — used
+    // only by startEditActualRecord() below, which seeds selectedTreeIds/
+    // selectedTreeQuantities/bulkQuantityValue from an existing record
+    // BEFORE calling this, and would otherwise have that prefill wiped out
+    // immediately by the reset every fresh "select trees" entry point needs.
+    if (!preserveSelection) {
+      state.selectedTreeIds = {};
+      state.selectedTreeQuantities = {};
+      state.bulkQuantityValue = "";
+      state.editingActualId = null;
+      state.editingActualDate = null;
+    }
     renderMap();
     renderPanel();
   }
@@ -963,6 +1101,8 @@ scripted.
     state.selectedTreeIds = {};
     state.selectedTreeQuantities = {};
     state.bulkQuantityValue = "";
+    state.editingActualId = null;
+    state.editingActualDate = null;
     renderMap();
     renderPanel();
   }
@@ -1009,6 +1149,15 @@ scripted.
       var submitBtn = form.querySelector('button[type="submit"]');
       if (submitBtn) submitBtn.disabled = true;
       var formData = new FormData(form);
+      // opts.includeTreeIds (set by startHarvestPlanForm above) carries a
+      // tree-selection checklist's picks through to a plain form submit —
+      // this form has no tree_ids field of its own, since it's shared with
+      // HarvestPlanUpdateView, which has no tree checklist at all. Encoded
+      // the same JSON-array way _tree_ids_from_request() (views.py) already
+      // decodes for every other tree-selection action on this page.
+      if (opts.includeTreeIds) {
+        formData.set("tree_ids", JSON.stringify(opts.includeTreeIds));
+      }
       postJson(form.getAttribute("action"), formData).then(function (json) {
         if (submitBtn) submitBtn.disabled = false;
         if (json.ok) {
@@ -1026,7 +1175,9 @@ scripted.
           refreshData(json.farm_map_data, focus);
         } else {
           showFlash(json.message, "error");
-          rerender(json.html);
+          // Validation errors come back with the re-rendered form; a
+          // session/network failure doesn't — keep what was typed.
+          if (json.html) rerender(json.html);
         }
       });
     });
@@ -1193,7 +1344,7 @@ scripted.
     (blocksByFarm[block.farm_id] || []).forEach(function (b) {
       if (b.id === block.id || !b.geometry) return;
       var layer = L.geoJSON(b.geometry, { style: { color: "#8A8578", weight: 1, fillOpacity: 0.05, dashArray: "3 3" } });
-      layer.bindPopup(b.name);
+      layer.bindPopup(el("span", { text: b.name }));
       layer.addTo(map);
       dimmedLayers.push(layer);
     });
@@ -1250,7 +1401,7 @@ scripted.
     var boundsSources = dimmedLayers.concat(drawnItems.getLayers().length ? [drawnItems] : []);
     if (boundsSources.length) {
       try {
-        map.fitBounds(L.featureGroup(boundsSources).getBounds().pad(0.2));
+        fitMapTo(L.featureGroup(boundsSources).getBounds().pad(0.1));
       } catch (err) { /* no valid bounds among these layers — leave the current view alone */ }
     }
 
@@ -1352,11 +1503,18 @@ scripted.
   }
 
   function startHarvestPlanForm(block) {
+    // includeSelectedTreeIds: true carries the checklist selection from
+    // renderHarvestPlanningSection() through to this form's own submit
+    // (bindPanelForm below) — the tree ids aren't fields on this form
+    // itself (it only has assessment_date/assessment_quantity), so
+    // without this they'd never reach HarvestPlanCreateView at all.
+    var selectedTreeIds = Object.keys(state.selectedTreeIds);
     exitInteractiveModes();
     getJson(buildUrl(data.urls.harvest_plan_add, block.id)).then(function (json) {
       openForm("Add harvest plan", blockBreadcrumb(block), json.html, {
         onCancel: function () { selectBlock(block.id, "harvest"); },
         focusSection: "harvest",
+        includeTreeIds: selectedTreeIds,
       });
     });
   }
@@ -1369,11 +1527,13 @@ scripted.
   // own docstring in apps/dashboard/forms.py) — so this goes straight to
   // the form, block-level only.
   function startFertilizerPlanForm(block) {
+    var selectedTreeIds = Object.keys(state.selectedTreeIds);
     exitInteractiveModes();
     getJson(buildUrl(data.urls.fertilizer_plan_add, block.id)).then(function (json) {
       openForm("Add fertilizer plan", blockBreadcrumb(block), json.html, {
         onCancel: function () { selectBlock(block.id, "fertilizer"); },
         focusSection: "fertilizer",
+        includeTreeIds: selectedTreeIds,
       });
     });
   }
@@ -1687,6 +1847,13 @@ scripted.
     panelEl.appendChild(el("h2", { class: "panel-heading", text: farm ? farm.name : "Farm" }));
     var blocks = blocksByFarm[state.farmId] || [];
     panelEl.appendChild(el("p", { class: "panel-subheading", text: blocks.length + (blocks.length === 1 ? " block" : " blocks") }));
+    // Farm-wide yield/fertilizer totals — summed server-side across this
+    // farm's own blocks (_build_farm_map_data() in views.py), same
+    // renderRateSummary() the block-level Harvest/Fertilizer panels use.
+    if (farm) {
+      panelEl.appendChild(renderRateSummary(farm.yield_summary, "kg", "Harvest yield"));
+      panelEl.appendChild(renderRateSummary(farm.fertilizer_summary, "kg", "Fertilizer applied"));
+    }
     panelEl.appendChild(el("div", { class: "panel-actions" }, [
       actionButton("+ Add block", function () { startBlockAdd(state.farmId); }, "primary-button-small"),
     ]));
@@ -1710,7 +1877,7 @@ scripted.
   // below — the lasso button, select-all/clear shortcuts, and the actual
   // checkbox list are identical across every "select several trees"
   // flow; only the panel-actions button below it differs per flow.
-  // `quantityUnit` (null | "bunches" | "kg") turns on a per-tree quantity
+  // `quantityUnit` (null | "kg") turns on a per-tree quantity
   // input next to each CHECKED row — used by the mark_harvested/
   // mark_fertilized completion flows (submitMarkTrees() below reads these
   // back via state.selectedTreeQuantities), never by harvest_plan or the
@@ -1719,6 +1886,39 @@ scripted.
   // TREE, not one shared field for the whole selection — different trees
   // yield different amounts, and a single shared value would be wrong for
   // most of a multi-tree selection.
+  // Shared by "Split evenly across selected" (below) and submitMarkTrees()'s
+  // own fallback — one implementation so both take a manually-typed
+  // per-tree value the same way. Splits the REMAINDER of `total` (after
+  // subtracting whatever's already typed into `quantitiesMap` for these
+  // ids) across only the still-blank ids, mutating `quantitiesMap` in
+  // place. A tree with its own typed value is left alone, no matter how
+  // many times this runs — reported directly: typing 500 for one tree and
+  // 200 for another, then re-splitting a bulk total, was overwriting both
+  // with a fresh even share instead of respecting what had just been typed
+  // in. Returns the per-tree share applied, or null if there was nothing
+  // to split (no total, no blank ids, or the total doesn't cover what's
+  // already typed) — callers use null to mean "did nothing."
+  function splitRemainderAcrossBlanks(ids, quantitiesMap, total) {
+    if (!isFinite(total) || total < 0) return null;
+    var blankIds = [];
+    var typedTotal = 0;
+    ids.forEach(function (id) {
+      var qty = quantitiesMap[id];
+      if (qty !== undefined && qty !== "") {
+        var parsed = parseFloat(qty);
+        if (isFinite(parsed)) typedTotal += parsed;
+      } else {
+        blankIds.push(id);
+      }
+    });
+    if (!blankIds.length) return null;
+    var remainder = total - typedTotal;
+    if (remainder <= 0) return null;
+    var share = Math.round((remainder / blankIds.length) * 100) / 100;
+    blankIds.forEach(function (id) { quantitiesMap[id] = String(share); });
+    return share;
+  }
+
   function renderTreeSelectionChecklist(block, quantityUnit) {
     var trees = treesByBlock[block.id] || [];
     if (!trees.length) {
@@ -1747,42 +1947,68 @@ scripted.
         trees.forEach(function (t) { state.selectedTreeIds[t.id] = true; });
         renderMap(); renderPanel();
       }),
+      // Shortcuts by status — "everything overdue" / "everything a Manager
+      // marked" is by far the common case in a 1,000-tree block, and the
+      // alternative was lasso-ing or ticking rows one by one.
+      actionButton("Select overdue", function () {
+        var field = /fertiliz/.test(String(state.selectionMode)) ? "fertilizer_stage" : "harvest_stage";
+        trees.forEach(function (t) { if (t[field] === "overdue") state.selectedTreeIds[t.id] = true; });
+        renderMap(); renderPanel();
+      }),
+      actionButton("Select marked", function () {
+        var field = /fertiliz/.test(String(state.selectionMode)) ? "fertilizer_stage" : "harvest_stage";
+        trees.forEach(function (t) { if (t[field] === "marked") state.selectedTreeIds[t.id] = true; });
+        renderMap(); renderPanel();
+      }),
       actionButton("Clear selection", function () {
         state.selectedTreeIds = {};
         renderMap(); renderPanel();
       }),
     ]));
 
-    // Bulk-fill: type one value once and apply it to every currently
-    // checked tree in a single action, rather than typing the same number
-    // into each row below one at a time. This writes into the exact same
-    // selectedTreeQuantities map the per-tree inputs read from and
-    // submitMarkTrees() sends — there's no separate bulk write path on
-    // the server, just a faster way to fill in the per-tree one. Applying
-    // again after checking more trees re-applies to the full current
-    // selection; it's a "fill down," not a live-bound default, so it
-    // never overwrites a row while you're still typing into it — only on
-    // an explicit click. Each per-tree row underneath stays individually
-    // editable afterward — the bulk value is a starting point, not a
-    // lock, so a tree that actually yielded a different amount (or none
-    // at all — quantity is optional per tree either way) can still be
-    // changed or cleared on its own row.
+    // Bulk-fill: type the TOTAL for the whole selection once, and split it
+    // evenly across every currently checked tree, rather than typing the
+    // same number into each row below one at a time. This writes into the
+    // exact same selectedTreeQuantities map the per-tree inputs read from
+    // and submitMarkTrees() sends — there's no separate bulk write path on
+    // the server, just a faster way to fill in the per-tree one.
+    //
+    // Update: this used to copy the SAME typed value into every checked
+    // tree verbatim (so typing "500" and checking 251 trees recorded 500
+    // bunches PER TREE — 125,500 total) — reported directly, with exact
+    // numbers matching this bug precisely: "input bulk is total fertilizer
+    // used or bunch harvested, not 1 quantity for all of them." Now
+    // divides the typed total by the number of checked trees instead.
+    // Applying again after checking more trees re-applies to the full
+    // current selection (recomputing the split for the new count); it's a
+    // "fill down," not a live-bound default, so it never overwrites a row
+    // while you're still typing into it — only on an explicit click. Each
+    // per-tree row underneath stays individually editable afterward — the
+    // even split is a starting point, not a lock, so a tree that actually
+    // yielded a different amount (or none at all — quantity is optional
+    // per tree either way) can still be changed or cleared on its own row.
     if (quantityUnit) {
       var bulkInput = el("input", {
         type: "number", step: "0.01", min: "0", inputmode: "decimal",
         class: "tree-checklist-qty", placeholder: quantityUnit,
-        "aria-label": "Bulk quantity in " + quantityUnit + ", applied to every checked tree below",
+        "aria-label": "Total " + quantityUnit + " for every checked tree below, split evenly among them",
       });
       bulkInput.value = state.bulkQuantityValue || "";
       bulkInput.addEventListener("input", function () { state.bulkQuantityValue = bulkInput.value; });
-      var applyBulkBtn = actionButton("Apply to all selected", function () {
+      var applyBulkBtn = actionButton("Split evenly across selected", function () {
         var ids = Object.keys(state.selectedTreeIds);
         if (!ids.length) { showFlash("Select at least one tree first.", "error"); return; }
-        ids.forEach(function (id) { state.selectedTreeQuantities[id] = state.bulkQuantityValue; });
+        var total = parseFloat(state.bulkQuantityValue);
+        if (!isFinite(total) || total < 0) { showFlash("Enter a valid total first.", "error"); return; }
+        var share = splitRemainderAcrossBlanks(ids, state.selectedTreeQuantities, total);
+        if (share === null) {
+          showFlash("Every checked tree already has its own quantity typed in below, or the total doesn't cover them.", "error");
+          return;
+        }
         renderPanel();
       });
       panelEl.appendChild(el("div", { class: "bulk-qty-row" }, [
-        el("label", { class: "bulk-qty-label", text: "Bulk quantity (" + quantityUnit + ")" }),
+        el("label", { class: "bulk-qty-label", text: "Total (" + quantityUnit + ") — split evenly" }),
         bulkInput,
         applyBulkBtn,
       ]));
@@ -1815,8 +2041,22 @@ scripted.
     panelEl.appendChild(list);
   }
 
+  function renderFertilizerPlanningSection(block) {
+    panelEl.appendChild(el("p", { class: "panel-note", text: "Check the trees you're planning to fertilize — click them on the map, check them below, or drag a lasso around a group. The plan itself is created for the whole block, and any trees checked here are marked as needing fertilizer — the assigned PIC Block user will see them as a to-do in the field app. Leave nothing checked for a plan with no specific trees flagged yet." }));
+    renderTreeSelectionChecklist(block);
+    var selectedCount = Object.keys(state.selectedTreeIds).length;
+    panelEl.appendChild(el("div", { class: "panel-actions" }, [
+      actionButton(
+        "Create fertilizer plan" + (selectedCount ? " (" + selectedCount + " selected)" : ""),
+        function () { startFertilizerPlanForm(block); },
+        "primary-button-small"
+      ),
+      actionButton("Cancel", cancelTreeSelection),
+    ]));
+  }
+
   function renderHarvestPlanningSection(block) {
-    panelEl.appendChild(el("p", { class: "panel-note", text: "Check the trees you're planning to harvest — click them on the map, check them below, or drag a lasso around a group. This is a visual reference only for now; the plan itself is created for the whole block." }));
+    panelEl.appendChild(el("p", { class: "panel-note", text: "Check the trees you're planning to harvest — click them on the map, check them below, or drag a lasso around a group. The plan itself is created for the whole block, and any trees checked here are marked as needing harvest — the assigned PIC Block user will see them as a to-do in the field app. Leave nothing checked for a plan with no specific trees flagged yet." }));
     renderTreeSelectionChecklist(block);
     var selectedCount = Object.keys(state.selectedTreeIds).length;
     panelEl.appendChild(el("div", { class: "panel-actions" }, [
@@ -1840,13 +2080,16 @@ scripted.
   // is what tells them apart in this UI: completion records *when* the
   // work happened (defaults to today, editable), assignment is just "now."
   // quantityUnit is null for the two mark_need_* assignment modes (nothing
-  // has happened yet, so a quantity has no meaning) and set for the two
-  // completion modes — "bunches" mirrors HarvestTree.quantity's own
-  // help_text ("e.g. fruit bunch count"), "kg" mirrors how fertilizer
-  // amounts are recorded everywhere else in this app.
+  // has happened yet, so a quantity has no meaning) and "kg" for the two
+  // completion modes — asked directly to move every harvest record from
+  // bunch count to kg, matching how fertilizer amounts are already
+  // recorded everywhere else in this app.
   var MARK_MODE_CONFIG = {
-    mark_harvested: { verb: "harvested", url: "trees_mark_harvested", needsDate: true, noun: "harvest", quantityUnit: "bunches" },
-    mark_fertilized: { verb: "fertilized", url: "trees_mark_fertilized", needsDate: true, noun: "fertilizer", quantityUnit: "kg" },
+    // Goes through Record harvest (RecordActualHarvestView), not the old
+    // tree-only endpoint: asked to run harvest on one system, so even the
+    // tree panel's one-tree shortcut reaches approval and yield.
+    mark_harvested: { verb: "harvested", url: "harvest_record", recordsHarvest: true, needsDate: true, noun: "harvest", quantityUnit: "kg" },
+    mark_fertilized: { verb: "fertilized", url: "fertilizer_record", recordsHarvest: true, needsDate: true, noun: "fertilizer", quantityUnit: "kg" },
     mark_need_harvest: { verb: "needing harvest", url: "trees_mark_need_harvest", needsDate: false, noun: "harvest", quantityUnit: null },
     mark_need_fertilize: { verb: "needing fertilizer", url: "trees_mark_need_fertilize", needsDate: false, noun: "fertilizer", quantityUnit: null },
   };
@@ -1858,18 +2101,16 @@ scripted.
       ? "Select the trees you just " + cfg.verb + " — click them on the map, check them below, or drag a lasso around a group — then confirm. Current interval for this block: every " + intervalDays + " days. A per-tree quantity is optional."
       : "Select the trees that need " + cfg.noun + " — click them on the map, check them below, or drag a lasso around a group — then confirm. The PIC Block user assigned to this block will see these as a to-do in the field app.";
     panelEl.appendChild(el("p", { class: "panel-note", text: noteText }));
-    renderTreeSelectionChecklist(block, cfg.quantityUnit);
-
     var dateInput = null;
+    var markBar = [];
     if (cfg.needsDate) {
-      dateInput = el("input", { type: "date", name: "date" });
+      dateInput = el("input", { type: "date", name: "date", id: "map-action-date", "aria-label": "Date", max: new Date().toISOString().slice(0, 10) });
       dateInput.value = new Date().toISOString().slice(0, 10);
-      panelEl.appendChild(el("label", { text: "Date", style: "display:block;margin-top:8px;" }));
-      panelEl.appendChild(dateInput);
+      markBar.push(el("label", { for: "map-action-date", text: "Date", style: "display:block;font-size:12px;" }));
+      markBar.push(dateInput);
     }
-
     var selectedCount = Object.keys(state.selectedTreeIds).length;
-    panelEl.appendChild(el("div", { class: "panel-actions", style: "margin-top:10px;" }, [
+    markBar.push(el("div", { class: "panel-actions", style: "margin-top:8px;" }, [
       actionButton(
         "Mark " + selectedCount + " tree" + (selectedCount === 1 ? "" : "s") + " " + cfg.verb,
         function () { submitMarkTrees(block, mode, dateInput ? dateInput.value : null); },
@@ -1877,6 +2118,81 @@ scripted.
       ),
       actionButton("Cancel", cancelTreeSelection),
     ]));
+    panelEl.appendChild(el("div", { class: "panel-sticky-bar" }, markBar));
+    renderTreeSelectionChecklist(block, cfg.quantityUnit);
+  }
+
+  // "Record actual harvest"/"Record actual fertilizer" — the operations
+  // pipeline's own recording flow (Harvest/ActualHarvest/HarvestTree,
+  // Fertilizer/ActualFertilizer/FertilizerTree — apps/operations/models.py),
+  // reusing the exact same checklist component as renderMarkTreesSection()
+  // above but writing to a different backend on submit (submitActualRecord()
+  // below) — deliberately a separate model/path, see _MarkTreesView's own
+  // docstring (views.py) for why TreeCareRecord and this pipeline don't
+  // share a table. Unlike that flow, a blank per-tree quantity is a real,
+  // meaningful final state here (effective_quantity derives it at read
+  // time — apps/operations/models.py), not something that needs filling in
+  // before submit; the checklist's own "Total — split evenly" field is
+  // still offered as a convenience, and its value becomes this action's
+  // own reported total (ActualHarvest/ActualFertilizer.quantity) rather
+  // than being divided away into the per-tree rows.
+  function renderRecordActualSection(block, kind) {
+    var unit = "kg"; // both harvest and fertilizer are kg-native — see BUILD_STATUS.md's "bunch to kg" change
+    // Harvest-only note for now — asked directly for a compliance-grade
+    // maker-checker flow: recording this doesn't count toward official
+    // yield reporting until a Manager approves the plan to "done" (see
+    // ActualHarvest.get_effective_quantity()'s own docstring). Fertilizer
+    // doesn't have this gate yet, so it gets no such note.
+    var approvalNote = kind === "harvest"
+      ? " The selected trees are updated right away (last harvested date, and cleared from \"needs harvest\"). The weight counts toward yield once the plan is approved — until then it shows in Yield history as \"pending approval\"."
+      : " The selected trees are updated right away (last fertilized date, and cleared from \"needs fertilizer\"). The amount counts toward the block's fertilizer total once the plan is approved — until then it shows as \"pending approval\".";
+    // One short line up front; the long explanation lives in a collapsed
+    // <details> so the date and submit button aren't pushed off screen.
+    panelEl.appendChild(el("p", { class: "panel-note", text: "Select the trees this " + kind + " covers (map, checklist or lasso), set the date, then record." }));
+    var help = el("details", { class: "panel-help" }, [
+      el("summary", { text: "How this works" }),
+      el("p", { class: "panel-note", text:
+        "A per-tree quantity is optional; leave it blank if a tree wasn't individually measured — it'll show an " +
+        "estimated share once a total is recorded. The total field above the list becomes this action's own reported total." + approvalNote
+      }),
+    ]);
+    panelEl.appendChild(help);
+
+    var dateInput = el("input", { type: "date", name: "date", id: "map-action-date", "aria-label": "Date", max: new Date().toISOString().slice(0, 10) });
+    dateInput.value = state.editingActualDate || new Date().toISOString().slice(0, 10);
+
+    // Recording an actual is what moves the plan's status forward
+    // (submitActualRecord() sends this as "finished"); mirrors the original
+    // app's submit==="finish" flag (Palm_Vision_PDR.md § 3.6). Only offered
+    // when creating — editing an existing record never touches plan status.
+    var finishedCheckbox = null;
+    var barChildren = [
+      el("label", { for: "map-action-date", text: "Date", style: "display:block;font-size:12px;" }),
+      dateInput,
+    ];
+    if (!state.editingActualId) {
+      finishedCheckbox = el("input", { type: "checkbox", id: "actual-finished-checkbox" });
+      barChildren.push(el("label", { style: "display:block;margin-top:8px;font-size:13px;" }, [
+        finishedCheckbox,
+        document.createTextNode(" This completes the " + kind + " plan (send it for Done approval)"),
+      ]));
+    }
+    var selectedCount = Object.keys(state.selectedTreeIds).length;
+    var actionLabel = (state.editingActualId ? "Save changes" : (kind === "harvest" ? "Record harvest" : "Record fertilizer")) +
+      (selectedCount ? " (" + selectedCount + " selected)" : "");
+    barChildren.push(el("div", { class: "panel-actions", style: "margin-top:8px;" }, [
+      actionButton(
+        actionLabel,
+        function () { submitActualRecord(block, kind, dateInput.value, !!(finishedCheckbox && finishedCheckbox.checked)); },
+        "primary-button-small"
+      ),
+      actionButton("Cancel", cancelTreeSelection),
+    ]));
+    // Sticky, and placed BEFORE the (1,000+ row) checklist so the decision
+    // controls are always on screen instead of ~900px down the panel.
+    panelEl.appendChild(el("div", { class: "panel-sticky-bar" }, barChildren));
+
+    renderTreeSelectionChecklist(block, unit);
   }
 
   // Single-tree shortcut for the tree detail panel (renderTreeDetailPanel()
@@ -1906,6 +2222,9 @@ scripted.
       quantities[tree.id] = quantity;
       formData.append("quantities", JSON.stringify(quantities));
     }
+    // A one-tree record is ready for approval as it stands — same as a
+    // harvest logged from the field app.
+    if (cfg.recordsHarvest) formData.append("finished", "1");
     formData.append("csrfmiddlewaretoken", CSRF_TOKEN);
     postJson(buildUrl(data.urls[cfg.url], block.id), formData).then(function (json) {
       if (json.ok) {
@@ -1938,22 +2257,25 @@ scripted.
     // only report as a generic "couldn't save." See
     // _tree_ids_from_request()'s docstring in views.py.
     formData.append("tree_ids", JSON.stringify(treeIds));
+    // Different trees still yield different amounts — this is a dict, not
+    // a single shared value; see renderTreeSelectionChecklist()'s own
+    // comment. A tree with its own typed value always keeps it; trees left
+    // blank are filled in below from whatever's typed into "Total — split
+    // evenly," so submitting straight away (without first clicking "Split
+    // evenly across selected") still works — reported directly: typing a
+    // total and submitting immediately used to silently drop it entirely
+    // ("the quantity bunch not shown in anywhere").
     var quantities = {};
     treeIds.forEach(function (id) {
-      // Different trees still yield different amounts — this is a dict,
-      // not a single shared value; see renderTreeSelectionChecklist()'s
-      // own comment. Falls back to the bulk-quantity box
-      // (state.bulkQuantityValue) for any tree that never got its own
-      // value — reported directly: typing a number into "Bulk quantity"
-      // and submitting straight away, without first clicking "Apply to
-      // all selected," silently dropped it entirely ("the quantity bunch
-      // not shown in anywhere"). The "Apply" button still exists as a way
-      // to pre-fill the visible per-tree boxes, but the submit itself no
-      // longer depends on having clicked it.
       var qty = state.selectedTreeQuantities[id];
-      if ((qty === undefined || qty === "") && state.bulkQuantityValue) qty = state.bulkQuantityValue;
       if (qty !== undefined && qty !== "") quantities[id] = qty;
     });
+    // Same remainder-across-blanks split "Split evenly across selected"
+    // itself uses (splitRemainderAcrossBlanks() above) — one implementation
+    // so a manually-typed value (e.g. 500 on one tree, 200 on another) is
+    // never overwritten by a bulk total, whether the split happens by
+    // clicking the button or by submitting with the total still untouched.
+    splitRemainderAcrossBlanks(treeIds, quantities, parseFloat(state.bulkQuantityValue));
     if (Object.keys(quantities).length) formData.append("quantities", JSON.stringify(quantities));
     if (dateValue) formData.append("date", dateValue);
     formData.append("csrfmiddlewaretoken", CSRF_TOKEN);
@@ -1979,6 +2301,89 @@ scripted.
       } else {
         showFlash(json.message || "Couldn't save that.", "error");
       }
+    });
+  }
+
+  // Submits renderRecordActualSection() above — RecordActualHarvestView/
+  // RecordActualFertilizerView (views.py) auto-create a plan behind the
+  // scenes if the block has no open one yet, so this is a one-click
+  // action the same way submitMarkTrees() already is. `editingActualId`
+  // (state.editingActualId) routes this same function to the matching
+  // *_actual_edit endpoint instead when startEditActualRecord() below is
+  // what opened this section — same checklist UI, different verb/endpoint.
+  function submitActualRecord(block, kind, dateValue, finished) {
+    var treeIds = Object.keys(state.selectedTreeIds);
+    if (!treeIds.length) { showFlash("Select at least one tree first.", "error"); return; }
+    var editingId = state.editingActualId;
+    var urlKey = kind === "harvest" ? "harvest_actual" : "fertilizer_actual";
+    var url = editingId
+      ? buildUrl2(data.urls[urlKey + "_edit"], block.id, editingId)
+      : buildUrl(data.urls[kind === "harvest" ? "harvest_record" : "fertilizer_record"], block.id);
+    var formData = new FormData();
+    formData.append("tree_ids", JSON.stringify(treeIds));
+    // Sent exactly as typed — a blank tree stays blank (quantity=null),
+    // not auto-filled with a split share; see this section's own note in
+    // renderRecordActualSection() above.
+    var quantities = {};
+    treeIds.forEach(function (id) {
+      var qty = state.selectedTreeQuantities[id];
+      if (qty !== undefined && qty !== "") quantities[id] = qty;
+    });
+    if (Object.keys(quantities).length) formData.append("quantities", JSON.stringify(quantities));
+    // The bulk field's own value — this action's real, reported total
+    // (ActualHarvest/ActualFertilizer.quantity), not divided into the
+    // per-tree rows the way "Bulk quantity" used to be (see
+    // BUILD_STATUS.md's fix for that bug in the TreeCareRecord flow).
+    if (state.bulkQuantityValue) formData.append("total_quantity", state.bulkQuantityValue);
+    if (dateValue) formData.append("date", dateValue);
+    // Only meaningful on the create path (RecordActualHarvestView/
+    // RecordActualFertilizerView) — see renderRecordActualSection()'s own
+    // comment for why the checkbox this comes from doesn't even render
+    // while editing. Harmless to send unconditionally: the edit endpoints
+    // never read a "finished" field.
+    if (finished) formData.append("finished", "1");
+    formData.append("csrfmiddlewaretoken", CSRF_TOKEN);
+    postJson(url, formData).then(function (json) {
+      if (json.ok) {
+        exitInteractiveModes();
+        state.planningBlockId = null;
+        state.selectionMode = null;
+        state.selectedTreeIds = {};
+        state.selectedTreeQuantities = {};
+        state.bulkQuantityValue = "";
+        state.editingActualId = null;
+        state.editingActualDate = null;
+        showFlash(json.message, "success");
+        refreshData(json.farm_map_data, { type: "block", id: block.id, section: kind });
+      } else {
+        showFlash(json.message || "Couldn't save that.", "error");
+      }
+    });
+  }
+
+  // Reopens renderRecordActualSection() prefilled from an existing
+  // ActualHarvest/ActualFertilizer — the Edit action on the "Yield
+  // history"/"Fertilizer applications" list (renderActualRow() above).
+  // The checklist itself is entirely client-rendered, so "prefilled" means
+  // seeding state.selectedTreeIds/selectedTreeQuantities/bulkQuantityValue
+  // from the fetched record before rendering it, same component either way.
+  function startEditActualRecord(block, kind, actualId) {
+    exitInteractiveModes();
+    var urlKey = kind === "harvest" ? "harvest_actual" : "fertilizer_actual";
+    getJson(buildUrl2(data.urls[urlKey + "_edit"], block.id, actualId)).then(function (json) {
+      var actual = json.actual;
+      state.selectedTreeIds = {};
+      state.selectedTreeQuantities = {};
+      actual.trees.forEach(function (row) {
+        state.selectedTreeIds[row.id] = true;
+        if (row.quantity !== null && row.quantity !== undefined) {
+          state.selectedTreeQuantities[row.id] = String(row.quantity);
+        }
+      });
+      state.bulkQuantityValue = actual.quantity !== null && actual.quantity !== undefined ? String(actual.quantity) : "";
+      state.editingActualId = actualId;
+      state.editingActualDate = actual.date;
+      startTreeSelection(block.id, kind === "harvest" ? "record_actual_harvest" : "record_actual_fertilizer", true);
     });
   }
 
@@ -2021,7 +2426,7 @@ scripted.
     processed.forEach(function (imageId) {
       var image = imagesById[imageId];
       if (!image) return;
-      var label = image.captured_at ? new Date(image.captured_at).toLocaleDateString() : "Undated upload";
+      var label = image.captured_at ? new Date(image.captured_at).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }) : "Undated upload";
       // Every entry here has a real ImageProcessingRun against this block
       // (processed_image_ids guarantees that much) — but the clip-persist
       // step can still have failed for it (run.clip_persist_error —
@@ -2040,8 +2445,8 @@ scripted.
   // decide which tree-selection flow (if any) is currently active for a
   // section, and nowhere else, so this stays a small lookup rather than a
   // third parallel copy of MARK_MODE_CONFIG's own kind/noun mapping.
-  var HARVEST_SELECTION_MODES = ["harvest_plan", "mark_need_harvest", "mark_harvested"];
-  var FERTILIZER_SELECTION_MODES = ["mark_need_fertilize", "mark_fertilized"];
+  var HARVEST_SELECTION_MODES = ["harvest_plan", "mark_need_harvest", "mark_harvested", "record_actual_harvest"];
+  var FERTILIZER_SELECTION_MODES = ["fertilizer_plan", "mark_need_fertilize", "mark_fertilized", "record_actual_fertilizer"];
 
   // One clickable row per section on the main block panel — "how's
   // harvest doing on this block" at a glance (a pending-count teaser, and
@@ -2052,15 +2457,23 @@ scripted.
     var isHarvest = kind === "harvest";
     var stageField = isHarvest ? "harvest_stage" : "fertilizer_stage";
     var pendingCount = (treesByBlock[block.id] || []).filter(function (t) { return t[stageField] === "marked"; }).length;
+    // Plans too, not just marked trees — a block with open plans, or field
+    // data waiting on this Manager's approval, used to read "Nothing pending
+    // right now". Awaiting approval leads: it's the Manager's own to-do.
+    var plans = (isHarvest ? block.harvest_plans : block.fertilizer_plans) || [];
+    var awaitingApproval = plans.filter(function (p) { return p.can_approve; }).length;
+    var openPlans = plans.filter(function (p) { return p.status !== "done" && !p.can_approve; }).length;
     var metaBits = [];
-    if (pendingCount) metaBits.push(pendingCount + " need" + (pendingCount === 1 ? "s" : "") + " " + kind);
+    if (awaitingApproval) metaBits.push(awaitingApproval + " awaiting approval");
+    if (pendingCount) metaBits.push(pendingCount + " tree" + (pendingCount === 1 ? " needs " : "s need ") + kind);
+    if (openPlans) metaBits.push(openPlans + " open plan" + (openPlans === 1 ? "" : "s"));
     if (isHarvest && block.recent_yield && block.recent_yield.length) {
-      metaBits.push("last recorded " + new Date(block.recent_yield[0].date).toLocaleDateString());
+      metaBits.push("last recorded " + new Date(block.recent_yield[0].date).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }));
     }
     var btn = el("button", { type: "button", class: "panel-list-button" }, [
       el("span", { text: isHarvest ? "Harvest" : "Fertilizer" }),
       // "Nothing pending" rather than "no activity" — this row only knows
-      // about pending count and recent_yield (already in data.blocks), not
+      // about marked trees, plans and recent_yield (already in data.blocks), not
       // completed TreeCareRecord markings (that's the full, block-wide
       // history behind an on-demand fetch, see renderBlockCareHistory()),
       // so it must not claim there's no history when there could well be.
@@ -2079,6 +2492,137 @@ scripted.
   // yield history (harvest only — no fertilizer-application equivalent
   // exists yet, see _recent_yield_by_block()'s own docstring), and the
   // block-wide marking history (renderBlockCareHistory() below).
+  // "All-time: 1,240 kg — 12.4 kg/ha" (or "no area recorded yet"
+  // when summary.area_ha is null) — one shared renderer for the block
+  // panel and the farm panel alike (renderFarmDetailPanel() below), from
+  // the yield_summary/fertilizer_summary payload _rate_summary() (views.py)
+  // builds. Requested directly: the "Yield history" list already existed
+  // but nothing anywhere showed a real total or a per-hectare figure.
+  function renderRateSummary(summary, unit, label) {
+    label = label ? label + " (all-time): " : "All-time: ";
+    if (!summary || !summary.total) {
+      return el("p", { class: "panel-empty", text: label + "0 " + unit });
+    }
+    var text = label + summary.total.toLocaleString() + " " + unit;
+    text += summary.per_ha !== null
+      ? " — " + summary.per_ha.toLocaleString() + " " + unit + "/ha"
+      : " (no area recorded, so a per-ha rate can't be shown)";
+    return el("p", { class: "panel-note", text: text });
+  }
+
+  // Shared by the "Harvest plans"/"Fertilizer plans" lists below — one
+  // plan row with Edit/Delete/Approve, all three backed by real endpoints
+  // (HarvestPlanUpdateView/DeleteView/ApproveView and their Fertilizer
+  // counterparts — apps/dashboard/views.py) rather than the create-only
+  // flow this pipeline had until now.
+  function renderPlanRow(block, kind, plan) {
+    var isHarvest = kind === "harvest";
+    var urlKey = isHarvest ? "harvest_plan" : "fertilizer_plan";
+    var qtyText = plan.assessment_quantity !== null && plan.assessment_quantity !== undefined
+      ? plan.assessment_quantity + " kg assessed — " : "";
+    var row = el("li", { class: "panel-list-row" }, [
+      el("div", {}, [
+        el("span", { text: new Date(plan.assessment_date + "T00:00:00").toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }) }),
+        el("span", { class: "panel-list-meta", text: " — " + qtyText + plan.status_display }),
+        // The normal state of a new plan, not a problem — so neutral
+        // styling. It used to be warning-coloured, which read as an error
+        // on every plan the moment it was created.
+        plan.needs_actual_to_approve
+          ? el("span", {
+              class: "panel-list-meta",
+              text: "Waiting for field data — can be approved once a " + kind + " is recorded against it.",
+            })
+          : null,
+      ]),
+    ]);
+    var actions = el("div", { class: "panel-actions" });
+    actions.appendChild(actionButton("Edit", function () {
+      getJson(buildUrl2(data.urls[urlKey + "_edit"], block.id, plan.id)).then(function (json) {
+        openForm("Edit " + kind + " plan", blockBreadcrumb(block), json.html, {
+          onCancel: function () { selectBlock(block.id, kind); },
+          focusSection: kind,
+        });
+      });
+    }, "link-button"));
+    if (plan.can_approve) {
+      actions.appendChild(actionButton("Approve", function () {
+        var formData = new FormData();
+        formData.append("csrfmiddlewaretoken", CSRF_TOKEN);
+        postJson(buildUrl2(data.urls[urlKey + "_approve"], block.id, plan.id), formData).then(function (json) {
+          if (json.ok) { showFlash(json.message, "success"); refreshData(json.farm_map_data, { type: "block", id: block.id, section: kind }); }
+          else showFlash(json.message || "Couldn't approve that.", "error");
+        });
+      }, "link-button"));
+    }
+    actions.appendChild(actionButton("Delete", function () {
+      var recorded = plan.status === "done" || plan.status === "done_wait" || plan.status === "on_progress" || plan.status === "on_progress_wait";
+      if (!window.confirm(recorded
+        ? "This " + kind + " plan is " + plan.status_display + " and has recorded " + (isHarvest ? "yield" : "applications") + " against it. Deleting it PERMANENTLY deletes those records too, and the block's all-time totals will drop. Delete anyway?"
+        : "Delete this " + kind + " plan? Any actual records against it are removed too.")) return;
+      var formData = new FormData();
+      formData.append("csrfmiddlewaretoken", CSRF_TOKEN);
+      postJson(buildUrl2(data.urls[urlKey + "_delete"], block.id, plan.id), formData).then(function (json) {
+        if (json.ok) { showFlash(json.message, "success"); refreshData(json.farm_map_data, { type: "block", id: block.id, section: kind }); }
+        else showFlash(json.message || "Couldn't delete that.", "error");
+      });
+    }, "link-button"));
+    row.appendChild(actions);
+    return row;
+  }
+
+  // Shared by the "Yield history"/"Fertilizer applications" lists below —
+  // one actual-record row with Edit (reopens the same tree checklist,
+  // prefilled — see startEditActualRecord() below) and Delete.
+  function renderActualRow(block, kind, entry, unit) {
+    var urlKey = (kind === "harvest" ? "harvest_actual" : "fertilizer_actual");
+    var rowChildren = [
+      el("span", { text: new Date(entry.date + "T00:00:00").toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }) }),
+      el("span", { class: "panel-list-meta", text: " — " + entry.quantity + " " + unit }),
+    ];
+    // Harvest only for now (entry.pending_approval is only ever set by
+    // _recent_yield_by_block(), never _recent_fertilizer_by_block() —
+    // Fertilizer doesn't gate get_effective_quantity() by approval yet).
+    // The figure shown above is always the real reported one
+    // (get_reported_quantity()) even while pending — see that function's
+    // own docstring for why this list and the "All-time" total above it
+    // are allowed to disagree.
+    if (entry.pending_approval) {
+      rowChildren.push(el("span", { class: "panel-list-meta panel-list-meta--warning", text: "Pending approval — not yet counted in All-time" }));
+    }
+    var row = el("li", { class: "panel-list-row" }, [
+      el("div", {}, rowChildren),
+    ]);
+    var actions = el("div", { class: "panel-actions" });
+    actions.appendChild(actionButton("Edit", function () { startEditActualRecord(block, kind, entry.id); }, "link-button"));
+    // Reported directly: "in yield history there are no approve button" —
+    // a Manager scanning this list (rather than the separate "Harvest
+    // plans" list) had no way to approve the plan this entry belongs to.
+    // entry.can_approve/entry.harvest_id come from _recent_yield_by_block();
+    // posts to the same HarvestPlanApproveView the plan-row Approve button
+    // above uses (kind === "harvest" only — Fertilizer isn't gated yet).
+    if (entry.can_approve) {
+      actions.appendChild(actionButton("Approve", function () {
+        var formData = new FormData();
+        formData.append("csrfmiddlewaretoken", CSRF_TOKEN);
+        postJson(buildUrl2(data.urls[kind === "harvest" ? "harvest_plan_approve" : "fertilizer_plan_approve"], block.id, kind === "harvest" ? entry.harvest_id : entry.fertilizer_id), formData).then(function (json) {
+          if (json.ok) { showFlash(json.message, "success"); refreshData(json.farm_map_data, { type: "block", id: block.id, section: kind }); }
+          else showFlash(json.message || "Couldn't approve that.", "error");
+        });
+      }, "link-button"));
+    }
+    actions.appendChild(actionButton("Delete", function () {
+      if (!window.confirm("Delete this actual " + kind + " record?")) return;
+      var formData = new FormData();
+      formData.append("csrfmiddlewaretoken", CSRF_TOKEN);
+      postJson(buildUrl2(data.urls[urlKey + "_delete"], block.id, entry.id), formData).then(function (json) {
+        if (json.ok) { showFlash(json.message, "success"); refreshData(json.farm_map_data, { type: "block", id: block.id, section: kind }); }
+        else showFlash(json.message || "Couldn't delete that.", "error");
+      });
+    }, "link-button"));
+    row.appendChild(actions);
+    return row;
+  }
+
   function renderBlockSectionPanel(kind) {
     var block = blocksById[state.blockId];
     var farm = farmsById[state.farmId];
@@ -2091,27 +2635,51 @@ scripted.
       { label: block ? block.name : "Block", onClick: function () { selectBlock(state.blockId); } },
     ]));
     panelEl.appendChild(el("h2", { class: "panel-heading", text: sectionLabel }));
+    panelEl.appendChild(renderRateSummary(
+      isHarvest ? block.yield_summary : block.fertilizer_summary,
+      "kg"
+    ));
 
     var relevantModes = isHarvest ? HARVEST_SELECTION_MODES : FERTILIZER_SELECTION_MODES;
     var inSelectionFlow = state.planningBlockId === block.id && relevantModes.indexOf(state.selectionMode) !== -1;
 
     if (inSelectionFlow && state.selectionMode === "harvest_plan") {
       renderHarvestPlanningSection(block);
+    } else if (inSelectionFlow && state.selectionMode === "fertilizer_plan") {
+      renderFertilizerPlanningSection(block);
+    } else if (inSelectionFlow && (state.selectionMode === "record_actual_harvest" || state.selectionMode === "record_actual_fertilizer")) {
+      renderRecordActualSection(block, kind);
     } else if (inSelectionFlow) {
       renderMarkTreesSection(block, state.selectionMode);
     } else {
       if (isHarvest) {
+        // Two actions on one system (asked directly): planning marks the
+        // chosen trees as needing harvest; recording goes to approval and
+        // yield AND updates the trees. "Mark trees needing harvest" and
+        // "Record harvest directly" duplicated these.
         panelEl.appendChild(el("div", { class: "panel-actions" }, [
           actionButton("Plan harvest — select trees", function () { startTreeSelection(block.id, "harvest_plan"); }, "primary-button-small"),
-          actionButton("Mark trees needing harvest", function () { startTreeSelection(block.id, "mark_need_harvest"); }),
-          actionButton("Record harvest directly", function () { startTreeSelection(block.id, "mark_harvested"); }),
+          actionButton("Record harvest", function () { startTreeSelection(block.id, "record_actual_harvest"); }),
         ]));
       } else {
         panelEl.appendChild(el("div", { class: "panel-actions" }, [
-          actionButton("Plan fertilizer application", function () { startFertilizerPlanForm(block); }, "primary-button-small"),
-          actionButton("Mark trees needing fertilizer", function () { startTreeSelection(block.id, "mark_need_fertilize"); }),
-          actionButton("Record fertilizer directly", function () { startTreeSelection(block.id, "mark_fertilized"); }),
+          actionButton("Plan fertilizer — select trees", function () { startTreeSelection(block.id, "fertilizer_plan"); }, "primary-button-small"),
+          actionButton("Record fertilizer", function () { startTreeSelection(block.id, "record_actual_fertilizer"); }),
         ]));
+      }
+
+      // Harvest/Fertilizer plans — the "assessment" side of this pipeline
+      // (Harvest/Fertilizer models). Create already existed ("Plan
+      // harvest"/"Plan fertilizer application" above); this is the first
+      // place a Manager can see, edit, delete, or approve one.
+      var plans = isHarvest ? (block.harvest_plans || []) : (block.fertilizer_plans || []);
+      panelEl.appendChild(el("p", { class: "panel-subheading", text: sectionLabel + " plans", style: "margin-top:14px;" }));
+      if (!plans.length) {
+        panelEl.appendChild(el("p", { class: "panel-empty", text: "No " + kind + " plans for this block yet." }));
+      } else {
+        var planList = el("ul", { class: "panel-list" });
+        plans.forEach(function (plan) { planList.appendChild(renderPlanRow(block, kind, plan)); });
+        panelEl.appendChild(planList);
       }
 
       // Needs-action list — trees currently carrying the stage-1 flag
@@ -2119,16 +2687,27 @@ scripted.
       // client-side filter over data already in `data.trees` — unlike the
       // marking history below, nothing here reaches further back than
       // what's already on the Tree record, so no extra endpoint is needed.
+      // Nested directly under the plan list above (indented, smaller
+      // heading) rather than as its own top-level subsection before it —
+      // these are the trees still outstanding against the plan(s) just
+      // listed, not a separate concern.
       var stageField = isHarvest ? "harvest_stage" : "fertilizer_stage";
       var markedAtField = isHarvest ? "harvest_marked_at" : "fertilizer_marked_at";
       var pendingTrees = (treesByBlock[block.id] || []).filter(function (t) { return t[stageField] === "marked"; });
-      panelEl.appendChild(el("p", { class: "panel-subheading", text: "Needs " + kind, style: "margin-top:14px;" }));
+      var pendingWrap = el("div", { class: "panel-nested", style: "margin-top:8px;padding-left:10px;border-left:2px solid #e3ddd0;" });
+      pendingWrap.appendChild(el("p", { class: "panel-subheading panel-subheading--sub", text: "Needs " + kind }));
+      var overdueCount = (treesByBlock[block.id] || []).filter(function (t) { return t[stageField] === "overdue"; }).length;
+      if (overdueCount) {
+        pendingWrap.appendChild(el("p", { class: "panel-note", text:
+          overdueCount + " tree" + (overdueCount === 1 ? " is" : "s are") + " overdue by the block's " + kind +
+          " interval (red dashed ring on the map). “Needs " + kind + "” below only lists trees a Manager has explicitly marked." }));
+      }
       if (!pendingTrees.length) {
-        panelEl.appendChild(el("p", { class: "panel-empty", text: "No trees currently marked as needing " + kind + "." }));
+        pendingWrap.appendChild(el("p", { class: "panel-empty", text: "No trees currently marked as needing " + kind + "." }));
       } else {
         var pendingList = el("ul", { class: "panel-list" });
         pendingTrees.forEach(function (tree) {
-          var assignedWhen = tree[markedAtField] ? new Date(tree[markedAtField]).toLocaleDateString() : "recently";
+          var assignedWhen = tree[markedAtField] ? new Date(tree[markedAtField]).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }) : "recently";
           var btn = el("button", { type: "button", class: "panel-list-button" }, [
             el("span", { text: tree.name }),
             el("span", { class: "panel-list-meta", text: "assigned " + assignedWhen }),
@@ -2140,26 +2719,23 @@ scripted.
           btn.addEventListener("click", function () { selectTree(tree.id); });
           pendingList.appendChild(el("li", {}, [btn]));
         });
-        panelEl.appendChild(pendingList);
+        pendingWrap.appendChild(pendingList);
       }
+      panelEl.appendChild(pendingWrap);
 
-      // Yield history — moved here unchanged from the old inline block
-      // panel layout; harvest only, see this function's own docstring for
-      // why fertilizer has no equivalent.
-      if (isHarvest) {
-        panelEl.appendChild(el("p", { class: "panel-subheading", text: "Yield history", style: "margin-top:14px;" }));
-        if (block.recent_yield && block.recent_yield.length) {
-          var yieldList = el("ul", { class: "panel-list" });
-          block.recent_yield.forEach(function (entry) {
-            yieldList.appendChild(el("li", { class: "panel-list-button" }, [
-              el("span", { text: new Date(entry.date).toLocaleDateString() }),
-              el("span", { class: "panel-list-meta", text: "Qty " + entry.quantity }),
-            ]));
-          });
-          panelEl.appendChild(yieldList);
-        } else {
-          panelEl.appendChild(el("p", { class: "panel-empty", text: "No harvest yield recorded for this block yet." }));
-        }
+      // Actual records — ActualHarvest/ActualFertilizer, i.e. what
+      // "Record actual harvest/fertilizer" above creates. Harvest's own
+      // list was already here as "Yield history"; fertilizer gets the
+      // same treatment now that there's something to show and edit/delete.
+      var actualEntries = isHarvest ? (block.recent_yield || []) : (block.recent_fertilizer || []);
+      var actualUnit = "kg";
+      panelEl.appendChild(el("p", { class: "panel-subheading", text: isHarvest ? "Yield history" : "Fertilizer applications", style: "margin-top:14px;" }));
+      if (!actualEntries.length) {
+        panelEl.appendChild(el("p", { class: "panel-empty", text: "No actual " + kind + " recorded for this block yet." }));
+      } else {
+        var actualList = el("ul", { class: "panel-list" });
+        actualEntries.forEach(function (entry) { actualList.appendChild(renderActualRow(block, kind, entry, actualUnit)); });
+        panelEl.appendChild(actualList);
       }
     }
 
@@ -2208,10 +2784,33 @@ scripted.
         container.appendChild(el("p", { class: "panel-empty", text: "No " + kind + " marking actions recorded yet for this block." }));
         return;
       }
-      var unit = kind === "harvest" ? "bunches" : "kg";
+      var unit = "kg";
       var verb = kind === "harvest" ? "harvested" : "fertilized";
-      var list = el("ul", { class: "panel-list" });
+      // The field app marks one tree at a time, each as its own batch, which
+      // flooded this list with identical "1 tree harvested" lines (10 of the
+      // 12 rows on B4). Fold single-tree entries from the same day, action
+      // and person into one row; real bulk actions stay as they are.
+      var merged = [];
+      var byKey = {};
       entries.forEach(function (entry) {
+        if (entry.tree_count !== 1) { merged.push(entry); return; }
+        var key = [entry.date, entry.action, entry.recorded_by_name || ""].join("|");
+        var into = byKey[key];
+        if (!into) {
+          into = byKey[key] = Object.assign({}, entry, { tree_ids: entry.tree_ids.slice() });
+          merged.push(into);
+          return;
+        }
+        into.tree_count += 1;
+        into.tree_ids = into.tree_ids.concat(entry.tree_ids);
+        if (entry.total_quantity !== null && entry.total_quantity !== undefined) {
+          into.total_quantity = (into.total_quantity || 0) + entry.total_quantity;
+        }
+      });
+      entries = merged;
+      var PAGE = 15;
+      var list = el("ul", { class: "panel-list" });
+      entries.forEach(function (entry, index) {
         var treeWord = entry.tree_count + " tree" + (entry.tree_count === 1 ? "" : "s");
         var label, meta;
         if (entry.action === "needed") {
@@ -2225,13 +2824,22 @@ scripted.
           meta = qtyText + (entry.recorded_by_name ? " · " + entry.recorded_by_name : "");
         }
         var btn = el("button", { type: "button", class: "panel-list-button" }, [
-          el("span", { text: new Date(entry.date + "T00:00:00").toLocaleDateString() + " — " + label }),
+          el("span", { text: new Date(entry.date + "T00:00:00").toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }) + " — " + label }),
           el("span", { class: "panel-list-meta", text: meta }),
         ]);
         btn.addEventListener("click", function () { highlightTreesOnMap(entry.tree_ids); });
-        list.appendChild(el("li", {}, [btn]));
+        var li = el("li", {}, [btn]);
+        if (index >= PAGE) li.hidden = true;
+        list.appendChild(li);
       });
       container.appendChild(list);
+      if (entries.length > PAGE) {
+        var more = actionButton("Show all " + entries.length + " entries", function () {
+          list.querySelectorAll("li[hidden]").forEach(function (li) { li.hidden = false; });
+          more.remove();
+        }, "link-button");
+        container.appendChild(more);
+      }
     });
   }
 
@@ -2253,6 +2861,26 @@ scripted.
       detailRow("PIC Block", block.pic_name || "—"),
       detailRow("Active trees", String(block.tree_count)),
     ]));
+
+    // Harvest/fertilizer status breakdown for the whole block — the map alone
+    // can't say "40 fine, 1,000 overdue" when nearly every dot is the same.
+    (function () {
+      var stageLabels = { marked: "marked", overdue: "overdue", due_soon: "due soon", ok: "OK", never: "never recorded" };
+      var order = ["marked", "overdue", "due_soon", "ok", "never"];
+      var rows = [["harvest_stage", "Harvest"], ["fertilizer_stage", "Fertilizer"]];
+      var blockTrees = treesByBlock[block.id] || [];
+      if (!blockTrees.length) return;
+      var list = el("div", { class: "detail-list" });
+      rows.forEach(function (r) {
+        var counts = {};
+        blockTrees.forEach(function (t) { counts[t[r[0]]] = (counts[t[r[0]]] || 0) + 1; });
+        var parts = order.filter(function (k) { return counts[k]; }).map(function (k) {
+          return counts[k].toLocaleString() + " " + stageLabels[k];
+        });
+        list.appendChild(detailRow(r[1] + " status", parts.join(" · ") || "—"));
+      });
+      panelEl.appendChild(list);
+    })();
 
     renderImageryPickerSection(block);
 
@@ -2406,18 +3034,34 @@ scripted.
       if (state.treeId !== treeId) return; // navigated away before this resolved
       container.innerHTML = "";
       container.appendChild(el("h2", { class: "panel-heading", text: "Harvest & fertilizer history", style: "margin-top:20px;" }));
-      if (!json.history || !json.history.length) {
+      // Trees stamped before per-action history existed (or by a direct bulk
+      // update) can show a "last harvested/fertilized" date above with no
+      // history rows behind it. Saying "no activity recorded" next to that
+      // date contradicted the panel itself, so say what's actually known —
+      // the date — and that no detail was kept. Nothing is invented: no
+      // history rows are fabricated for these.
+      var history = json.history || [];
+      var tree = treesById[treeId] || {};
+      var undetailed = [];
+      [["harvest", "Harvested", tree.last_harvested_at], ["fertilizer", "Fertilized", tree.last_fertilized_at]].forEach(function (k) {
+        var hasDetail = history.some(function (h) { return h.kind === k[0] && h.action !== "needed"; });
+        if (k[2] && !hasDetail) {
+          undetailed.push(k[1] + " " + new Date(k[2] + "T00:00:00").toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }) + " — no further detail kept (marked before detailed history was recorded).");
+        }
+      });
+      if (!history.length && !undetailed.length) {
         container.appendChild(el("p", { class: "panel-empty", text: "No harvest or fertilizer activity recorded yet for this tree." }));
         return;
       }
+      undetailed.forEach(function (line) { container.appendChild(el("p", { class: "panel-note", text: line })); });
       var list = el("ul", { class: "panel-list" });
-      json.history.forEach(function (entry) {
+      history.forEach(function (entry) {
         var label, meta;
         if (entry.action === "needed") {
           label = entry.kind_display + " — marked as needed";
           meta = entry.recorded_by_name || "";
         } else {
-          var unit = entry.kind === "harvest" ? "bunches" : "kg";
+          var unit = "kg";
           var qtyText = entry.quantity === null || entry.quantity === undefined
             ? "no quantity recorded"
             : entry.quantity + " " + unit;
@@ -2425,7 +3069,7 @@ scripted.
           meta = qtyText + (entry.recorded_by_name ? " · " + entry.recorded_by_name : "");
         }
         list.appendChild(el("li", { class: "panel-list-button" }, [
-          el("span", { text: new Date(entry.date + "T00:00:00").toLocaleDateString() + " — " + label }),
+          el("span", { text: new Date(entry.date + "T00:00:00").toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }) + " — " + label }),
           el("span", { class: "panel-list-meta", text: meta }),
         ]));
       });
@@ -2458,7 +3102,7 @@ scripted.
         var confidencePct = Math.round(entry.confidence * 100);
         var meta = confidencePct + "%" + (entry.reviewed ? " · reviewed" : "");
         list.appendChild(el("li", { class: "panel-list-button" }, [
-          el("span", { text: new Date(entry.date).toLocaleDateString() + " — " + entry.label_display }),
+          el("span", { text: new Date(entry.date).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }) + " — " + entry.label_display }),
           el("span", { class: "panel-list-meta", text: meta }),
         ]));
       });
@@ -2509,7 +3153,10 @@ scripted.
   } else if (initialTree && treesById[initialTree]) {
     selectTree(initialTree);
   } else if (initialBlock && blocksById[initialBlock]) {
-    selectBlock(initialBlock);
+    // ?section=harvest|fertilizer opens that drill-down directly — used by
+    // notification links (e.g. "Harvest approval pending").
+    var initialSection = params.get("section");
+    selectBlock(initialBlock, ["harvest", "fertilizer"].indexOf(initialSection) !== -1 ? initialSection : undefined);
   } else if (initialFarm && farmsById[initialFarm]) {
     selectFarm(initialFarm);
   } else {

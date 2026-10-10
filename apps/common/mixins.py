@@ -3,6 +3,7 @@ Shared viewset mixins for offline-writable models. See docs/05-offline-sync.md
 and docs/04-api-spec.md § Conventions: "resubmitting the same UUID is
 idempotent, not an error."
 """
+from django.db import transaction
 from rest_framework import status
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
@@ -44,6 +45,28 @@ class IdempotentUUIDCreateMixin:
     def get_idempotent_create_defaults(self, request):
         return {}
 
+    def is_resubmit_locked(self, instance):
+        """Return True when an existing record must no longer change through
+        a resubmit. A locked resubmit gets the stored record back unchanged
+        (200) rather than an error, so a genuine offline replay still clears
+        from the device's outbox, but a replay can't be used as a second
+        edit path around ManagerOnlyChangesMixin (e.g. rewriting an
+        already-approved harvest weight by re-POSTing its UUID).
+        """
+        return False
+
+    def validate_new_record(self, validated_data):
+        """Hook: raise ValidationError to refuse creating a brand-new record.
+        Never called for a resubmit of a record that already exists, so a
+        rule like "no new actuals on an approved plan" doesn't also reject
+        a genuine offline replay of an actual created before approval.
+        """
+
+    def on_record_created(self, instance):
+        """Hook: side effects of creating a brand-new record (not called on
+        a resubmit). Runs in the same transaction as the create.
+        """
+
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -65,17 +88,29 @@ class IdempotentUUIDCreateMixin:
                 raise PermissionDenied(
                     "A record with this id exists but is outside your scope; it cannot be updated via sync."
                 )
+            existing = scoped_qs.filter(**{pk_field: pk_value}).first() if exists_in_scope else None
+            if existing is not None and self.is_resubmit_locked(existing):
+                return Response(self.get_serializer(existing).data, status=status.HTTP_200_OK)
+
+            if existing is None:
+                self.validate_new_record(serializer.validated_data)
 
             defaults = {**serializer.validated_data, **self.get_idempotent_create_defaults(request)}
             defaults.pop(pk_field, None)
-            instance, created = model.objects.update_or_create(
-                **{pk_field: pk_value}, defaults=defaults
-            )
+            with transaction.atomic():
+                instance, created = model.objects.update_or_create(
+                    **{pk_field: pk_value}, defaults=defaults
+                )
+                if created:
+                    self.on_record_created(instance)
             output = self.get_serializer(instance)
             return Response(
                 output.data,
                 status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
             )
 
-        self.perform_create(serializer)
+        self.validate_new_record(serializer.validated_data)
+        with transaction.atomic():
+            self.perform_create(serializer)
+            self.on_record_created(serializer.instance)
         return Response(serializer.data, status=status.HTTP_201_CREATED)

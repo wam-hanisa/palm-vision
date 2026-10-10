@@ -24,7 +24,8 @@ def _email_subscribers(run: ReportRun):
     dev — settings/base.py — so 'sent' mail shows up in the worker's logs,
     not a real inbox, until SMTP is configured for a real deployment).
     """
-    subscribers = run.definition.subscribers.exclude(email="")
+    eligible = services.eligible_subscribers(run.definition.farm)
+    subscribers = run.definition.subscribers.filter(id__in=eligible.values("id")).exclude(email="")
     if not subscribers.exists() or not run.file:
         return
     message = EmailMessage(

@@ -75,10 +75,12 @@ blocks a farm has.
   // see farm_map.html's matching comment for why (OSM's own tile server
   // blocks exactly this kind of embedded, repeatedly-reloaded use under
   // its usage policy; this page hit the same block).
-  L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
+  // CARTO now requires an API key (every tile came back "API KEY
+  // REQUIRED"); Esri's keyless street map, same as farm_map.html.
+  L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}", {
     maxZoom: 20,
-    subdomains: "abcd",
-    attribution: "&copy; OpenStreetMap contributors &copy; CARTO",
+    maxNativeZoom: 19,
+    attribution: "Tiles &copy; Esri — Source: Esri, HERE, Garmin, USGS, and others",
   }).addTo(map);
 
   var boundsSources = [];
@@ -118,7 +120,7 @@ blocks a farm has.
         fillOpacity: block.suggested ? 0.35 : 0.05,
       },
     }).addTo(map);
-    layer.bindPopup(block.name);
+    layer.bindPopup(Object.assign(document.createElement("span"), { textContent: block.name }));
     layer.on("click", function () {
       var checkbox = checklist.querySelector('input[value="' + block.id + '"]');
       setBlockChecked(block.id, checkbox ? !checkbox.checked : true);

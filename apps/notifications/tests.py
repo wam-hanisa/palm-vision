@@ -33,7 +33,7 @@ from apps.notifications.tasks import (
     check_stalled_sync,
     check_tree_health_anomalies,
 )
-from apps.operations.models import Fertilizer, PlanStatus
+from apps.operations.models import ActualFertilizer, Fertilizer, PlanStatus
 from apps.sync.models import SyncCheckIn
 
 
@@ -295,11 +295,47 @@ def test_approvals_pending_notifies_manager_after_stale_period(settings, manager
     # PIC Block starting field execution), not something this notification
     # check needs to exercise. Set the status directly instead of chaining
     # advance_status() calls that would raise on the undefined transition.
+    ActualFertilizer.objects.create(fertilizer=plan, date="2026-08-02", quantity=5)
     stale_time = timezone.now() - datetime.timedelta(days=5)
     Fertilizer.objects.filter(id=plan.id).update(status=PlanStatus.ON_PROGRESS_WAIT, updated_at=stale_time)
 
     check_approvals_pending()
     assert Notification.objects.filter(user=manager, category=NotificationCategory.APPROVAL_PENDING).exists()
+
+
+@pytest.mark.django_db
+def test_approval_notification_links_to_the_blocks_section_and_is_clickable(settings, client, manager, farm_role_manager, block_a):
+    """Links used to point at raw API JSON (/api/fertilizers/<id>/), and
+    the notifications page didn't render links at all."""
+    settings.APPROVAL_PENDING_DAYS = 1
+    plan = Fertilizer.objects.create(farm_block=block_a, assessment_date="2026-08-01")
+    ActualFertilizer.objects.create(fertilizer=plan, date="2026-08-02", quantity=5)
+    Fertilizer.objects.filter(id=plan.id).update(
+        status=PlanStatus.DONE_WAIT, updated_at=timezone.now() - datetime.timedelta(days=5)
+    )
+    check_approvals_pending()
+    note = Notification.objects.get(user=manager, category=NotificationCategory.APPROVAL_PENDING)
+    assert note.link == f"/dashboard/farms/?block={block_a.id}&section=fertilizer"
+
+    Notification.objects.create(user=manager, category=NotificationCategory.APPROVAL_PENDING,
+                                title="Old style", message="m", link="/api/harvests/x/")
+    client.login(username="manager", password="manager12345")
+    html = client.get("/dashboard/notifications/").content.decode()
+    assert f'href="/dashboard/farms/?block={block_a.id}&amp;section=fertilizer"' in html
+    assert 'href="/api/' not in html  # old raw-API links stay plain text
+
+
+@pytest.mark.django_db
+def test_approvals_pending_skips_plans_with_nothing_to_approve(settings, manager, farm_role_manager, block_a):
+    """A waiting plan whose only actual was deleted has no Approve button,
+    so it mustn't nag the Manager either."""
+    settings.APPROVAL_PENDING_DAYS = 1
+    plan = Fertilizer.objects.create(farm_block=block_a, assessment_date="2026-08-01")
+    stale_time = timezone.now() - datetime.timedelta(days=5)
+    Fertilizer.objects.filter(id=plan.id).update(status=PlanStatus.DONE_WAIT, updated_at=stale_time)
+
+    check_approvals_pending()
+    assert not Notification.objects.filter(user=manager, category=NotificationCategory.APPROVAL_PENDING).exists()
 
 
 # --- event-driven processing-failure notification -------------------------

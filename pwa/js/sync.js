@@ -89,9 +89,55 @@ async function pullChanges() {
     if (records.length) await window.PalmVisionDB.putAll(storeName, records);
   }
 
+  // Server-side hard deletes (apps/sync/models.py's SyncTombstone) never
+  // show up in the per-resource lists above — a deleted row just stops
+  // appearing, it isn't listed as "changed" — so without this, a plan
+  // deleted after this device already synced it would linger in
+  // IndexedDB forever. Reported directly: "in pwa log harvest previous
+  // harvest plan are still showing." Grouped by store first so each
+  // store only gets one deleteAll() transaction, not one per tombstone.
+  const idsByStore = {};
+  for (const tombstone of data.tombstones || []) {
+    const storeName = SYNC_KEY_TO_STORE[tombstone.resource];
+    if (!storeName) continue; // e.g. "farms" — never cached locally to begin with
+    if (!idsByStore[storeName]) idsByStore[storeName] = [];
+    idsByStore[storeName].push(tombstone.object_id);
+  }
+  for (const [storeName, ids] of Object.entries(idsByStore)) {
+    await window.PalmVisionDB.deleteAll(storeName, ids);
+  }
+
   await window.PalmVisionDB.setMeta("sync_cursor", data.server_time);
   await window.PalmVisionDB.setMeta("last_synced_at", new Date().toISOString());
   return data;
+}
+
+/** Re-downloads everything and removes local records the server no longer
+ * has. The incremental pull can't clean up records deleted before deletion
+ * tombstones existed (apps/sync/models.py SyncTombstone) — they'd stay on a
+ * device forever. The full download completes before anything is removed,
+ * so a failed download never leaves the device emptied. The caller must
+ * make sure the outbox is empty first: a record created on this device but
+ * not yet sent isn't on the server either, and would be removed.
+ */
+async function fullResync() {
+  const response = await window.PalmVisionAPI.apiFetch("/api/sync/pull/");
+  if (!response.ok) {
+    throw new Error(`Download failed with status ${response.status}`);
+  }
+  const data = await response.json();
+  let removed = 0;
+  for (const [key, storeName] of Object.entries(SYNC_KEY_TO_STORE)) {
+    const records = data[key] || [];
+    const onServer = new Set(records.map((r) => r.id));
+    const stale = (await window.PalmVisionDB.getAll(storeName)).filter((r) => !onServer.has(r.id)).map((r) => r.id);
+    if (records.length) await window.PalmVisionDB.putAll(storeName, records);
+    if (stale.length) await window.PalmVisionDB.deleteAll(storeName, stale);
+    removed += stale.length;
+  }
+  await window.PalmVisionDB.setMeta("sync_cursor", data.server_time);
+  await window.PalmVisionDB.setMeta("last_synced_at", new Date().toISOString());
+  return { removed };
 }
 
 /** Replay queued outbox writes, oldest first, stopping on the first
@@ -129,7 +175,9 @@ async function flushOutbox() {
         await window.PalmVisionDB.updateOutboxEntry(entry.outboxId, {
           status: "failed",
           attempts: entry.attempts + 1,
-          lastError: JSON.stringify(body),
+          // Readable, because it's shown to the field worker on the
+          // "couldn't be saved" review screen (app.js syncIssuesScreen()).
+          lastError: window.PalmVisionAPI.describeServerError(body) || `Rejected by the server (${response.status}).`,
         });
         failed += 1;
       }
@@ -176,7 +224,7 @@ async function runSync() {
   }
 }
 
-window.PalmVisionSync = { runSync, pullChanges, flushOutbox, onSyncStatusChange };
+window.PalmVisionSync = { runSync, pullChanges, flushOutbox, fullResync, onSyncStatusChange };
 
 window.addEventListener("online", () => {
   window.PalmVisionSync.runSync().catch((err) => console.error("Sync on reconnect failed", err));

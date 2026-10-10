@@ -25,6 +25,7 @@ from PIL import Image as PILImage
 from rasterio.transform import from_bounds
 from rest_framework import status
 
+from django.urls import reverse
 from apps.imagery.models import Image, ImageProcessingRun, ModelVersion, TreeDetection, TreeHealthClassification
 from apps.imagery.services import (
     ImageDeletionRefused,
@@ -871,7 +872,7 @@ def test_run_processing_refuses_when_block_has_no_boundary(tmp_path, farm, manag
     # failure path in run_processing(), and silent since this always runs
     # inside an async Celery task the triggering Manager isn't watching.
     assert Notification.objects.filter(
-        user=manager, category=NotificationCategory.PROCESSING_FAILURE, link__contains=str(block_no_boundary.id)
+        user=manager, category=NotificationCategory.PROCESSING_FAILURE, link__contains=str(run.id)
     ).exists()
 
 
@@ -884,7 +885,7 @@ def test_run_processing_full_chain_matched_new_candidate_and_out_of_bounds(tmp_p
     outside_block = (101.0, 0.0, 0.99)  # nowhere near block_a at all — must be filtered out
 
     fake_detector = _fake_detector_factory([inside_matched, inside_new, outside_block])
-    fake_classifier = lambda crop: ("yellow", 0.42)  # noqa: E731 — test-local, fine
+    fake_classifier = lambda crop: ("yellow", 0.92)  # noqa: E731 — test-local, fine
 
     run = ImageProcessingRun.objects.create(image=image, farm_block=block_a, triggered_by=manager)
     run_processing(run, detector=fake_detector, classifier=fake_classifier)
@@ -1012,7 +1013,7 @@ def test_confirm_new_candidate_creates_tree_and_classifies(tmp_path, farm, manag
         detection_confidence=0.9,
         match_status=TreeDetection.MATCH_NEW_CANDIDATE,
     )
-    tree = confirm_new_candidate(detection, manager, classifier=lambda crop: ("yellow", 0.6))
+    tree = confirm_new_candidate(detection, manager, classifier=lambda crop: ("yellow", 0.9))
     detection.refresh_from_db()
     tree.refresh_from_db()
     assert tree.source == Tree.SOURCE_DRONE_DETECTED
@@ -1102,9 +1103,9 @@ def test_classify_detection_leaves_patch_image_empty_when_patch_is_unusable(monk
     clipped_array, clipped_transform, clip_crs = clip_to_block(image, block_a)
 
     classification = classify_detection(
-        detection, clipped_array, clipped_transform, crs=clip_crs, classifier=lambda c: ("healthy", 0.8)
+        detection, clipped_array, clipped_transform, crs=clip_crs, classifier=lambda c: ("unknown", 0.8)
     )
-    assert classification.health_label == "healthy"
+    assert classification.health_label == "unknown"
     assert classification.confidence == 0.0  # unusable patch -> forced to review, never a real classifier call
     assert not classification.patch_image
 
@@ -1882,7 +1883,7 @@ def test_load_real_classifier_routes_unmapped_class_to_review_not_a_guess(tmp_pa
     classifier = _load_real_classifier(checkpoint_path)
 
     label, confidence = classifier(PILImage.new("RGB", (64, 64)))
-    assert label == "healthy"
+    assert label == "unknown"
     assert confidence == 0.0  # always routed to review — same convention as stub_classifier()
 
 
@@ -2026,3 +2027,173 @@ def test_compute_indices_handles_a_pure_black_patch_without_raising():
     indices = compute_indices(rgb)
     assert np.all(np.isnan(indices.vari))
     assert np.all(np.isnan(indices.ngrdi))
+
+
+def test_clip_to_block_reads_at_reduced_resolution_when_asked(tmp_path, farm, manager, block_a):
+    """A native-resolution clip of a very fine orthomosaic exhausted the
+    worker's memory (every B3 run was SIGKILLed while clipping)."""
+    from apps.imagery.ml.detection import _native_gsd_m
+    from apps.imagery.services import clip_to_block
+
+    image = _make_image(tmp_path, farm, manager)
+    native, native_transform, crs = clip_to_block(image, block_a)
+    gsd = _native_gsd_m(native_transform, crs)
+
+    reduced, reduced_transform, _ = clip_to_block(image, block_a, max_gsd_m=gsd * 2)
+    assert reduced.shape[0] == native.shape[0]  # same bands
+    assert reduced.size < native.size / 3  # ~4x fewer pixels at 2x the pixel size
+    assert abs(_native_gsd_m(reduced_transform, crs) - gsd * 2) < gsd * 0.2
+    assert reduced.any()  # real pixels inside the block, not an empty clip
+
+    same, _, _ = clip_to_block(image, block_a, max_gsd_m=gsd)  # already fine enough: untouched
+    assert same.shape == native.shape
+
+
+# --- Confirming a detection must never create a second tree for the same
+#     palm: a double-click, a retried request, or a second run over the same
+#     area used to each add another one. ---
+
+@pytest.mark.django_db
+def test_confirming_the_same_detection_twice_creates_one_tree(as_manager, farm, manager, block_a, tmp_path):
+    image = _make_image(tmp_path, farm, manager)
+    run = ImageProcessingRun.objects.create(image=image, farm_block=block_a, triggered_by=manager)
+    detection = TreeDetection.objects.create(
+        processing_run=run, detected_location=Point(101.4440, 0.5340, srid=4326),
+        detection_confidence=0.9, match_status=TreeDetection.MATCH_NEW_CANDIDATE,
+    )
+    first = as_manager.post(f"/api/detections/{detection.id}/confirm/")
+    second = as_manager.post(f"/api/detections/{detection.id}/confirm/")
+    assert first.data["tree_id"] == second.data["tree_id"]
+    assert Tree.objects.filter(farm_block=block_a).count() == 1
+
+
+@pytest.mark.django_db
+def test_second_run_over_the_same_palm_links_to_the_existing_tree(farm, manager, block_a, tmp_path):
+    image = _make_image(tmp_path, farm, manager)
+    point = Point(101.4440, 0.5340, srid=4326)
+    runs = [ImageProcessingRun.objects.create(image=image, farm_block=block_a, triggered_by=manager) for _ in range(2)]
+    detections = [
+        TreeDetection.objects.create(
+            processing_run=run, detected_location=point, detection_confidence=0.9,
+            match_status=TreeDetection.MATCH_NEW_CANDIDATE,
+        )
+        for run in runs
+    ]  # both were "new" when their runs finished, before either was reviewed
+    trees = [confirm_new_candidate(d, manager) for d in detections]
+    assert trees[0].id == trees[1].id
+    assert Tree.objects.filter(farm_block=block_a).count() == 1
+    detections[1].refresh_from_db()
+    assert detections[1].match_status == TreeDetection.MATCH_MATCHED
+
+
+# --- Health labels: no guesses, and low-confidence results don't colour the map. ---
+
+@pytest.mark.django_db
+def test_low_confidence_result_does_not_change_tree_health_until_reviewed(client, farm, manager, farm_role_manager, block_a, tree_in_block_a, tmp_path):
+    image = _make_image(tmp_path, farm, manager)
+    run = ImageProcessingRun.objects.create(image=image, farm_block=block_a, triggered_by=manager)
+    run_processing(run, detector=_fake_detector_factory([(101.4410, 0.5310, 0.9)]),
+                   classifier=lambda c: ("yellow", 0.4))
+    tree_in_block_a.refresh_from_db()
+    assert tree_in_block_a.current_health == Tree.HEALTH_UNKNOWN  # not trusted yet
+
+    classification = TreeHealthClassification.objects.get()
+    client.login(username="manager", password="manager12345")
+    response = client.post(
+        reverse("dashboard:imagery-classification-review", kwargs={"classification_id": classification.id}),
+        {"label": "healthy"},
+    )
+    assert response.status_code == 302
+    classification.refresh_from_db()
+    tree_in_block_a.refresh_from_db()
+    assert (classification.reviewed, classification.corrected_label) == (True, "healthy")
+    assert tree_in_block_a.current_health == "healthy"
+
+
+def test_unusable_patch_is_unknown_not_healthy():
+    from apps.imagery.ml.classification import stub_classifier
+
+    assert stub_classifier(None) == ("unknown", 0.0)
+
+
+@pytest.mark.django_db
+def test_second_run_for_the_same_image_and_block_is_not_started(as_manager, farm, manager, block_a, tmp_path):
+    image = _make_image(tmp_path, farm, manager)
+    georeference_image(image)
+    active = ImageProcessingRun.objects.create(
+        image=image, farm_block=block_a, triggered_by=manager, status=ImageProcessingRun.STATUS_CLIPPING
+    )
+    response = as_manager.post(f"/api/farm-blocks/{block_a.id}/images/{image.id}/process/")
+    assert response.status_code == 200
+    assert response.data["id"] == str(active.id)
+    assert ImageProcessingRun.objects.filter(farm_block=block_a).count() == 1
+
+
+@pytest.mark.django_db
+def test_delete_image_removes_run_clipped_files(tmp_path, farm, manager, block_a, settings):
+    from django.core.files.base import ContentFile
+
+    from apps.imagery.services import delete_image
+
+    settings.MEDIA_ROOT = tmp_path / "media"
+    image = _make_image(tmp_path, farm, manager)
+    run = ImageProcessingRun.objects.create(image=image, farm_block=block_a, triggered_by=manager)
+    run.clipped_cog_file.save("clip.tif", ContentFile(b"x"), save=True)
+    path = run.clipped_cog_file.path
+    delete_image(image)
+    import os
+    assert not os.path.exists(path)
+
+
+@pytest.mark.django_db
+def test_cleanup_command_finds_only_unreferenced_old_files(tmp_path, farm, manager, settings):
+    import os
+    import time
+
+    from django.core.management import call_command
+
+    from apps.imagery.management.commands.cleanup_orphaned_imagery import find_orphans
+
+    settings.MEDIA_ROOT = tmp_path / "media"
+    raw = settings.MEDIA_ROOT / "imagery" / "raw"
+    raw.mkdir(parents=True)
+    orphan, fresh = raw / "old.tif", raw / "new.tif"
+    orphan.write_bytes(b"x")
+    fresh.write_bytes(b"x")
+    old = time.time() - 48 * 3600
+    os.utime(orphan, (old, old))
+    assert [n for n, _, _ in find_orphans()] == ["imagery/raw/old.tif"]  # new one is too recent to touch
+    call_command("cleanup_orphaned_imagery")  # dry run
+    assert orphan.exists()
+    call_command("cleanup_orphaned_imagery", "--delete")
+    assert not orphan.exists() and fresh.exists()
+
+
+@pytest.mark.django_db
+def test_cannot_reject_a_confirmed_detection_or_link_to_a_removed_tree(as_manager, farm, manager, block_a, tree_in_block_a, tmp_path):
+    image = _make_image(tmp_path, farm, manager)
+    run = ImageProcessingRun.objects.create(image=image, farm_block=block_a, triggered_by=manager)
+    linked = TreeDetection.objects.create(
+        processing_run=run, detected_location=Point(101.4410, 0.5310, srid=4326), detection_confidence=0.9,
+        match_status=TreeDetection.MATCH_MATCHED, tree=tree_in_block_a,
+    )
+    assert as_manager.post(f"/api/detections/{linked.id}/reject/").status_code == 400
+
+    tree_in_block_a.status = Tree.STATUS_REMOVED
+    tree_in_block_a.save()
+    open_detection = TreeDetection.objects.create(
+        processing_run=run, detected_location=Point(101.4411, 0.5311, srid=4326), detection_confidence=0.9,
+        match_status=TreeDetection.MATCH_AMBIGUOUS,
+    )
+    assert as_manager.post(f"/api/detections/{open_detection.id}/link/", {"tree_id": str(tree_in_block_a.id)}).status_code == 404
+
+
+@pytest.mark.django_db
+def test_failure_notification_links_to_the_review_page(farm, manager, block_a, tmp_path):
+    from apps.imagery.services import _notify_processing_failure
+    from apps.notifications.models import Notification
+
+    image = _make_image(tmp_path, farm, manager)
+    run = ImageProcessingRun.objects.create(image=image, farm_block=block_a, triggered_by=manager, error_message="boom")
+    _notify_processing_failure(run)
+    assert Notification.objects.get(user=manager).link == f"/dashboard/imagery/runs/{run.id}/"

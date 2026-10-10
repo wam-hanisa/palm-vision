@@ -13,7 +13,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from apps.common.permissions import user_role_on_farm
-from apps.farms.models import UserFarmRole
+from apps.farms.models import FarmBlock, UserFarmRole
 
 from .models import ReportDefinition, ReportRun
 from .serializers import ReportDefinitionSerializer, ReportRunSerializer
@@ -31,8 +31,16 @@ def _scoped_to_user_farms(queryset, user, farm_field="farm"):
     """
     if user.is_superuser:
         return queryset
+    # A PIC Block only reaches reports restricted to one of their own blocks
+    # (a farm-wide or other-block report would expose figures they can't see
+    # anywhere else).
+    pic_block_ids = [
+        str(pk) for pk in FarmBlock.objects.filter(pic=user).values_list("id", flat=True)
+    ]
+    prefix = "filters__" if farm_field == "farm" else "definition__filters__"
     return queryset.filter(
-        Q(**{f"{farm_field}_id__in": _managed_farm_ids(user)}) | Q(**{f"{farm_field}__blocks__pic": user})
+        Q(**{f"{farm_field}_id__in": _managed_farm_ids(user)})
+        | Q(**{f"{prefix}farm_block_id__in": pic_block_ids})
     ).distinct()
 
 
@@ -60,6 +68,10 @@ class ReportDefinitionViewSet(viewsets.ModelViewSet):
         farm = serializer.validated_data.get("farm", serializer.instance.farm)
         self._require_manager_or_superadmin_for_farm(farm)
         serializer.save()
+
+    def perform_destroy(self, instance):
+        self._require_manager_or_superadmin_for_farm(instance.farm)
+        instance.delete()
 
     @action(detail=True, methods=["post"])
     def run(self, request, pk=None):

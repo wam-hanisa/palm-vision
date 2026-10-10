@@ -138,14 +138,15 @@ erDiagram
         uuid id
         fk harvest_id
         date date
-        float quantity "derived if tree-level rows exist, else manual"
+        float weight_kg "authoritative total (kg); wins over tree-level sum whenever set"
+        float quantity "optional bunch count, supplementary only"
     }
     HARVEST_TREE {
         uuid id
         fk actual_harvest_id
         fk tree_id
-        float quantity "per-tree yield count"
-        float weight_kg
+        float weight_kg "authoritative per-tree value (kg)"
+        float quantity "optional bunch count, supplementary only"
         point recorded_location "GPS at capture time"
         fk recorded_by
         datetime recorded_at
@@ -170,7 +171,7 @@ erDiagram
 ```
 
 Notes:
-- `ActualHarvest.quantity` is derived (summed from `HarvestTree` rows) when tree-level entries exist for that harvest event; otherwise it's the manually-entered block-level total. Both paths are valid — don't force one.
+- `ActualHarvest.weight_kg` (kg — every harvest record's authoritative unit, not bunch count) is authoritative whenever it's manually set, full stop; it only falls back to summing `HarvestTree.weight_kg` rows when no manual total was ever given. `quantity` (bunch count) is optional supplementary detail on both models, never part of this derivation — see `apps/operations/models.py`'s `get_effective_quantity()`/`effective_quantity` for the exact remainder-split rule when some but not all tree rows are individually measured. `ActualFertilizer`/`FertilizerTree` mirror this exactly, already kg-native (no separate bunch-count field ever existed there).
 - Status transitions on `Harvest`/`Fertilizer` are `TextChoices` enums, enforced through DRF permission classes on every state-changing endpoint — approval specifically requires the actor to hold the right role/permission, checked server-side, every time.
 
 ## Compliance & traceability

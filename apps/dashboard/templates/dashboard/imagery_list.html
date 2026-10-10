@@ -242,7 +242,7 @@
     <p class="empty-state">No images uploaded yet.</p>
   {% else %}
     <div class="table-scroll"><table class="data-table">
-      <thead><tr><th>Preview</th><th>Farm</th><th>Blocks</th><th>Uploaded</th><th>Georeference status</th><th>Format</th><th>Storage</th><th>Uploaded by</th><th></th></tr></thead>
+      <thead><tr><th>Preview</th><th>Farm</th><th>Blocks</th><th>Uploaded</th><th>Georeference status</th><th>Map loading</th><th>Original file</th><th>Uploaded by</th><th></th></tr></thead>
       <tbody>
         {% for image in images %}
         <tr>
@@ -272,20 +272,20 @@
               <span class="muted">Not processed yet</span>
             {% endfor %}
           </td>
-          <td>{{ image.created_at }}</td>
+          <td>{{ image.created_at|date:"j M Y, H:i" }}</td>
           <td>
             {% if image.georeference_status == "done" %}<span class="tag tag-success">Done</span>
             {% elif image.georeference_status == "failed" %}<span class="tag tag-danger">Failed — {{ image.georeference_error }}</span>
             {% else %}<span class="tag tag-warning">Pending</span>{% endif %}
           </td>
           <td>
-            {% if image.is_cog %}<span class="tag tag-success" title="Internally tiled with baked-in overview levels — see convert_to_cog() in apps/imagery/services.py">COG</span>
-            {% elif image.cog_error %}<span class="tag tag-danger" title="{{ image.cog_error }}">Plain — conversion failed</span>
-            {% else %}<span class="muted">Plain</span>{% endif %}
+            {% if image.is_cog %}<span class="tag tag-success" title="Converted to a Cloud-Optimized GeoTIFF, so the map loads it quickly at any zoom">Optimized</span>
+            {% elif image.cog_error %}<span class="tag tag-danger" title="{{ image.cog_error }}">Optimization failed</span>
+            {% else %}<span class="muted">Not optimized</span>{% endif %}
           </td>
           <td>
-            {% if image.storage_tier == "cold" %}<span class="tag" title="Raw file older than the retention window — see docs/12-security-ops.md">Cold</span>
-            {% else %}<span class="muted">Hot</span>{% endif %}
+            {% if image.storage_tier == "cold" %}<span class="tag" title="The original upload is past the retention period and has been moved to archive storage">Archived</span>
+            {% else %}<span class="muted">Available</span>{% endif %}
           </td>
           <td>{{ image.uploaded_by|default:"—" }}</td>
           <td>

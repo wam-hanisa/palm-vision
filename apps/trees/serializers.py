@@ -30,6 +30,10 @@ class TreeSerializer(ScopedPrimaryKeyFieldsMixin, serializers.ModelSerializer):
     location_orphaned_warning = serializers.SerializerMethodField()
     harvest_stage = serializers.SerializerMethodField()
     fertilizer_stage = serializers.SerializerMethodField()
+    # Server-assigned (Tree.save()); the field app shows `label` wherever a
+    # tree has no name.
+    number = serializers.IntegerField(read_only=True)
+    label = serializers.CharField(read_only=True)
     scoped_pk_fields = {"farm_block": scoped_farm_blocks}
 
     class Meta:
@@ -38,6 +42,8 @@ class TreeSerializer(ScopedPrimaryKeyFieldsMixin, serializers.ModelSerializer):
             "id",
             "farm_block",
             "name",
+            "number",
+            "label",
             "location",
             "source",
             "status",
