@@ -20,16 +20,26 @@ from datetime import timedelta
 from celery import shared_task
 from django.conf import settings
 from django.db.models import Count, Q
+from django.urls import reverse
 from django.utils import timezone
 
 from apps.compliance.models import ComplianceDocument
 from apps.farms.models import FarmBlock, UserFarmRole
 from apps.imagery.models import TreeDetection, TreeHealthClassification
-from apps.operations.models import Fertilizer, Harvest, PlanStatus
+from apps.operations.models import Fertilizer, Harvest
+from apps.operations.services import awaiting_approval
 from apps.sync.models import SyncCheckIn
 
 from .models import NotificationCategory
 from .services import notify, notify_with_snooze
+
+
+def _block_link(block_id, section=None):
+    """Farm Map, opened on this block (and its Harvest/Fertilizer section).
+    Notification links used to point at raw API URLs, which aren't anywhere
+    a Manager can act — the notifications page now renders these."""
+    link = f"{reverse('dashboard:farms')}?block={block_id}"
+    return f"{link}&section={section}" if section else link
 
 
 def _managers_for_farm(farm):
@@ -69,7 +79,7 @@ def check_compliance_expiry():
                         f"{document.get_document_type_display()} for "
                         f"{document.farm_block or document.farm} expires on {document.expiry_date}."
                     ),
-                    link=f"/api/compliance-documents/{document.id}/",
+                    link=reverse("dashboard:compliance-documents"),
                 )
 
 
@@ -126,7 +136,7 @@ def check_tree_health_anomalies():
                         f"Unhealthy classifications for {block.name} rose from {prior_count} to "
                         f"{current_count} over the last {window_days} days."
                     ),
-                    link=f"/api/farm-blocks/{block.id}/",
+                    link=_block_link(block.id),
                 )
 
 
@@ -182,7 +192,7 @@ def check_review_backlog():
                 dedup_key=f"review-backlog:{block.id}",
                 title=f"Detection review backlog — {block.name}",
                 message=f"{row['count']} detections awaiting review on {block.name}.",
-                link=f"/api/farm-blocks/{block.id}/processing-runs/",
+                link=reverse("dashboard:imagery-block", kwargs={"block_id": block.id}),
             )
 
 
@@ -196,12 +206,9 @@ def check_approvals_pending():
     """
     pending_days = getattr(settings, "APPROVAL_PENDING_DAYS", 3)
     cutoff = timezone.now() - timedelta(days=pending_days)
-    waiting_statuses = [PlanStatus.ON_PROGRESS_WAIT, PlanStatus.DONE_WAIT]
 
     for model, label in [(Harvest, "Harvest"), (Fertilizer, "Fertilizer")]:
-        pending = model.objects.filter(status__in=waiting_statuses, updated_at__lt=cutoff).select_related(
-            "farm_block__farm"
-        )
+        pending = awaiting_approval(model.objects.filter(updated_at__lt=cutoff)).select_related("farm_block__farm")
         for plan in pending:
             for manager in _managers_for_farm(plan.farm_block.farm):
                 notify_with_snooze(
@@ -210,5 +217,5 @@ def check_approvals_pending():
                     dedup_key=f"approval-pending:{label.lower()}:{plan.id}",
                     title=f"{label} approval pending — {plan.farm_block.name}",
                     message=f"{label} plan for {plan.farm_block.name} has been awaiting approval since {plan.updated_at:%Y-%m-%d}.",
-                    link=f"/api/{label.lower()}s/{plan.id}/",
+                    link=_block_link(plan.farm_block_id, section=label.lower()),
                 )

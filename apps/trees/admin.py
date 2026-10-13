@@ -14,6 +14,6 @@ class TreeAdmin(GISModelAdmin):
 
 @admin.register(TreeCareRecord)
 class TreeCareRecordAdmin(admin.ModelAdmin):
-    list_display = ("__str__", "tree", "kind", "date", "quantity", "recorded_by")
-    list_filter = ("kind",)
+    list_display = ("__str__", "tree", "kind", "action", "date", "quantity", "recorded_by", "batch_id")
+    list_filter = ("kind", "action")
     autocomplete_fields = ("tree",)

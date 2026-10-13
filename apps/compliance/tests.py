@@ -319,3 +319,30 @@ def test_image_referenced_by_baseline_is_compliance_exempt(block_a, farm):
 
     DeforestationBaseline.objects.create(farm_block=block_a, source="drone survey", evidence_image=image)
     assert image.is_compliance_exempt() is True
+
+
+# --- Deletes/edits on block-scoped compliance records need a Manager too —
+#     previously only create/update were checked, so a PIC Block user who
+#     can read a record could delete it. ---
+
+@pytest.mark.django_db
+def test_pic_block_cannot_delete_baseline(as_pic_block, block_a):
+    baseline = DeforestationBaseline.objects.create(farm_block=block_a, source="Manual survey")
+    assert as_pic_block.delete(f"/api/deforestation-baselines/{baseline.id}/").status_code == status.HTTP_403_FORBIDDEN
+    assert DeforestationBaseline.objects.filter(id=baseline.id).exists()
+
+
+@pytest.mark.django_db
+def test_pic_block_cannot_delete_or_edit_harvest_batch(as_pic_block, harvest_batch):
+    assert as_pic_block.delete(f"/api/harvest-batches/{harvest_batch.id}/").status_code == status.HTTP_403_FORBIDDEN
+    assert as_pic_block.patch(f"/api/harvest-batches/{harvest_batch.id}/", {}, format="json").status_code == status.HTTP_403_FORBIDDEN
+
+
+@pytest.mark.django_db
+def test_non_manager_cannot_write_checklist_items(as_pic_block):
+    template = ComplianceAuditTemplate.objects.create(name="ISPO checklist", certification_scheme="ISPO")
+    response = as_pic_block.post(
+        "/api/checklist-items/", {"template": str(template.id), "text": "Injected item"}, format="json"
+    )
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert not template.checklist_items.exists()

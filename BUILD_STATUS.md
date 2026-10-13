@@ -3707,6 +3707,1296 @@ Reported directly, with a screenshot: every base-map tile across the Farm Map ha
 
 **Verified**: all four templates confirmed loadable via Django's own loader. Logged in live as the real `admin` account and confirmed directly — not just assumed — that the map now actually requests `cartocdn` tiles (checked the rendered `<img class="leaflet-tile">` `src`), and that a real tile fetch returns `200 OK` with a genuine ~11KB PNG (not another blocked-placeholder image). No browser console errors. Full `apps/dashboard` suite re-run: **92 passed, 0 failed** — genuinely clean now (the one previously-failing, self-contradicting test was fixed in the update above).
 
+## Update — Harvest/Fertilizer given their own drill-down panel; lasso and tap-highlight fixes
+
+Reported directly, with three specific asks: (1) Harvest/Fertilizer should each get their own panel level (Farm → Block → Harvest/Fertilizer), and that panel should show which trees have been harvested/fertilized or marked as needing it — the only place any of that lived before was per-tree, one click from being lost track of; (2) the same marking/recording buttons that used to sit inline in the block panel should live in that new panel; (3) the lasso-select button should visibly show it's "on," and the drone-imagery picker's blue tap flash shouldn't happen. Confirmed understanding and asked two clarifying questions before writing any code — both answered directly: move the existing "Plan harvest" and "Yield history" into the new Harvest panel in full, but keep a compact yield summary visible on the main block panel too; clicking a pending "needs harvest/fertilizer" tree should jump straight to that tree's own detail page.
+
+**New block-wide marking history endpoint**: `BlockCareHistoryView` (`apps/dashboard/views.py`) — the same `TreeCareRecord` rows `TreeCareHistoryView` already returned for one tree, now across every tree in a block, each row labelled with which tree it belongs to (`GET /dashboard/farms/blocks/<block_id>/care-history/`, manager-scoped like every other block endpoint). Both kinds (harvest/fertilizer) come back together and the client filters to whichever section is open — a block's combined history comfortably fits the existing `[:50]` cap, so a second endpoint wasn't worth it just to split them server-side. 4 new tests (`apps/dashboard/tests.py`): spans every tree in the block correctly labelled, excludes other blocks, empty-state, and scope enforcement for an unrelated manager.
+
+**Client-side panel restructuring** (`farm_map.html`): added `state.blockSection` (`null | "harvest" | "fertilizer"`) to the existing state machine, set/cleared by `selectFarm`/`selectTree`/`clearSelection` and settable via `selectBlock(blockId, section)`'s new optional second argument. `renderPanel()` now dispatches to a new `renderBlockSectionPanel(kind)` when both `blockId` and `blockSection` are set. The old block panel's inline Harvest/Fertilizer headings (three buttons apiece) and full "Yield history" list are gone from `renderBlockDetailPanel()`, replaced by one `sectionSummaryRow()` per kind — a single clickable row showing a pending count and (harvest only) the most recent yield date, linking into the new drill-down. `renderBlockSectionPanel()` shows, in order: whichever tree-selection flow is active (unchanged content, just relocated), or the three action buttons + which trees are currently marked as needing this (click → that tree's own detail page, per the confirmed answer) + yield history (harvest only — fertilizer has no equivalent, `_recent_yield_by_block()`'s own docstring confirms why) + the new block-wide marking history from `BlockCareHistoryView` above, fetched on demand with the same "Loading…" placeholder + staleness-guard pattern already used by `renderTreeCareHistory()`/`renderTreeHealthHistory()`.
+
+**Navigation restoration, so a save doesn't bounce you out of the section you were in**: `applyFocus()` now accepts an optional `focus.section` and passes it through to `selectBlock()`, defaulting to `null`/unset for every existing caller. `submitMarkTrees()`'s success handler now sets it to `"harvest"`/`"fertilizer"` based on which mode just ran, so a bulk mark-needing or record-directly action lands back on the section panel it was started from, not the plain block panel. The generic form-submit path (`bindPanelForm()`, shared by every in-panel form) grew the same optional `opts.focusSection`, used by `startHarvestPlanForm()`/`startFertilizerPlanForm()` (and their Cancel buttons) so creating a harvest/fertilizer plan also returns to the right section — every other form using this same generic path leaves it unset and is unaffected. `quickMarkTreeDone()` (the one-tree shortcut on the tree detail page) now explicitly overrides the focus to `{type: "tree", id: tree.id}` instead of following the server's default block-level focus, per the confirmed answer — it's a shortcut fired *from* a tree's own detail page, so bouncing away from it on save would undo the point of the shortcut.
+
+**Lasso button fix — root cause was deeper than styling**: while wiring up a "pressed" visual state, found the actual bug behind the report: `startLassoSelect()` (called when the button is clicked) only ever wired up map event listeners — it never re-rendered the panel, so neither the button's own label change ("Drag on the map…") nor any new CSS state could ever appear on the first click. The label only ever flipped back to normal, after a completed drag called `applyLassoSelection()` (which does re-render). Fixed by having the button's click handler call `renderPanel()` itself right after `startLassoSelect()`. Combined with a new `.secondary-button--pressed` class (`style.css` — filled `--primary` background, inset shadow, same pairing already used elsewhere so no new contrast check was needed) applied while lassoing, the button now visibly dims/inverts the instant it's clicked, exactly as reported.
+
+**Tap-highlight fix**: added a global `* { -webkit-tap-highlight-color: transparent; }` reset (`style.css`) — Chromium/WebKit's own default translucent-blue flash on any clickable element, never reset anywhere in this file before. Ruled out the imagery picker's real `.selected` state as the cause first (it's `--primary` forest green, not blue) before concluding this was the browser default.
+
+**Also fixed in passing**: the new `sectionSummaryRow()`'s empty-state text originally read "No activity recorded yet" when there was no pending count or yield to show — factually wrong when a block has completed marking history, since that row only knows about pending count and `recent_yield` (baked into `data.blocks`), not the full history behind the on-demand endpoint above. Changed to "Nothing pending right now," which is the only claim this row can actually back up.
+
+**Verified**: `manage.py check` clean; JS syntax-checked (both `<script>` blocks in `farm_map.html` parse); `ruff check apps/dashboard/` clean; full suite **330 passed**, `apps/dashboard` alone **107 passed** (103 pre-existing + 4 new). Live end-to-end against real Postgres/PostGIS (Playwright, logged in as the seeded `manager` account, not just inspected): Farm → Block → Harvest panel renders action buttons + empty "Needs harvest"/"Yield history" + real marking history pulled from the new endpoint; Fertilizer panel renders with no "Yield history" section (confirmed absent, not just untested); clicking "Mark trees needing harvest," checking a tree, and submitting correctly lands back on the Harvest panel (not the plain block panel) with the flash message and the tree now showing under "Needs harvest"; clicking that pending tree jumps to its own detail page; using its "Mark harvested (today)" quick-mark shortcut and saving stays on that same tree's detail page afterward; the lasso button visibly flips to the filled/pressed state with the "Drag on the map… (click to cancel)" label on the very first click, confirmed via both a DOM class-attribute check and a screenshot.
+
+Also confirmed live: creating a harvest plan (Plan harvest → select trees → fill in the form → submit) lands back on the Harvest section panel afterward, not the plain block panel — the `focusSection` path through the generic form-submit handler works end-to-end, not just by inspection.
+
+**Not verified**: the tap-highlight-color fix is a browser-default reset that's correct by inspection (Chromium/WebKit's documented default, confirmed absent from this file beforehand) but the transient blue flash it addresses is a compositor-level effect that headless/screenshot-based testing cannot visually confirm one way or the other — worth a quick manual tap on a real touchscreen or Chrome DevTools' touch emulation to close the loop.
+
+## Update — block marking history grouped into one entry per action, not one per tree; "needs" assignments now logged; a real quantity-loss bug fixed
+
+Reported directly, as a follow-up to the panel restructuring above: "the harvest marking history is not the each tree history but the marking history itself, so if I mark need to harvest in 15/02/2025 it show the marking history quantity of marked trees and quantity fertilize/harvested bunch when I click it it show only marked trees in the map." Also: "when I tried record harvest directly the quantity bunch not shown in anywhere."
+
+**Root cause of the "not shown anywhere" report**: verified live rather than assumed. `TreeCareRecord.quantity` and the whole save/display pipeline were working correctly — the bug was a UI trap. `renderTreeSelectionChecklist()`'s "Bulk quantity" input and each tree's own per-tree quantity input share the CSS class `tree-checklist-qty`; the bulk box only ever takes effect if "Apply to all selected" is clicked to copy it into the per-tree fields first. Typing a number into the bulk box and submitting straight away — a completely reasonable thing to do, especially with only one tree selected — silently discarded it. Reproduced exactly this in a live browser test (filled the bulk box, submitted without clicking Apply, the resulting history entry showed "no quantity recorded") before fixing it.
+
+**Fixed**: `submitMarkTrees()` (`farm_map.html`) now falls back to `state.bulkQuantityValue` for any checked tree that never got its own explicit per-tree value, at submit time — "Apply to all selected" is still there as a way to pre-fill the visible boxes, but the submission itself no longer depends on having clicked it.
+
+**Redesigned the block-wide history around the marking ACTION, not the tree**: `TreeCareRecord` gained two fields (`apps/trees/migrations/0007_...py`) — `action` (`needed` vs `completed`, default `completed` for existing rows) and `batch_id` (a UUID shared by every row created from the same bulk submission). `MarkTreesHarvestedView`/`MarkTreesFertilizedView` and the new logging in `MarkTreesNeedHarvestView`/`MarkTreesNeedFertilizeView` (see below) each generate ONE `batch_id` per request and stamp it onto every row the loop creates; the PWA's single-tree `mark_harvested`/`mark_fertilized` just takes the field's own `uuid4` default — a "batch of one" is exactly what a single-tree action is. `BlockCareHistoryView` now groups its (wider, 400-row) raw query by `batch_id` in Python and returns up to 50 *batches*, each with `tree_count`, `tree_ids`, and `total_quantity` (sum of that batch's non-null quantities, or `null` if none), instead of one flat row per tree per record.
+
+**Stage-1 "needs" assignments now leave a trace at all**: `MarkTreesNeedHarvestView`/`MarkTreesNeedFertilizeView` previously only ever stamped `Tree.harvest_marked_at`/`harvest_marked_by` — no `TreeCareRecord` row, so once a tree's "needs harvest" flag was cleared (by completion, or reassignment), the fact that a Manager ever marked it was gone for good. They now also create one `TreeCareRecord` per tree (`action=ACTION_NEEDED`, `quantity=None`, one shared `batch_id` for the request), so a block's history shows entries like "3 trees marked needing harvest" even after those trees are later completed. This was also a genuine pre-existing test gap — neither view had a single dedicated test before this round.
+
+**Frontend**: `renderBlockCareHistory()` (`farm_map.html`) now renders one row per batch — "3 trees harvested — 42.5 bunches total · Demo Manager" or "2 trees marked needing harvest · Demo Manager" — and clicking a row calls a new `highlightTreesOnMap()` (reuses the exact bigger/bolder-ring marker style `renderMap()` already gives a checked tree during an active selection flow) instead of navigating into one tree — with several trees behind one entry there's no single "the" tree to jump to. The pending "Needs harvest/fertilizer" list (individual, live, un-batched — sourced from `Tree.harvest_stage`, not history) is unchanged and still jumps to a tree's own detail page on click, per the earlier confirmed design; only the historical log below it changed shape. `renderTreeCareHistory()` (the tree-detail page's own history, unaffected by batching since a bulk action can only ever include a given tree once) now labels "needed" rows distinctly ("Harvest — marked as needed", no quantity meta) instead of rendering them like a completion with a blank quantity.
+
+**Migration correctness bug caught and fixed before it shipped**: `batch_id`'s `default=uuid.uuid4` is a callable default, and Django's `AddField` only calls a callable default ONCE, using that single value to backfill every pre-existing row — a documented Django migration limitation. Caught live, not assumed: after migrating, every one of this sandbox's ~17 existing `TreeCareRecord` rows shared one `batch_id`, and the block history immediately (and wrongly) showed a "12 trees harvested" entry merging unrelated trees and dates together. Fixed with a second migration (`0008_fix_batch_id_backfill_collision.py`, `RunPython`) that gives every pre-existing row its own fresh, unique `batch_id` — a no-op on a fresh database with no existing rows, and exactly equivalent to how historical rows always displayed before this feature (one entry each) on one with existing data. Re-verified after: 17/17 rows now have distinct `batch_id`s, and the block history shows each pre-existing record on its own line again.
+
+**Verified**: `manage.py check` clean; `ruff check apps/dashboard/ apps/trees/` clean; full suite **333 passed** (330 + 3 new: batch-grouping, needed-action-in-history, and the previously-untested `MarkTreesNeedHarvestView` now covered). Live end-to-end against real Postgres/PostGIS (Playwright, `manager` account): bulk "Mark trees needing harvest" on 2 trees produced exactly one history entry, "2 trees marked needing harvest"; "Record harvest directly" on 3 trees using ONLY the bulk-quantity box — deliberately without clicking "Apply to all selected," to reproduce the reported bug — produced "3 trees harvested — 297 bunches total" (99 × 3, confirming the fallback fix actually applied the bulk value to all three); clicking that history entry kept the panel on the Harvest section (heading stayed "Harvest," did not navigate to a tree) and showed "Highlighted 3 trees on the map."; re-ran the migration-collision check directly against the database before and after the `0008` fix.
+
+## Update — the real production bug this whole round was chasing: `TooManyFieldsSent` on a large real selection, plus a second undercounting bug it exposed
+
+The user pulled the batch-grouping/quantity-fallback fixes above into their own Docker-based local environment and reported a NEW failure on "Record harvest directly": a `400 (Bad Request)` with an HTML (not JSON) response — the frontend's generic "Couldn't save that" catch-all. Diagnosed from their own `docker compose logs web` output, not guessed: `django.core.exceptions.TooManyFieldsSent` — every previous session's bulk mark/record views sent **one POST field per selected tree** (`tree_ids` repeated, plus `quantity_<id>` for completions), and the user had lasso-selected roughly 500 of a ~1000-tree real block — comfortably over Django's default `DATA_UPLOAD_MAX_NUMBER_FIELDS` (1000) once both field types are counted. This was a pre-existing latent bug (the one-field-per-tree shape predates this round), just never hit before because this project's own demo/test data tops out at a handful of trees per block — CLAUDE.md's own docs already flagged "a farm block can hold over a thousand trees" as a real scale concern, and this is exactly where it bit.
+
+**Fixed at the payload shape, not by raising the field-count ceiling**: `_MarkTreesActionMixin._get_selected_trees()`/new `_tree_ids_from_request()` (`apps/dashboard/views.py`) now reads a single JSON-encoded `tree_ids` field instead of one `tree_ids` field per tree; `_MarkTreesView` similarly reads one JSON-encoded `quantities` field (`{tree_id: value}`) instead of one `quantity_<id>` field per tree. Both `submitMarkTrees()` and `quickMarkTreeDone()` (`farm_map.html`) now `JSON.stringify()` these once instead of appending N fields. Total POST field count is now constant (~4) regardless of how many trees are selected — scales to however large a block actually is. Every existing dashboard test posting the old flat shape was updated to the new JSON shape (`apps/dashboard/tests.py`).
+
+**A second bug found while reproducing the fix, not assumed away**: verified the fix by actually creating 600 trees in a test block and selecting all of them via a live browser (Playwright) — the 400 was gone (`200 OK`, all 600 rows correctly sharing one `batch_id`), but `BlockCareHistoryView`'s own history entry showed "400 trees harvested, 5000 bunches total" instead of the real 600/7500. Root cause: that view's raw-record query was capped at `[:400]` rows before grouping by batch — fine when a history log is many small batches, wrong the moment a single batch (this 600-tree action) is itself larger than the cap, silently truncating its own reported tree_count/total_quantity partway through.
+
+**Fixed with a two-pass query**: pass 1 walks the ordered rows (cheap — `.values_list("batch_id", flat=True).iterator()`, no `select_related`) only far enough to collect the 50 most recent *distinct* batch_ids; pass 2 fetches every row belonging to just those batches, with no row cap, so each batch's own total is always complete regardless of size. Re-verified against the same 600-tree batch: now correctly reads "600 trees harvested — 7500 bunches total."
+
+**Verified**: `manage.py check` clean; `ruff check apps/dashboard/` clean; full suite **333 passed** (test count unchanged from the previous update — same tests, updated to the new JSON payload shape, not new coverage). Live end-to-end against real Postgres/PostGIS (Playwright, `manager` account, a temporary 600-tree test block cleaned up afterward): "Select all" on 600 trees → bulk quantity 12.5 via "Apply to all selected" → "Record harvest directly" → server responded `200` (previously `400` at this scale) with the correct flash message; confirmed via the database directly that all 600 `TreeCareRecord` rows share one `batch_id`; confirmed the block history entry reads the correct "600 trees harvested — 7500 bunches total," not a truncated figure. Test data removed after verification (`Tree.objects.filter(name__startswith="Bulk Tree").delete()`), confirmed back to the original demo counts.
+
+## Update — tree cluster markers: dropped the count label, fixed the contrast
+
+Reported directly, with a screenshot of a real drone/satellite photo background: the map's tree clusters (Leaflet.markercluster, `farm_map.html`) rendered as the plugin's own default numbered icon — a pale yellow-green circle with a count inside (`vendor/leaflet/MarkerCluster.Default.css`, never customized before this). Asked for two things: drop the number, just show a plain dot, and fix the color — the pale yellow-green all but disappeared against real green plantation canopy.
+
+**Fixed at the source, not by hiding the default with more CSS**: `MarkerCluster.Default.css` is no longer loaded at all (confirmed via grep that `farm_map.html` is the only template using marker clustering anywhere in this app, so nothing else depended on its classes). `buildLayers()`'s `L.markerClusterGroup(...)` now supplies its own `iconCreateFunction` returning a plain `L.divIcon` with no text content and an explicit `iconAnchor` (centers the dot on its actual coordinate, matching how the individual `circleMarker`s are centered — Leaflet's own default anchor is bottom-center, meant for pin-shaped icons, and would have offset a round dot upward from where the cluster actually sits). Styled via one new class, `.tree-cluster-dot` (`style.css`): a solid `var(--text)` (near-black warm charcoal) fill with a `var(--bg)` (cream) ring — no per-size color tiering (small/medium/large) the plugin's default had, since the ask was for one plain, consistent dot, not a scaled indicator. Dark-on-light-ring reads clearly against green foliage from any angle, and doesn't collide with any existing status color already in use elsewhere on the map (health fills, harvest/fertilizer ring colors) — see `treeIndicatorStyle()`'s own docstring for that existing palette.
+
+**Verified**: `manage.py check` clean, JS syntax-checked (both `<script>` blocks in `farm_map.html` parse). Live in a real browser (Playwright, `manager` account, 40 temporary tightly-packed trees added to force clustering, removed after): zoomed out until trees clustered, confirmed via direct DOM inspection that the rendered cluster icon carries class `tree-cluster-dot` (not `marker-cluster-small/medium/large`), has empty text content (no count), and is correctly centered (`margin-left/top: -12px`, matching the 24×24 icon's half-size anchor) — not just eyeballed from a screenshot. Actual visual contrast against a real green satellite/drone tile couldn't be screenshotted in this sandbox (Esri/CARTO tile requests are blocked by this environment's own egress policy, same limitation noted for basemap tiles elsewhere in this file) — the color choice is justified by general luminance-contrast reasoning (near-black against mid-tone green foliage) rather than a literal side-by-side screenshot; worth a quick manual look against real imagery to close the loop.
+
+## Update — clustering removed entirely: every tree gets its own always-visible dot
+
+Reported directly, with another screenshot of a real drone photo: the previous update's fix (plain dark dot instead of the numbered default) was itself still a cluster icon — several nearby trees still collapsed into one dot at low zoom. That wasn't wanted at all: "there are no need to make a group of dot ... show dot as is." The ask was never about the cluster icon's own styling; it was to not group markers together in the first place.
+
+**Removed Leaflet.markercluster from this page entirely**, rather than tuning `maxClusterRadius` down or leaving clustering optional: `buildLayers()`'s `L.markerClusterGroup(...)` (with its now-pointless custom `iconCreateFunction` from the previous update) is a plain `L.featureGroup()` — every tree marker is added straight to it and stays its own always-visible `circleMarker`, at any zoom, even when several trees sit close enough to visually overlap. `L.featureGroup` rather than the simpler `L.layerGroup` specifically because the surrounding `fitBounds` logic calls `.getBounds()` on this layer, which plain `LayerGroup` doesn't implement — confirmed this before shipping by tracing every existing use of the renamed variable, not by trial and error.
+
+**Cleaned up rather than left half-migrated**: `leaflet.markercluster.js`, `MarkerCluster.css`, and `MarkerCluster.Default.css` (the latter already unloaded by the previous update, but the other two were still wired in) are no longer referenced by `farm_map.html` at all — confirmed via grep that no other template in this app ever used marker clustering — and the three now-fully-unused vendored files were deleted from disk rather than left as dead weight. `.tree-cluster-dot` (the previous update's own CSS, now with no icon left to style) removed from `style.css`. The `test_vendored_frontend_assets_exist_on_disk` test's file list updated to match, and the module-level variable formerly named `currentClusterGroup` renamed to `currentTreeLayer` throughout `farm_map.html`, since keeping "Cluster" in the name of something that no longer clusters would have been actively misleading to the next person reading it. Every stale comment describing tree markers as "clustered" (the file's own top-of-file plugin-loading rationale, the `buildLayers()` comment above the marker map, and a `views.py` docstring for the old, already-removed standalone MapView) updated to match reality, with the removal's own rationale recorded at the top of `farm_map.html` for whoever next wonders why there's no clustering on a map that could hold thousands of trees.
+
+**Known tradeoff, not silently absorbed**: the original clustering existed specifically because "a farm block can hold over a thousand trees" (this file's own repeated refrain) — removing it trades that scale cushion for literal, ungrouped visibility. Recorded plainly in the new top-of-file comment rather than left implicit, so if a very large block ever makes this page sluggish, the next person debugging it has the actual history instead of having to reverse-engineer why clustering disappeared.
+
+**Verified**: `manage.py check` clean; JS syntax-checked; `ruff check apps/dashboard/` clean; full suite **333 passed** (`test_vendored_frontend_assets_exist_on_disk` updated and still green after the vendor file deletions, not skipped). Live in a real browser (Playwright, `manager` account, the same 40 temporary tightly-packed trees as the previous update's test, removed after): zoomed out to the same level that previously forced a cluster dot to appear — confirmed zero `.tree-cluster-dot` elements and all 44 trees rendered as individual, visibly overlapping `circleMarker` paths instead.
+
+## Update — harvest/fertilizer yield data structure: fertilizer gap filled, manual total made authoritative, derived per-tree averages
+
+Follow-up to a design review (farm > block > action > tree, ton/ha and bunch/ha as trailing averages at farm/block level, raw bunch/ton at action/tree level): confirmed the existing `Harvest`→`ActualHarvest`→`HarvestTree` pipeline already matches this shape, but found and fixed two real gaps in it before building the reporting layer on top.
+
+**Fertilizer gap filled**: `ActualFertilizer` had no manual block-level total at all — only `FertilizerTree`'s own per-tree amounts, with no fallback for "no tree-level breakdown was recorded this time" (unlike `ActualHarvest.quantity`, which already had one). Added `ActualFertilizer.quantity` + `get_effective_quantity()`, mirroring `ActualHarvest` exactly.
+
+**Manual-total precedence reversed, asked directly**: `ActualHarvest.get_effective_quantity()`'s original rule was "tree-sum wins outright the moment any `HarvestTree` row exists, discarding the manual total entirely" — a real, tested, deliberate prior decision. Found a real problem with it during this review: a Manager who reports "500 bunches from this harvest" and then logs 2 trees' worth of detail (120 + 80) would see this method silently report 200, dropping 300 bunches of real reported yield with no warning. Asked directly which behavior was wanted; chose to make the manual total authoritative whenever it's set, with tree-level rows becoming a *breakdown* of that total rather than a competing source. Falls back to tree-sum only when no manual total exists at all (unchanged for that case). Applied identically to the new `ActualFertilizer.get_effective_quantity()`. The one existing test asserting the old "tree-sum always wins" behavior was deliberately updated, not left contradicting the new rule.
+
+**Derived per-tree averages, never persisted**: requested directly — "if the user not input any data to it but only input the bulk then the data input to tree level is the average from bulk/trees." Implemented as `HarvestTree.effective_quantity`/`FertilizerTree.effective_quantity` — a computed *property*, never written back to `quantity` itself (discussed and confirmed: persisting a fabricated average into the same field a real measurement lives in would make the two indistinguishable later, silently defeating the entire point of tree-level tracking — spotting the one underperforming tree, not "everyone gets the block average that day"). `quantity` itself is now nullable on both models, representing a real, distinct state: "this tree was part of the action, just not individually measured" (vs. no row at all, meaning "not part of this action"). The estimate is the *remainder* split evenly across only the other unmeasured siblings — `(manual total − sum of measured siblings) ÷ count of unmeasured siblings` — not a naive `total ÷ every tree`, which would wrongly dilute the trees that *were* actually measured. Returns `None` (never `0`, never a guess) when there's no manual total to estimate from, or when the measured trees alone already meet or exceed the reported total (a sign the total itself is incomplete or wrong, not something to paper over).
+
+Both `HarvestTreeSerializer`/`FertilizerTreeSerializer` now expose `effective_quantity` as a read-only field alongside the writable `quantity`; both `ActualHarvestSerializer`/`ActualFertilizerSerializer` already had (or now have) `effective_quantity` at the action level.
+
+**Verified**: new migration (`operations/0004`) applies cleanly against both the real dev database and a truly fresh one (matching CI). `ruff check .` clean. 31/31 `apps/operations` tests pass, including new coverage for every branch of the new logic (own measured value, remainder estimate across multiple unmeasured siblings, no-manual-total case, measured-exceeds-total guard) for both harvest and fertilizer. Full suite: **346 passed, 0 failed**.
+
+**Not yet done**: no dashboard UI exists yet for actually creating `ActualHarvest`/`HarvestTree` records with a mix of measured/unmeasured trees (this pipeline is currently API-only — dashboard tree-level scoping for Harvest was explicitly phased out for "a later, separate round" per this file's earlier "Two-stage harvest/fertilize marking" entry). Also flagged but not built: `ActualHarvest` has no action-level `weight_kg` field the way `HarvestTree` does (tree-level can record bunch count *and* weight; action-level currently only has one generic `quantity`) — needed for "ton" to be enterable/showable at the action level for harvest without a full tree breakdown, symmetric with what this update already gave fertilizer. Recommended next step: decide whether the farm/block-level ton/ha and bunch/ha reporting views get built next, or the dashboard UI for this pipeline first.
+
+## Bulk quantity now split evenly across selection, not copied to every tree
+
+Reported directly, with two screenshots and exact numbers: "I just input
+record harvest and input bulk 500 and check one of the three it shown 500
+instead of average of the inputed, also in the tab when I input bulk it
+went bulk * quantity. what I mean input bulk is total fertilizer used or
+bunch harvested, not 1 quantity for all of them." Confirmed precisely from
+the screenshots before touching any code: a fertilizer marking history
+entry read "251 trees fertilized: 125500 kg total" — 125500 ÷ 251 = exactly
+500, proving the typed value was being copied verbatim into every selected
+tree's row rather than divided.
+
+This is a different system from the `ActualHarvest`/`HarvestTree`
+`effective_quantity` work in the entry above it — that pipeline is
+API-only with no dashboard UI. What the user was actually testing is the
+`TreeCareRecord`-based "Record harvest/fertilizer directly" flow in
+`farm_map.html`'s Farm Map dashboard, which predates and is entirely
+separate from the operations-app pipeline. The "Bulk quantity entry for
+harvest/fertilizer marking" feature documented earlier in this file
+(`farm_map.html`'s "Apply to all selected" button) was that flow's bug —
+it was, by design at the time, a literal fill-down (every checked tree
+gets the exact typed value), which is fine for "this tree also yielded
+15" but wrong once the field is meant to mean "500 total, split across
+however many trees are checked."
+
+**Fixed in two places in `farm_map.html`**, both driven by the same
+remainder-split principle already agreed on for `effective_quantity`
+above (never a naive `total ÷ everyone`, never fabricate a value where
+one wasn't asked for):
+
+- **"Apply to all selected" → "Split evenly across selected."** Now reads
+  the bulk field as a *total*, divides by the number of currently checked
+  trees (`Math.round((total / ids.length) * 100) / 100`), and fills every
+  checked row with that per-tree share instead of the raw total. Label
+  changed from "Bulk quantity (unit)" to "Total (unit) — split evenly" so
+  the field's meaning is unambiguous without reading the button.
+- **`submitMarkTrees()`'s own fallback** (used when a Manager types a bulk
+  total but submits without ever clicking the button) had the identical
+  bug independently — it fell back to the raw `bulkQuantityValue` per
+  blank tree. Fixed to compute `remainder = bulkTotal − (sum of any
+  individually-typed per-tree values)`, then split that remainder only
+  across the trees still left blank — a tree with its own typed value
+  keeps exactly that value, never overwritten by the bulk total.
+
+**Verified live** against the running dev server (not just read from
+source): logged in as a temporary superuser, opened Block B4 (1070
+trees) in "Record harvest directly," selected all trees, typed 500 into
+the bulk field, clicked "Split evenly across selected," and inspected the
+rendered `.tree-checklist-qty` DOM inputs directly — all 1070 tree rows
+read `0.47` (500 ÷ 1070, rounded to 2 decimals), not `500`; the bulk
+input itself correctly still shows the typed total `500`. Temporary
+account deleted afterward. `apps/dashboard` test suite (110 tests) and
+`ruff check` both clean; no Python-level tests needed changes since this
+bug was entirely in client-side JS with no server-side test coverage of
+this path to begin with.
+
+## "Split evenly" was overwriting individually-typed quantities too
+
+Reported directly, immediately after the fix above shipped: "how can I
+input 500, 200 but it result in not exact what I input?" Root cause: the
+"Split evenly across selected" button (and the bulk field it reads from)
+divided the typed total across *every* checked tree unconditionally,
+including ones that already had their own value typed into their own row
+— so typing 500 into one tree and 200 into another, then clicking "Split
+evenly" again (e.g. after checking one more tree to add to the group),
+overwrote both with a fresh even share instead of leaving them alone. The
+submit-time fallback in `submitMarkTrees()` (fixed in the entry above)
+already got this right — it only fills blank rows — but the button itself
+still had the old blanket-overwrite behavior, so the two paths disagreed
+depending on whether a Manager clicked the button or just submitted.
+
+**Fixed** by extracting one shared function, `splitRemainderAcrossBlanks(ids,
+quantitiesMap, total)`, used by both the button and the submit fallback: it
+sums whatever's already typed for the given trees, splits only the
+*remainder* across the still-blank ones, and leaves every already-typed
+value exactly as typed no matter how many times it's called or in what
+order. Clicking "Split evenly" a second time with nothing left blank now
+shows "Every checked tree already has its own quantity typed in below, or
+the total doesn't cover them" instead of silently clobbering the input.
+
+**Verified live**: checked 3 trees in Block B4, typed 500 into the first
+row and 200 into the second (third left blank), typed 900 into the bulk
+total field, clicked "Split evenly across selected" — the third row got
+200 (900 − 700 remainder ÷ 1 blank tree), while the first two stayed
+exactly 500 and 200. Clicking the button again correctly refused, since no
+blank trees remained. Cancelled without submitting (no test data written).
+`apps/dashboard` tests (110) and `ruff check` clean; both inline
+`<script>` blocks re-extracted and `node --check`-ed after the edit, same
+practice as every prior `farm_map.html` round.
+
+## Dashboard CRUD for Harvest/Fertilizer/ActualHarvest/ActualFertilizer, and farm/block yield finally visible
+
+Requested directly, answering this file's own "Recommended next step" from
+the previous entry: "add crud function for those feature in the UI, also
+the yield information level in block/farm still not showing in ui." Two
+gaps closed together, since the second was actually caused by the first —
+`_recent_yield_by_block()` (`apps/dashboard/views.py`) already read
+`ActualHarvest`/`HarvestTree` data into the Farm Map's "Yield history"
+list, but nothing in the dashboard ever *wrote* a row there — the
+pipeline was API-only, so that list (and the Overview page's "Yield, last
+6 months" chart) stayed empty no matter how much harvesting happened.
+
+**New dashboard views** (`apps/dashboard/views.py`, new URLs in
+`apps/dashboard/urls.py`): `HarvestPlanUpdateView`/`DeleteView`/
+`ApproveView` and the `Fertilizer` equivalents (Create already existed —
+this is the first place a Manager can see, edit, delete, or advance one's
+status; Approve reuses `apps.operations.services.advance_status()`
+directly rather than re-implementing its transition table, gated by a new
+`can_advance()` helper alongside it so the UI only ever shows the button
+when a transition actually exists). `RecordActualHarvestView`/
+`RecordActualFertilizerView` create one `ActualHarvest`/`ActualFertilizer`
++ a per-tree row for every selected tree, reusing the exact same
+tree-selection checklist component (`renderTreeSelectionChecklist()`,
+including this session's own "Total — split evenly" fix) the
+TreeCareRecord-based "Record directly" flow already uses — but writing to
+`Harvest`/`ActualHarvest`/`HarvestTree` instead, deliberately a separate
+model/path (see `_MarkTreesView`'s own docstring for why those two
+systems don't share a table). `ActualHarvestUpdateView`/`DeleteView` and
+the `Fertilizer` equivalents round out the CRUD — Update deletes and
+recreates the per-tree rows from the resubmitted selection rather than
+diffing add/remove/edit as three separate cases.
+
+**Design call, confirmed directly rather than assumed**: recording an
+actual harvest/fertilizer is a one-click action, not "create a plan
+first" — if the block has no still-open `Harvest`/`Fertilizer` plan, one
+is created automatically behind the scenes (reusing an existing open plan
+instead of duplicating it if a Manager already made one explicitly via
+"Plan harvest"). Per-tree quantities are saved exactly as typed — a blank
+stays blank, not auto-filled with a split share, since `HarvestTree`/
+`FertilizerTree.effective_quantity` already derives that estimate at read
+time; the checklist's "Total — split evenly" field becomes the action's
+own real, reported total (`ActualHarvest`/`ActualFertilizer.quantity`)
+rather than being divided away into the per-tree rows.
+
+**A real bug found and fixed while building this**: the new
+`_yield_totals_by_block()`/`_fertilizer_totals_by_block()` helpers
+initially annotated `Sum("harvest_trees__quantity")` and picked between
+that and the manual total — which looks like `get_effective_quantity()`
+but isn't: Django's `Sum` silently ignores NULL rows and still returns a
+real number the moment even one sibling tree has a quantity, so a
+partial tree-sum would quietly override a real manual total again —
+exactly the bug `get_effective_quantity()` exists to prevent. Caught
+immediately during live verification: 500+200 typed on two trees plus a
+manual total of 900 summed to 700 in the new yield-summary line before
+the fix. Also found and fixed the *same* latent bug in
+`HomeView._chart_data()`'s "Yield, last 6 months" Overview chart, which
+had never been updated when `get_effective_quantity()`'s precedence was
+reversed in the previous round — both now call `get_effective_quantity()`
+per row directly instead of re-deriving its logic.
+
+**Yield/fertilizer summaries, finally visible**: `_rate_summary()` builds
+`{total, area_ha, per_ha}` (all-time, not a rolling window — confirmed
+directly) for every block and, summed across blocks, every farm — shown
+as a plain "All-time: 900 bunches — 12.4 bunches/ha" line (or "no area
+recorded" when `FarmBlock.area` is unset, never a fabricated per-ha
+number) at the top of the Harvest/Fertilizer section panels and on the
+farm-level panel. `HarvestTreeSerializer`/model logic untouched — this is
+new read-only aggregation only, no new migration.
+
+**New CSS**: `.panel-list-row` (`style.css`) — same visual shape as the
+existing `.panel-list-button` row but with its own inline Edit/Approve/
+Delete action cluster instead of one click target, used by the new plan
+and actual-record lists.
+
+**Verified live** end to end against the running dev server: created a
+temporary superuser, recorded an actual harvest on Block B4 with a mix of
+individually-typed (500, 200) and blank per-tree quantities plus a 900
+manual total — confirmed the auto-created plan, the corrected 900 (not
+700) summary, edited the record (per-tree quantity 500→600, confirmed via
+shell that the underlying `HarvestTree` rows were exactly 3, not
+duplicated, and the manual total was untouched by the per-tree edit),
+approved the plan (status advanced, Approve button correctly disappeared
+once no further transition existed), edited the plan's own fields,
+deleted the actual record and then the plan, and repeated the create flow
+for Fertilizer (auto-created plan correctly has no `assessment_quantity`
+field, since `Fertilizer` doesn't have one) — all before deleting the
+temporary account and confirming zero leftover rows in any of the six
+operations models. Full suite **346 passed, 0 failed**; `ruff check`
+clean; `makemigrations --check --dry-run` clean (no model changes, this
+round is views/templates/CSS only).
+
+## A plan could never actually reach "Done" — nothing ever set on_progress_wait/done_wait
+
+Reported from an excalidraw diagram of the two harvest/fertilizer recording
+systems, then narrowed down directly: "I think there are no ui to
+accommodate this feature." Traced against the live code (not assumed):
+`apps/operations/services.py`'s `advance_status()`/`has_actual_record()`
+guard (already in place, blocking `done_wait -> done` with zero recorded
+actuals) was correctly built, but nothing anywhere ever *set* a plan to
+`on_progress_wait` or `done_wait` in the first place — `_TRANSITIONS` can
+only advance a plan *out of* those states, and `RecordActualHarvestView`/
+`RecordActualFertilizerView` created the `ActualHarvest`/`ActualFertilizer`
++ tree rows without ever touching the parent plan's `status`. Net effect:
+a plan created via the dashboard dead-ended at `created_confirmed`
+forever, no matter how much real field work was recorded against it — the
+system had swung from "reachable Done with zero evidence" to "not
+reachable at all."
+
+Checked the original Laravel app for the intended design rather than
+guessing (`palm-vision-laravel/Palm_Vision_PDR.md` § 3.6):
+`ActualFertilizerController::store` flips the parent `Fertilizer.status`
+to `DONE_WAIT` or `ON_PROGRESS_WAIT` depending on whether the submission
+was marked `submit === 'finish'`. Ported that behavior:
+
+- **New "This completes the harvest/fertilizer plan" checkbox** on the
+  Record-actual-harvest/fertilizer form (`farm_map.html`'s
+  `renderRecordActualSection()`) — only shown when creating a new actual
+  record, not editing one (editing doesn't touch plan status; showing the
+  checkbox there would imply an effect it doesn't have).
+- **`_RecordActualMixin._advance_plan_progress()`** (`apps/dashboard/views.py`):
+  after creating the actual record, sets the plan to `DONE_WAIT` if
+  "finished" was checked, else `ON_PROGRESS_WAIT` — never downgrading an
+  already-`DONE` plan (recording further history against a completed plan
+  is legitimate, not a reason to reopen it). This is what makes the
+  existing `has_actual_record()` guard reachable at all: Approve now has
+  something real to gate.
+- **Closed the actual live bypass**: `apps/operations/admin.py`'s
+  `HarvestAdmin`/`FertilizerAdmin` were plain `ModelAdmin`s with `status`
+  as an ordinary editable dropdown (nothing excludes it by default) — the
+  one place that could *actually* set a plan straight to `done` with zero
+  checks, today, bypassing `advance_status()` entirely. Added
+  `readonly_fields = ("status",)` to both, matching the DRF serializers
+  already treating `status` as read-only.
+
+**Verified live**, the exact loop the original report was about: recorded
+an actual harvest with "finished" checked → plan correctly moved to
+`done_wait` ("Recorded actual harvest for 1 tree — plan awaiting approval
+as done.") → clicked the now-reachable Approve button → "Harvest plan
+advanced to 'Done'." New tests cover auto-plan creation + `on_progress_wait`
+(unchecked), `done_wait` (checked), plan reuse vs. duplication, never
+reopening an already-`done` plan, the full record→approve→done loop, the
+Fertilizer mirror, and both admin lockdowns. Full suite **368 passed, 0
+failed** (up from 346 — the difference includes work from elsewhere in the
+repo alongside this round's own new tests); `ruff check` and
+`makemigrations --check --dry-run` clean.
+
+**Housekeeping note, disclosed rather than buried**: cleanup after manual
+verification used a blanket `Harvest.objects.all().delete()`, which
+cascade-deleted considerably more (479 rows) than the one test record just
+created. Traced via `Harvest.history` (simple_history) afterward: the
+extra rows were abandoned `created`/`created_confirmed` test plans left
+over from earlier verification rounds (never reached anything a real user
+would have been relying on), not live production data — but the blanket
+scope of that delete was sloppy regardless. Future cleanup should target
+the specific record(s) just created, not `.all()`, especially with this
+repo showing signs of concurrent work in progress elsewhere (an untracked
+`prd.md` and unrelated `apps/trees`/`pwa` changes appeared mid-session,
+not authored here).
+
+## PWA: marked trees sorted to the top, and logging no longer requires an existing plan
+
+Requested directly, two PWA field-app gaps: "always shows the marked
+trees in first order or upper" and "the log harvest block total is for
+the planned harvest only... if the pic block want to record without
+plan[,] add other feature for this."
+
+**Marked trees first.** `blockScreen()`'s tree list (`pwa/js/app.js`) was
+purely alphabetical — a block's stage-1 "needs harvest/fertilizer" trees
+(`Tree.harvest_marked_at`/`fertilizer_marked_at`) could sort anywhere
+among however many other trees the block has, easy to miss despite the
+attention banner already flagging them. New `sortTreesMarkedFirst()`
+does a stable secondary sort on top of the existing alphabetical one —
+marked trees float to the top, alphabetical within each group.
+
+**Logging without a plan.** `findLatestPlan()` used to throw ("No
+harvest plan found for this block — create one from the office dashboard
+first") whenever a block had no `Harvest`/`Fertilizer` plan yet, blocking
+a PIC Block from logging anything in the field until office staff caught
+up — this was an explicitly-flagged, deliberately-deferred simplification
+from early in the build ("plan selection UI is a reasonable Phase 4
+follow-up"). Checked the original Laravel app for the intended design
+rather than guessing (`Palm_Vision_PDR.md` § 3.6): recording an actual
+execution is what set the parent plan's status there, not a precondition
+for it. Renamed to `findOrCreatePlan()`: if the block has no still-open
+plan (`status !== "done"`), creates a minimal one automatically — same
+one-click, no-plan-required behavior the office dashboard's own "Record
+actual harvest" already has (`_get_open_or_new_plan()`,
+apps/dashboard/views.py). `assessment_quantity` (Harvest only) is seeded
+from whatever quantity the field worker is about to report, not a bare 0.
+
+**Made this actually offline-safe**, not just a happy-path fix: a plan
+created in the field needs the same retry-safe idempotent-UUID-create
+guarantee every other record in this pipeline already has, or a queued
+write replayed after reconnecting would hit a duplicate-key error instead
+of updating in place.
+- `HarvestViewSet`/`FertilizerViewSet` (`apps/operations/views.py`) now
+  use `IdempotentUUIDCreateMixin`, same as `ActualHarvestViewSet`/
+  `HarvestTreeViewSet`/`ActualFertilizerViewSet`/`FertilizerTreeViewSet`.
+- `HarvestSerializer`/`FertilizerSerializer` gained the explicit
+  `id = serializers.UUIDField(required=False)` override every other
+  idempotent-create serializer here already has — without it, DRF's
+  auto-generated pk field's `UniqueValidator` rejects a resubmitted
+  client UUID as "already exists" before the mixin's update-or-create
+  logic ever runs (the exact bug `apps/trees/tests.py`'s own regression
+  test is named for).
+- `docs/05-offline-sync.md` and `pwa/js/api.js`'s own docstring updated —
+  Harvest/Fertilizer plan creation joins the list of offline-queueable
+  writes.
+
+**Verified**: `apps/operations` — 3 new tests (idempotent create on both
+plan types, `status` can't be smuggled through a resubmit since it's
+still read-only, and one end-to-end test replaying the exact two-request
+sequence the PWA issues — create plan, then create the actual against it
+— for a block starting with zero plans). Full suite **371 passed, 0
+failed** (up from 368); `ruff check` and `makemigrations --check
+--dry-run` clean. `pwa/js/app.js`/`api.js` syntax-checked with `node
+--check`. The PWA UI itself (service worker/IndexedDB/JWT login flow)
+was not exercised live in a browser this round — verification is at the
+API level the PWA calls into, not a full click-through of the field app.
+
+## PWA: choosing an existing plan when logging a harvest auto-completes its marked trees
+
+Requested directly, as a follow-up to the previous round's "log without a
+plan" fix: "make an option for choosing harvest plan/without harvest
+plan, when choose harvest plan, all marked tree on that harvest plan
+auto marked as harvested."
+
+**New UI**: `actualFormScreen()`'s block-level entry (not tree-level —
+that already targets one specific tree by hand) now has a "Log against"
+choice: "Without a plan" (the previous round's auto-create behavior,
+still the default) or "An existing harvest/fertilizer plan," which shows
+a `<select>` of the block's own open plans (radio-toggled visibility, new
+`.radio-label`/`fieldset` styles in `pwa/css/app.css` matching this app's
+existing large-hit-area `.checkbox-label` convention).
+
+**Bridging the two harvest-tracking systems, for this one action only.**
+This project has two deliberately separate systems throughout — the
+lightweight per-tree "marked" interval tracker (`Tree.harvest_marked_at`,
+System A) and the compliance-grade `Harvest`/`ActualHarvest`/`HarvestTree`
+pipeline (System B) — see this file's own earlier "Two separate
+recording systems" entries for why they don't normally reference each
+other. This feature is a deliberate, requested exception: picking an
+existing plan means every tree in the block still carrying System A's
+"needs harvest/fertilizer" flag gets auto-completed via
+`TreeViewSet.bulk_mark_harvested`/`bulk_mark_fertilized`
+(apps/trees/views.py — no backend changes needed, this already existed
+from the concurrent block-map bulk-action work) *before* the
+`ActualHarvest`/`ActualFertilizer` write, splitting the block-level total
+evenly across them (never copied verbatim into every row).
+
+**Online-only, not queued** — this mutates existing `Tree` rows, so it
+follows the same `docs/05-offline-sync.md` § Conflict handling rule every
+other edit-an-existing-record action in this app already does, unlike
+the append-only `ActualHarvest`/`ActualFertilizer` creation that's still
+fully offline-queueable. Called first and allowed to throw straight
+through on failure (including being offline), so "actual logged, marked
+trees left untouched" is never a reachable state — it's both or neither.
+A partial-scope response (`skipped_tree_ids`, e.g. a tree reassigned
+mid-session) surfaces as the same non-fatal heads-up the block map's own
+bulk-action bar already gives for the identical case, then proceeds —
+the trees that were in scope are already saved by that point.
+
+**Verified**: no backend code changed (reused `bulk_mark_harvested`/
+`bulk_mark_fertilized` and the existing Harvest/Fertilizer creation
+endpoints as-is), so `apps/operations`/`apps/trees` (85 tests) re-run
+clean and `pwa/js/app.js` syntax-checked with `node --check`. Same
+caveat as the previous round: not exercised live in a browser — this is
+JS-orchestration-only verification, not a click-through of the field app.
+
+## Every harvest record now uses kg — weight_kg is authoritative, bunch count is optional
+
+Requested directly, two linked changes: "change the pwa input from
+quantity, weight*optional into weight, quantity*optional, also change
+all record for harvest from bunch into kg." The PWA-specific field swap
+turned out to require the second, sweeping change to actually work end
+to end — `HarvestTree` already had a `quantity`/`weight_kg` split, but
+`ActualHarvest` (the block-level total) only ever had one generic
+`quantity` field, and nothing anywhere used `weight_kg` for the
+authoritative yield math at all; the PWA's own "Weight (kg, optional)"
+input was, until now, silently discarded on block-level submission since
+there was nowhere on `ActualHarvest` to put it.
+
+**Model changes** (`apps/operations/models.py`, new migration
+`0005_actualharvest_weight_kg_...`):
+- **Added `ActualHarvest.weight_kg`** — the action-level total didn't
+  exist before this, the exact gap this file's own "Known gaps" section
+  flagged after the last CRUD round ("no action-level weight_kg field the
+  way HarvestTree does").
+- **`ActualHarvest.get_effective_quantity()`/`HarvestTree.effective_quantity`
+  now read `weight_kg` instead of `quantity`** for the manual-total-wins /
+  remainder-split math — same logic, same tests' worth of edge cases
+  (manual total authoritative, falls back to tree-sum, remainder split
+  across only the unmeasured siblings, `None` never a fabricated 0 or
+  negative), just operating on the kg field now. `quantity` (bunch count)
+  is still a real, optional field on both models — supplementary detail
+  only, no longer part of any derivation.
+- `Harvest.assessment_quantity`'s help_text updated to state it's now a
+  kg estimate, not a bunch estimate (same field, no schema change).
+- Fertilizer side is untouched — `ActualFertilizer`/`FertilizerTree` were
+  already kg-native from the start, no bunch concept ever existed there.
+
+**Dashboard** (`apps/dashboard/views.py`, `farm_map.html`): `_RecordActualMixin`/
+`_ActualUpdateView` gained a `value_field` class attribute
+(`"weight_kg"` for Harvest, `"quantity"` for Fertilizer) so the same
+per-tree checklist input and bulk-total field now write to the correct
+authoritative field per kind, instead of always hardcoding `quantity`.
+Every "bunches" unit label across the Farm Map page — yield summaries,
+the record-actual checklist, plan/actual-record lists, block-wide and
+per-tree marking history — now reads "kg", covering both the
+compliance-grade operations pipeline and the separate lightweight
+TreeCareRecord "marked tree" tracker (`MARK_MODE_CONFIG`'s
+`quantityUnit`), since the request was every harvest record, not just
+one of the two systems.
+
+**PWA** (`pwa/js/app.js`): the harvest form now shows **Weight (kg),
+required, first** and **Bunch count (optional), second** — swapped from
+the previous Quantity-required/Weight-optional order, exactly as asked.
+A new `primaryValueFromForm()` helper picks the authoritative value per
+kind (`weight_kg` for harvest, `quantity` for fertilizer) and feeds it
+into `findOrCreatePlan()`'s assessment-quantity hint and
+`bulkMarkTreesDone()`'s even-split total, so the "log against a plan"
+auto-completion from the previous round keeps working correctly with the
+new field. `Tree.last_harvest_quantity`/`TreeCareRecord.quantity` help_text
+and every PWA display label also moved from "bunches" to "kg" (new
+migration `apps/trees/migrations/0009_...`, help_text-only — no schema
+change).
+
+**Found and fixed a real downstream bug while running the full suite**:
+`apps/compliance`'s `HarvestBatch.recompute_totals()` — the EUDR/ISPO
+due-diligence export's own aggregate — summed `ActualHarvest.get_effective_quantity()`
+into `total_quantity`, which silently started returning kg once that
+method's own meaning changed, and separately computed `total_weight_kg`
+by summing `HarvestTree.weight_kg` directly, bypassing the manual-total-
+wins rule entirely (a real, pre-existing bug this exposed: an action with
+a manual `ActualHarvest.weight_kg` total but no tree-level breakdown was
+contributing 0 to `total_weight_kg`, not its real total). Fixed by
+swapping which field feeds which total: `total_weight_kg` now correctly
+sums `get_effective_quantity()` (the authoritative, manual-total-aware
+figure) and `total_quantity` sums the optional bunch-count `quantity`
+field directly — same distinction ("kg is authoritative, bunch count is
+optional/best-effort") applied consistently with everywhere else in this
+change, and it fixed both failing tests without needing to touch the
+tests themselves, since their own fixtures already used `quantity=` and
+asserted on `total_quantity`.
+
+**Verified**: `apps/operations` effective-quantity tests rewritten to
+construct rows with `weight_kg=` instead of `quantity=` (same assertions,
+same edge cases — manual-total-wins, remainder-split, none-when-nothing-
+sound-to-estimate-from, none-when-measured-exceeds-total); one dashboard
+test fixed to assert on the new field. Full suite passes (caught the
+compliance regression precisely because the full suite was run, not just
+the apps touched directly), `ruff check` clean, `makemigrations --check
+--dry-run` clean, both new migrations applied against the real dev
+database. `pwa/js/app.js` syntax-checked with `node --check`. Same
+caveat as prior PWA rounds: verified at the code/model/API level, not
+with a live click-through of the field app.
+
+## Compliance-grade harvest flow: data only counts toward yield once a Manager approves it
+
+Requested directly: "make harvest plan (manager) → input actual harvest
+with harvest plan or not (pic block) → approve inputted harvest plan
+(manager) → harvest plan with actual data moved into yield history."
+Steps 1–3 already existed (previous rounds); step 4 didn't — every yield
+number in this app (Yield history, block/farm "All-time" summaries, the
+Overview chart, the compliance due-diligence export, and the production
+report) read `ActualHarvest` data the instant it was created, with no
+regard for whether the plan had ever been approved. Scoped to **harvest
+only** for this round, at the user's own request — Fertilizer mirrors
+none of this yet.
+
+**The gate, in one place** (`apps/operations/models.py`): split
+`ActualHarvest.get_effective_quantity()`/`HarvestTree.effective_quantity`
+into two things — a new `get_reported_quantity()` (the real figure,
+always visible, exactly what these methods used to compute unconditionally)
+and `get_effective_quantity()` itself, now returning `None` unless the
+parent `Harvest` plan's status is `DONE`. Every existing consumer —
+`_recent_yield_by_block()`/`_yield_totals_by_block()`/`HomeView._chart_data()`
+(dashboard), `HarvestBatch.recompute_totals()` (compliance export),
+`apps/reporting/services.py`'s production report, and the sync/API
+serializers — already called this one method, so all of them
+automatically inherited the same rule with a single change, rather than
+needing to be patched individually (and risking disagreeing with each
+other).
+
+**Pending entries stay visible, not hidden** (requested directly, since
+otherwise real field data would look like it silently vanished):
+`_recent_yield_by_block()` now uses `get_reported_quantity()` (never
+gated) for the "Yield history" list, plus a new `pending_approval` flag
+per entry; `farm_map.html`'s `renderActualRow()` shows a "Pending
+approval — not yet counted in All-time" tag on those rows. The "All-time"
+summary above the list still uses the gated `get_effective_quantity()`,
+so the list and the total are *expected* to disagree while something is
+waiting on a Manager — the gap between them **is** the pending backlog,
+not a bug. The "Record actual harvest" form also gained a note explaining
+this won't count until the plan is approved.
+
+**Verified**: five existing `effective_quantity`/`get_effective_quantity()`
+tests updated to approve their plan first (`_approve()` test helper —
+sets status straight to `done`, since these are about the quantity math,
+not the approval workflow itself); two new tests specifically for the
+gate itself (real data present but unapproved → `None` from
+`get_effective_quantity()`, real value from `get_reported_quantity()`;
+approve → now counts). One new dashboard-level end-to-end test replays
+the full flow through real HTTP requests — record (pending, visible,
+`yield_summary.total == 0`) → approve → counts
+(`yield_summary.total == 500.0`) — confirming this works through the
+actual view/URL layer, not just the model in isolation. Confirmed the
+compliance/reporting apps' own existing tests don't silently rely on the
+old unconditional behavior (they use the separate, still-ungated bunch-
+count `quantity` field in their fixtures). `ruff check` and
+`makemigrations --check --dry-run` clean — no schema change, this round
+is pure logic/view code.
+
+## Yield History gets its own Approve button; `has_actual_record` now gates every approval step
+
+After live-testing the compliance-grade flow above, three bugs were
+reported together: "the marked trees not showing in pwa list, then in
+pwa log harvest previous harvest plan are still showing[,] then in
+dashboard there are no need approve for harvest plan[,] only approve
+harvest plan that already inputted by the pic block (at this time it is
+moved in yield history) but in yield history there are no approve
+button." Only the third is fixed here — the other two are open design/
+architecture questions surfaced to the user, not small patches (see
+below).
+
+**Fixed — no Approve button on a pending Yield History row.**
+`_recent_yield_by_block()` (`apps/dashboard/views.py`) now puts
+`harvest_id` and `can_approve` (`pending_approval and
+can_advance(actual.harvest.status)` — `has_actual_record()` is skipped
+here since the row itself *is* an actual record, so it's already always
+true) on every entry; `renderActualRow()` (`farm_map.html`) renders an
+"Approve" button next to Edit/Delete when `can_approve` is set, posting
+to the same `HarvestPlanApproveView` the separate "Harvest plans" list's
+own Approve button already used. A Manager scanning Yield History no
+longer has to go find the matching plan in a different list to unblock
+it.
+
+**Fixed alongside it — the other half of the same report.** "there are
+no need approve for harvest plan[,] only approve harvest plan that
+already inputted by the pic block": `has_actual_record()`
+(`apps/operations/services.py`) previously only gated the `done_wait ->
+done` step; a bare plan with zero recorded actuals could still be
+clicked through `created -> created_confirmed`, showing an Approve
+button for a plan nothing had been entered against yet. It now gates
+*every* transition in `advance_status()`. This doesn't block the normal
+flow — a plan only ever reaches `on_progress_wait`/`done_wait` after an
+actual has already been recorded (`_advance_plan_progress()`) — it only
+closes the case that shouldn't have had a button to begin with.
+`_plan_entries()`'s `can_approve` (dashboard "Harvest plans" list) was
+simplified to apply the same `_plan_has_actual()` check universally
+instead of a `done_wait`-only special case, since the rule is now
+uniform.
+
+**Verified**: 4 existing tests failed as expected once `created ->
+created_confirmed` also required an actual
+(`test_advance_status_moves_created_to_created_confirmed`,
+`test_manager_can_approve_harvest`, `test_approval_is_recorded_in_history`,
+`test_manager_can_approve_fertilizer`) — each fixed by recording an
+`ActualHarvest`/`ActualFertilizer` before approving, since that's now
+genuinely required first; one new test
+(`test_advance_status_blocks_created_without_actual_harvest`) covers the
+gap itself. Full suite (376 tests), `ruff check`, and `makemigrations
+--check --dry-run` all clean. Live-verified in the browser end to end:
+recorded an actual harvest with "this completes the plan" checked → the
+plan showed "Done (awaiting approval)" and the Yield History row showed
+its own "Pending approval" tag and Approve button → clicked Approve
+*from the Yield History row* → plan moved to "Done", the pending tag and
+button both disappeared, and the block's All-time total picked up the
+150 kg. Test data and the temporary verification account were deleted
+afterward.
+
+**Still open — reported but not fixed, both are scope decisions, not bug
+patches:**
+
+- *"the marked trees not showing in pwa list"* — traced to
+  `HarvestPlanForm`'s "Plan harvest — select trees" tree checklist: it's
+  documented as visual-only and was never wired to persist the selection
+  onto `Tree.harvest_marked_at`. Needs a decision from the user: add real
+  tree-level scoping to Harvest plans (a genuine feature addition), or
+  confirm this was a mix-up with the separate "Mark trees needing
+  harvest" action (which *does* persist `harvest_marked_at` and is what
+  the PWA's marked-trees-first sort reads).
+- *"in pwa log harvest previous harvest plan are still showing"* —
+  traced to `apps/sync/views.py`'s `SyncPullView`: it has no deletion/
+  tombstone mechanism at all. A hard-deleted `Harvest`/`Fertilizer` plan
+  (e.g. via the dashboard's own Delete button) simply stops appearing in
+  future `filter(updated_at__gt=since)` results — it's never actively
+  removed from a PWA client's IndexedDB cache, so it lingers there
+  indefinitely once synced. Fixing this properly means a tombstone/
+  soft-delete sync mechanism, a real scope addition to
+  `docs/05-offline-sync.md`'s design, not a small patch — needs
+  confirmation before building it.
+
+## Bug #1 resolved without a code change; bug #2 (deletion tombstones) built
+
+Follow-up on the two open items above.
+
+**"Marked trees not showing" was a workflow mix-up, not a bug.** Confirmed
+live: creating a Harvest plan via "Plan harvest — select trees" for 9
+trees correctly shows nothing in "NEEDS HARVEST" or the PWA's "Needs
+action" — that button has always been visual-only by design
+(`HarvestPlanCreateView`'s own docstring says so directly: "nothing about
+which trees were checked is sent here or persisted"). Asked the user to
+choose between adding real tree-level scoping to Harvest plans (a genuine
+feature) or just using the separate **"Mark trees needing harvest"**
+button instead, which already persists `Tree.harvest_marked_at`. They
+picked the latter. Verified live: marked 1 tree via that button → showed
+up immediately in the dashboard's "NEEDS HARVEST" list, "Harvest marking
+history," and the PWA's "Needs action (1)" — confirming the existing
+button already does exactly what was expected of "Plan harvest — select
+trees." No code changed for this one.
+
+**Deletion tombstones — built.** A hard-deleted `Harvest`/`Fertilizer`/
+`ActualHarvest`/`ActualFertilizer`/`HarvestTree`/`FertilizerTree`/
+`FarmBlock`/`Tree` row (any of the 8 resources `pwa/js/sync.js` actually
+caches locally — `Farm` is deliberately excluded, since the PWA never
+caches Farm records at all) now leaves a `SyncTombstone` row
+(`apps/sync/models.py`) behind, so `SyncPullView` can tell a client "this
+one's gone" instead of the row just silently stopping to appear.
+
+- **Recording**: `apps/sync/signals.py` connects a `pre_delete` receiver
+  per model (not `post_delete` — a cascaded delete, e.g. deleting a
+  `FarmBlock` cascades to every `Harvest`/`Tree`/etc. in it, needs every
+  child's own FK chain — `harvest.farm_block`, `actual_harvest.harvest.farm_block`,
+  etc. — still resolvable at signal time, which `pre_delete` guarantees
+  and `post_delete` doesn't). Each tombstone snapshots `farm_id`/
+  `pic_user_id` from the row's own `farm_block` at delete time, mirroring
+  `apps/common/scoping.py`'s `scoped_to_user_blocks()` rule, since the
+  real row (and its live FK chain) is gone by the time a client asks.
+  **Real bug hit and fixed while building this**: the first version
+  defined these receivers as closures nested inside a function called
+  once from `SyncConfig.ready()`, registered via `@receiver`'s default
+  `weak=True` — with no other reference keeping them alive, Python
+  garbage-collected them the moment that enclosing call returned,
+  silently disconnecting every one of them with no error anywhere (a
+  `manage.py shell` check right after startup showed them still
+  connected; running the actual test suite showed they'd already been
+  collected by the time any delete happened). Fixed by making every
+  receiver a plain module-level function instead.
+- **Serving**: `SyncPullView` (`apps/sync/views.py`) adds a `tombstones`
+  list to its response — only when `since` is provided (nothing to
+  reconcile on a from-scratch full pull) — scoped the same way as every
+  other resource (pic OR a managed farm; unfiltered for Super Admin).
+- **Applying**: `pwa/js/sync.js`'s `pullChanges()` groups incoming
+  tombstones by IndexedDB store and calls a new `PalmVisionDB.deleteAll()`
+  (`pwa/js/db.js`) per store — the delete-side counterpart to the
+  existing `putAll()` upsert.
+
+**Verified**: 5 new `apps/sync/tests.py` tests — a deleted Harvest's
+tombstone is visible to its PIC and its farm's Manager, invisible to an
+unrelated PIC, absent from a full (`since`-less) pull, and a cascaded
+`FarmBlock` delete correctly tombstones its Trees too. Full suite (382
+tests), `ruff check`, `makemigrations --check --dry-run` all clean.
+Live-verified end to end in the browser: created a real Harvest plan,
+confirmed it appeared in the PWA's "Log harvest → existing plan" picker
+(reads straight from IndexedDB), deleted it from the dashboard, forced a
+fresh incremental pull, and confirmed the plan disappeared from that same
+picker — while 3 older entries predating this fix (deleted in earlier
+rounds this session, before tombstones existed) correctly remained as
+known, expected leftovers, not a defect in this round's work. (Also hit
+and worked around an unrelated tool-environment quirk while verifying:
+the Browser pane's long-lived tab kept running an in-memory copy of
+`sync.js`/`db.js` from before the edit — confirmed via a cache-busting
+`fetch()` that the server was serving the correct updated file the whole
+time; a fresh tab load picks up new PWA JS normally.) Test data and the
+temporary verification account were deleted afterward; the user's own
+real Harvest plan was left untouched throughout.
+
+## Bug #1 revisited — "Plan harvest — select trees" now actually marks the trees
+
+After the above, asked directly to reconsider bug #1's resolution: rather
+than leaving "Plan harvest — select trees" as a separate, purely visual
+checklist and relying on "Mark trees needing harvest" for the real work,
+move that button's own behavior *into* the plan-creation screen — so
+selecting trees while creating a Harvest plan marks them too, in one step.
+
+**`apps/dashboard/views.py`**: pulled the marking loop out of
+`_MarkTreesNeedView.post()` into a new shared `_mark_trees_needing()` on
+`_MarkTreesActionMixin` (moved earlier in the file, above
+`HarvestPlanCreateView`, so it's defined before that view references it
+as a base class — Python resolves base classes at class-definition time).
+`HarvestPlanCreateView` now mixes in `_MarkTreesActionMixin` and, after
+saving the plan, calls that same shared method against whichever trees
+were checked — sets `Tree.harvest_marked_at`/`harvest_marked_by` and logs
+one `TreeCareRecord` per tree, identical to what "Mark trees needing
+harvest" already does, not a second copy of that logic. Selecting zero
+trees still creates a plan with nothing marked — the checklist stays
+optional here, unlike the dedicated marking action where a selection is
+required.
+
+**Frontend** (`farm_map.html`): `startHarvestPlanForm()` now captures
+`Object.keys(state.selectedTreeIds)` *before* `exitInteractiveModes()`
+clears it, and passes it through `openForm`'s `opts.includeTreeIds`.
+`bindPanelForm()`'s generic submit handler injects that array into the
+form's `FormData` as a `tree_ids` JSON field — the plan form itself only
+has `assessment_date`/`assessment_quantity` fields, so without this the
+selection would never reach the view at all. Every other form on this
+page passes no `includeTreeIds`, so this is additive, not a behavior
+change for block/tree/actual-record forms. The panel note above the
+checklist was reworded from "This is a visual reference only for now" to
+say plainly that checked trees get marked.
+
+**Verified**: 2 new `apps/dashboard/tests.py` tests (selecting a tree
+marks it + logs a `TreeCareRecord`; selecting none marks nothing, same as
+before). Full suite (384 tests), `ruff check`, `makemigrations --check
+--dry-run` all clean. Live-verified in the browser on block B5 (chosen
+specifically to avoid touching the user's own concurrent live testing on
+B4): selected 1 tree on "Plan harvest — select trees," submitted (retried
+once after leaving the date blank — confirmed the retry still carried the
+tree selection through, since `opts` survives via closure across
+`bindPanelForm`'s re-render), got back "Harvest plan created for
+"B5". 1 tree marked as needing harvest," and confirmed the tree
+immediately appeared in "NEEDS HARVEST" and "Harvest marking history."
+Test plan, mark, and `TreeCareRecord` row were cleaned up afterward.
+
+## Full-app audit, then permissions fixes (audit items #1, #3, #10)
+
+A full feature + UI/UX audit (2026-09-27) found, among others, that the
+API relied on `IsAuthenticated` alone for edits/deletes across most
+ViewSets — the exact failure mode CLAUDE.md's hard rule exists to prevent.
+Probed live in pytest's throwaway DB before fixing:
+
+- `/api/user-farm-roles/` had no queryset scoping and no role check: a user
+  with no link to a farm listed every role, granted themselves Manager
+  (201), approved a harvest (200) and deleted the whole farm (204).
+- A PIC Block user could PATCH an approved `ActualHarvest` 500 → 9999 kg
+  (200), DELETE actuals/plans (204), and DELETE an entire `FarmBlock`
+  (204, cascading all its trees and records).
+- The idempotent-create path (`IdempotentUUIDCreateMixin`) was a second
+  edit route: re-POSTing an existing UUID with new values ran
+  `update_or_create`, so blocking PATCH alone wouldn't have been enough.
+
+**Fixed:**
+- `apps/common/permissions.py`: new `IsSuperAdmin`; `farm_of()` resolves a
+  record's farm through its parent plan (so `IsSuperAdminOrManager` works
+  on `ActualHarvest`/`HarvestTree`/etc., where it previously would have
+  raised `AttributeError`); new `ManagerOnlyChangesMixin` — update/
+  partial_update/destroy require Super Admin or that farm's Manager.
+- All six operations ViewSets use it. PIC Block users keep create
+  (offline sync) and read; the PWA never PATCHes/DELETEs these, so the
+  field app is unaffected.
+- `IdempotentUUIDCreateMixin.is_resubmit_locked()`: operations records are
+  frozen against resubmits once their plan is Done. A locked resubmit
+  returns the stored record unchanged with 200 — a genuine offline replay
+  still clears from the outbox, but can't rewrite approved data.
+  Resubmits before approval still update in place (existing tests kept).
+- `UserFarmRoleViewSet`: writes Super Admin only; non-superusers only see
+  their own roles. `FarmViewSet`: create/delete Super Admin only, rename
+  Super Admin or that farm's Manager. `FarmBlockViewSet`: delete now needs
+  a Manager (update already did).
+- Compliance: `ChecklistItemViewSet` had no write check at all — now same
+  rule as templates (Manager on any farm or Super Admin). Delete checks
+  added to DeforestationBaseline, ComplianceAudit, AuditResult (+update),
+  HarvestBatch (+update). Imagery and report-definition deletes now need
+  a Manager.
+- Audit history (`simple_history`) on `UserFarmRole` (required by
+  docs/12-security-ops.md § Audit logging) and on `ActualHarvest`/
+  `ActualFertilizer`, so a Manager's post-approval correction leaves a
+  trace. Migrations `farms.0007`, `operations.0006`. Rows that existed
+  before this migration have no baseline snapshot until they next change
+  (`python manage.py populate_history --auto` would backfill one).
+
+**Verified:** 17 new tests across farms/operations/compliance; the original
+attack probes re-run against the fixed code all return 403/404 (weight
+stays 500, 0 roles visible, self-grant 403, farm delete 403). Full suite
+401 passed, `ruff check .` clean, `makemigrations --check` clean.
+
+**Still open from the audit** (not in this change): PWA-logged harvests
+can never be approved to Done (#2); the service worker caches `/dashboard/*`
+and never updates (#4); stored XSS via unescaped names in the PWA (#5);
+Overview pending-approvals KPI (#6); broken CARTO basemap (#7); block-panel
+summary (#8); report subscribers not farm-scoped (#9); UX items #11–17.
+Decided (2026-09-27): a Manager can still edit an `ActualHarvest` after its
+plan is approved — approval freezes it only against PIC Block edits and sync
+resubmits. The new history trail is what makes those corrections traceable.
+
+## Service worker no longer caches the dashboard; PWA updates actually ship (audit #4)
+
+Most likely root cause of the repeated "I already did that but it's still
+not showing" reports, and of the two "CSRF token incorrect" 403s in the
+server log when deleting a harvest plan. Two separate caching problems:
+
+1. **`pwa/service-worker.js` intercepted every page on the site.** It's
+   registered at the root (scope `/`, so it controls `/dashboard/*` too) and
+   was cache-first for every same-origin GET except `/api/` and `/admin/`.
+   Once a user had opened the field app in a browser, every dashboard page
+   and AJAX fragment was cached on first load and served from cache from
+   then on — including the Farm Map's embedded data, its inline JS (so new
+   features like marking trees from "Plan harvest" never arrived), and its
+   CSRF token (so deletes failed with 403). Its cache name was also never
+   bumped past `v2`, so new `app.js`/`sync.js` versions never reached
+   installed field devices either.
+2. **PWA files had no `Cache-Control` header**, so even without the service
+   worker browsers guessed a freshness window from `Last-Modified` (~17h
+   for a week-old file) and skipped revalidating.
+
+**Fixed:** the service worker now handles only an allowlist of the field
+app's own files (`/field/`, `/pwa/*`, the manifest) and leaves everything
+else to the network. It's network-first with a 4s timeout, revalidating
+with the server (`cache: "no-cache"`) and falling back to the cache when
+offline. Precaching bypasses the HTTP cache. The cache name is now `v3`, and
+activation deletes every other cache, which purges the old `v2` cache full
+of dashboard pages. `palmvision/urls.py` serves all PWA files with
+`Cache-Control: no-cache` (still reusable, but only after a cheap 304
+revalidation). `docs/05-offline-sync.md` notes the scope rule.
+
+**Verified:** a Node harness (scratch, not committed) ran the real
+`service-worker.js` with mocked browser APIs: old `v2` cache purged;
+dashboard, `/api/`, `/admin/`, `/media/` and non-GET requests never
+intercepted; online requests revalidate and refresh the cache; offline
+serves the refreshed copy; uncached-and-offline fails rather than faking a
+response. The same harness fails against the old worker. New parametrized
+test pins `Cache-Control: no-cache` on the PWA routes; live curl shows the
+header and a 304 on revalidation. Full suite 405 passed, ruff and
+migration check clean. Not verifiable in the Browser pane itself (it
+can't register service workers).
+
+**For an existing browser to pick this up:** the browser fetches the new
+`/service-worker.js` on its next navigation, installs it, and it takes
+over immediately. A dashboard tab that was already open was loaded from
+the old cache, so reload it once after that.
+
+**One-time transition caveat (found while verifying #5):** a browser
+*without* the service worker that cached `app.js` etc. before the
+`Cache-Control` header existed keeps serving that old copy from its disk
+cache (confirmed: `transferSize: 0`, no request sent) until the old entry's
+heuristic freshness runs out — about 17h at most, once. Devices with the
+service worker aren't affected, since the worker script itself is always
+checked against the network and v3 revalidates everything. A hard reload
+(Ctrl+Shift+R) clears it immediately.
+
+## Stored XSS closed in the PWA and on dashboard map popups (audit #5)
+
+`pwa/js/app.js` renders every screen as an HTML string assigned to
+`innerHTML`, and deliberately didn't escape text (its own comment called it
+"an internal field-crew tool"). But tree names are free text a PIC Block
+user can edit, and they render for every other user of that block,
+Managers included, whose login tokens live in the same origin's storage —
+a stored XSS path across roles. Separately, Leaflet's `bindPopup(string)`
+renders its argument as HTML, and the dashboard passed it raw block names,
+and in `tree_form.html` raw tree names.
+
+**Fixed:** `escapeAttr()` replaced by `escapeHtml()` (escapes `& < > " '`,
+safe in text and quoted attributes), applied to every interpolation of
+server, IndexedDB, error-message or user data in `app.js`: block name/
+commodity/year/overlap warning/id, tree name/health/id, proximity prompt,
+plan picker options, quantities in `formatLastDone()`, and every
+`state.error` sink (server error messages can echo input). What's left
+unescaped is numbers, fixed strings chosen by comparisons, or constant
+colour lookups. Dashboard: all `bindPopup` calls (`farm_map.html`,
+`block_boundary.html`, `tree_form.html`, `imagery_confirm_blocks.html`)
+now pass a `<span>` built with `textContent`; the Farm Map's block
+dropdown is built with `new Option()` instead of concatenated HTML. The
+dashboard panels themselves already used `el()`/`textContent` and
+Django-escaped fragments.
+
+**Verified live:** planted a fake tree in the browser's local IndexedDB
+only (not the server DB) named `<img src=x onerror="window.__xss=1">"'&`.
+Block screen and tree detail screen both show it as literal text, the
+edit field's `value` round-trips it exactly, no `<img>` element is created
+and the handler never fires; fake record removed afterwards. Dashboard:
+the block dropdown rebuilds correctly on farm change, and a neighbour
+outline's popup (boundary-edit mode) renders "B2" inside a `<span>` — no
+console errors. `node --check pwa/js/app.js` clean; full suite 405 passed.
+
+## Harvests logged from the PWA can now be approved into yield (audit #2)
+
+The PIC Block → Manager approval flow was broken for exactly the channel
+PIC Block users actually use. Only the dashboard's "Record actual" moved a
+plan to `done_wait`/`on_progress_wait`; the API path the PWA uses
+(`ActualHarvestViewSet` create) never touched the plan, so it stayed
+`created`. The first Approve then moved it to `created_confirmed`, a dead
+end with no further transition, every later Approve failed with 400, and
+`get_effective_quantity()` stayed `None` forever.
+
+**Fixed:**
+- The rule lives in one place: `services.record_actual_progress(plan,
+  finished)`. The dashboard's `_advance_plan_progress()` now calls it.
+- `IdempotentUUIDCreateMixin` gained two hooks, run only for brand-new
+  records, never for a resubmit of an existing one:
+  `validate_new_record()` (before) and `on_record_created()` (after, in the
+  same transaction as the create).
+- `ActualHarvestViewSet`/`ActualFertilizerViewSet` advance the plan on
+  create, always as "finished" (`done_wait`). The PWA has no notion of
+  partial progress, and the flow asked for is one approval: PIC inputs,
+  Manager approves, it counts. The dashboard keeps its "This completes the
+  plan" checkbox for multi-visit plans. Fertilizer gets the same
+  status-advance for parity with the dashboard, which already did this for
+  it; fertilizer yield is still not gated by approval.
+- New actuals or per-tree rows under an already-approved (Done) plan are
+  refused (400, "This plan has already been approved… Log this against a
+  new plan instead."). Otherwise a record added after approval would count
+  toward yield without ever being approved. A genuine offline replay of a
+  record created *before* approval still succeeds (200, unchanged).
+- No existing data was stuck (checked: 2 plans, both `created` with no
+  actuals), so no data migration was needed.
+
+**Verified:** new end-to-end dashboard test replays the exact PWA sequence:
+plan + actual created through the API by the PIC → `done_wait` → Yield
+history offers Approve → dashboard Approve → Done → 500 kg counted. Five new
+API tests cover the harvest/fertilizer status advance, Done after one
+approve, refusal of new actuals and new tree rows under an approved plan,
+and replay-after-approval still succeeding. The original audit probe now
+shows `created → done_wait → done`, effective quantity 500 (was
+`created_confirmed`, `None`). Full suite 411 passed, ruff and migration
+check clean.
+
+**Follow-up flagged, not built:** the PWA never shows *why* a queued write
+failed. A rejected entry stays in the outbox as "failed", the banner keeps
+saying "N items waiting to sync", and "Sync now" skips it. That's
+pre-existing — docs/05 step 5 says failures must surface, never silently —
+and this change adds one rare way to hit it: logging offline against a plan
+a Manager approves before the device syncs.
+
+## Audit High items: report subscribers, pending-approvals count, basemap, block summary (#9, #6, #7, #8)
+
+**#9 — reports could be emailed to another farm's staff.** A report's
+subscriber list offered every Manager of *any* farm, and the API accepted
+any user. New `reporting.services.eligible_subscribers(farm)` (Super
+Admins plus that farm's Managers) is enforced in three places: the
+dashboard form (lists only people eligible for farms this user manages,
+and `clean()` rejects anyone not eligible for the chosen farm), the API
+serializer (400), and at send time — so removing someone's Manager role
+also stops their scheduled emails.
+
+**#6 — Overview "Pending approvals" counted the wrong plans.** It counted
+`created` plans, which can't be approved under the approval gate, and
+missed the ones that could. New `operations.services.awaiting_approval()`
+is exactly the set that shows an Approve button (approvable status plus at
+least one recorded actual). The Overview and the daily approval-pending
+notification both use it, so they can't disagree with the button — the
+notification had its own rule, which also nagged about waiting plans whose
+only actual had been deleted. Live: Overview now shows 0 for your two B4
+plans with nothing recorded (it showed 2).
+
+**#7 — default basemap broken.** CARTO started requiring an API key and
+served an "API KEY REQUIRED" image for every tile. Switched all four map
+templates to Esri's World Street Map — keyless, and the same provider the
+satellite layer already uses, so no new third-party dependency.
+`maxNativeZoom: 19` lets Leaflet upscale past the deepest real tiles.
+Verified by downloading a tile over B4 (real roads, "Jalan Kebon Manggis")
+and live: the Farm Map fits B4 on the working street basemap.
+
+**#8 — block summary said "Nothing pending" with open plans.** The Harvest/
+Fertilizer rows only counted marked trees. They now lead with "N awaiting
+approval", then marked trees, then "N open plans", from data the panel
+already had. Live: B4 reads "Harvest · 2 open plans".
+
+**Verified:** 4 new tests (subscriber API rejection, send-time filtering
+after a role is removed, dashboard form hiding/rejecting other farms'
+managers, notification skipping plans with nothing to approve); 2 existing
+tests updated from the old rule (the Overview one had asserted a bare plan
+counts as pending — the bug itself). Full suite 415 passed, ruff and
+migration check clean.
+
+**New finding, logged not fixed:** notification `link`s point at raw API
+URLs (`/api/harvests/<id>/`, `/api/farm-blocks/<id>/`…), and the
+dashboard's notifications page doesn't render links at all — so a
+notification can't take a Manager to the thing it's about.
+
+## PWA: rejected saves are shown, with the reason, and can be retried or discarded
+
+Flagged under #2 above. A queued write the server rejected (4xx) was
+marked "failed" in the outbox and then never mentioned again: the banner
+kept counting it as "waiting to sync", "Sync now" skipped it, and the
+reason was stored as raw JSON nobody saw — against docs/05-offline-sync.md
+step 5 ("failures surface to the user … never silently"). Online, an
+immediate rejection only ever said "Request rejected by the server."
+
+**Fixed:**
+- `api.js`: `describeServerError()` turns a DRF error body into one
+  readable line. Both write paths now throw "Not saved: <reason>", and
+  `sync.js` stores that readable reason on a failed outbox entry.
+- The banner splits into "N items waiting to sync" (Sync now) and "N items
+  couldn't be saved" (Review, in the danger colour). The sync chip no
+  longer counts rejected items as queued.
+- New "Couldn't be saved" screen: one row per rejected item — what it was
+  ("Harvest log · 9/27/2026 · 12 kg"), the server's reason, and *Try
+  again* (back to pending, then sync) or *Discard* (confirmed; also removes
+  the local copy the form saved optimistically, so it doesn't linger in
+  lists as if saved).
+
+**Verified live at phone width:** queued a write the server rejects (an
+actual harvest pointing at a plan that doesn't exist, so no real data is
+touched), synced, and walked the whole flow — failed with a readable
+reason, banner shows the failed line and Review, the review row shows
+what/why, Try again re-sends and it stays listed (attempt 2), Discard
+empties the outbox, removes the local copy and shows "Nothing to review".
+Immediate online rejection shows "Not saved: …". Confirmed nothing was
+created server-side. `node --check` clean on all three scripts.
+
+## Audit Medium and Low items (all except #11 and #12, which need decisions)
+
+**#13 — dashboard failures explained, buttons no longer stuck.** Any
+non-JSON response (expired session → login redirect, stale CSRF token,
+permission denied, server error, offline) used to show "Couldn't save
+that — try again" — for deletes and approvals too, and "try again" can't
+fix an expired session. `postJson()` now never rejects: it resolves to
+`{ok: false, message}` naming the cause and what to do ("You've been signed
+out — reload…", "This page is out of date… reload it", "You don't have
+permission…", "The server hit an error…", each ending "Nothing was
+changed."), so every caller's failure branch shows it and re-enables its
+button — the form submit button used to stay disabled until a reload.
+`getJson()` uses the same messages. A 403 is told apart by body (CSRF page
+vs. permission denied). The generic form handler keeps what was typed when
+a failure has no re-rendered form. Verified live with a throwaway plan:
+corrupted CSRF cookie → "page is out of date" (plan untouched — the
+failure behind your earlier plan-delete 403s); signed out in the
+background → "You've been signed out" for both Delete and Edit.
+
+**#14 —** a new plan's "record an actual first" line is now neutral
+("Waiting for field data — can be approved once a harvest is recorded
+against it") instead of warning-coloured on every new plan.
+
+**#15 — PWA "Re-download all data".** Downloads everything first, then
+removes local records the server no longer has (e.g. plans deleted before
+sync tombstones existed) — never clears before the download succeeds.
+Refuses while unsent items exist (they'd look stale too) or offline.
+Verified live: a staged stale plan was removed, both real plans kept;
+refusal message shown with an unsent item.
+
+**#16 — dashboard on a phone.** Compact top bar (brand + sign-out, nav as
+one sideways-scrolling row) instead of the full sidebar stacked on top:
+98px instead of 302px. Farm Map: map first (55vh, unobstructed), panel and
+legend below it instead of floating over ~70% of it. Desktop unchanged.
+
+**Notification links —** now point at dashboard pages where the Manager
+can act (Farm Map on the block, opened on its Harvest/Fertilizer section
+via a new `?section=` parameter; the block's imagery runs; compliance
+documents), and the notifications page renders them. Old notifications
+with raw `/api/` links stay plain text.
+
+**Low / polish:**
+- Units: "1 kg assessed" (was "1 assessed"), Yield history "150 kg" (was
+  "Qty 150 kg"), empty summary "All-time: 0 kg" (was "No kg recorded yet").
+- PWA: health shown as "Healthy / Yellowing / Unknown health" (was the raw
+  value "yellow"; same wording as the dashboard legend); "1 tree needs
+  harvest" (was "1 tree need harvest").
+- PWA block cards and tree rows are real `<button>`s inside the list items
+  (keyboard-reachable; they were clickable `<li>`s). Same look.
+- PWA no longer shows the block-overlap warning to field staff, who can't
+  act on it; Managers still see it on the dashboard.
+- Reports form offers only the two report types that generate a file
+  (it listed five with a note pointing at BUILD_STATUS.md); the failure
+  message for other types no longer names phases and code files.
+- Imagery table: "Map loading: Optimized / Not optimized" and "Original
+  file: Available / Archived" instead of "Format: COG" / "Storage: Hot",
+  without code/doc paths in the tooltips.
+- Plan form notes: harvest's no longer claims tree selection is "a visual
+  aid only" (it marks trees now); fertilizer's no longer cites
+  BUILD_STATUS.md.
+- `---------` dropdown placeholders replaced with "Choose a farm…", "Choose
+  a block…", "No PIC Block assigned".
+
+**Verified:** full suite 417 passed (1 new: report form choices and
+labels); ruff, migration check and `node --check` clean; live checks as
+noted above. Temporary account and all test data removed.
+
+**Still open, needs a decision:** #11 (four overlapping harvest actions
+backed by two data systems) and #12 (trees have no human-usable
+identifier — 1,070 "Unnamed tree" rows in the PWA).
+
+## #11 and #12 decided and built: two harvest actions on one system; tree numbers
+
+**#11 — decided: "two buttons, one system" (Harvest only; Fertilizer waits
+for the user's go-ahead).** The Harvest panel had four actions over two
+record systems that didn't talk to each other: "Record harvest directly"
+updated each tree's last-harvested date but never reached Yield history
+or approval; "Record actual harvest" did, but didn't touch the trees.
+Now:
+- The panel has **"Plan harvest — select trees"** (marks trees as needing
+  harvest) and **"Record harvest"**. "Mark trees needing harvest" and
+  "Record harvest directly" are gone from it.
+- Recording (RecordActualHarvestView) now also completes the selected
+  trees exactly as "Record harvest directly" did — last-harvested
+  date/quantity, cleared from "needs harvest", marking-history entry —
+  via one shared `_MarkTreesActionMixin._mark_trees_done()` that the old
+  endpoint also uses. The whole record is one transaction.
+- The tree detail panel's "Mark harvested (today)" shortcut goes through
+  Record harvest too (marked finished, like a field log), so no dashboard
+  path records a harvest outside approval/yield any more.
+- The panel's notes and labels say what now happens (trees updated right
+  away; the weight counts once the plan is approved).
+Tests: recording completes the trees and still goes to approval; the
+Fertilizer record still leaves trees alone.
+
+**#12 — decided: per-block tree numbers, by position.** New
+`Tree.number` (unique per block, never reused) and `Tree.label` — the
+name if set, else block name + number, e.g. **B4-0123**. New trees get
+the block's next number in `Tree.save()` (every creation path — dashboard,
+API, sync retry, detection confirm, seed — goes through it; the block row
+is locked while numbering so two trees saved at once can't collide; a
+tree moved to another block is renumbered there). Existing trees were
+numbered once by migration `trees.0011`: a "snake" walk along each
+block's planting rows (alternating direction, so the end of one row and
+the start of the next are also consecutive), with the row direction found
+per block by trying every 3° angle and row widths 7–10 m and keeping the
+walk with the shortest typical step. Result on the real data: median
+step between consecutive numbers ~9 m (one tree spacing), 90th percentile
+~21 m — versus ~15 m / ~39 m for plain east–west bands. The migration
+also moves `updated_at`, because the field app's incremental sync only
+re-fetches changed trees and would otherwise never receive the numbers.
+Shown everywhere a tree was "Unnamed tree" or an 8-character id: the
+dashboard (checklists, lists, detail heading, popups, messages — one
+server-side change, since it built that name in one place) and the field
+app (list, detail, proximity prompt; list now sorts in number order).
+The API returns `number` and `label` (read-only).
+Tests: numbering per block, never reused, renumbered on block move, API
+fields, and the offline-sync create path.
+
+**Verified live:** field app — an ordinary incremental sync delivered
+labels for all 1,483 trees; B4 lists B4-0001, 0002, 0003… in walking
+order. Dashboard — Harvest panel shows exactly the two actions, the
+checklist shows B4-0001…, the record form explains the new behaviour.
+Full suite 424 passed; ruff, migration check, `node --check` clean.
+Temporary account removed.
+
+## Imagery audit: B3 out-of-memory crash and duplicate trees (audit items #1, #2)
+
+Imagery audit (2026-10-09) found two critical bugs; fixed here. The rest of
+the audit's findings are still open (see the list at the end).
+
+**#1 — every B3 processing run was killed while clipping.** `clip_to_block()`
+read the block at the image's native 2 cm resolution (~4 GB of pixels for a
+~640 x 680 m block), the worker was SIGKILLed (out of memory) ~1.5 min in,
+and both runs sat at "Clipping" until the 60-minute stale sweep. Detection
+resamples to ~6 cm and classification to ~15 cm anyway. `clip_to_block()`
+now takes `max_gsd_m` and does a decimated windowed read plus a rasterized
+mask on the output grid; all three callers pass the block's detection target
+GSD. Real B3 image: 489 MB array, 21 s, 2 GB peak process memory (was ~4 GB
+before copies, killed). The persisted per-run clipped COG/preview is now at
+~6 cm too (still plenty for review overlays). Test added on a synthetic
+raster.
+
+**#2 — confirming could create duplicate trees** (proven in the test DB):
+confirming one detection twice (API or dashboard double-click) gave two
+trees, and two runs over the same area confirmed in both queues gave two
+trees per palm. `confirm_new_candidate()` now locks the detection row
+(`select_for_update`), returns the existing tree if it was already
+confirmed, and links to an existing active tree within the block's match
+threshold instead of creating one (marking the detection `matched`).
+2 tests added.
+
+Verified: imagery + dashboard suites 211 passed, ruff clean.
+
+**Still open from the imagery audit:** #3 dead/grass/unusable patches are
+stored as "healthy" at 0.0 confidence and colour the map; #4 no UI to
+review/correct health labels (269 of 1,483 below the 70% bar); orphaned
+files (~11.7 GB: clipped files of deleted runs, `.cogswap` leftovers, raw
+uploads with no image) and no cleanup command; no guard against a second
+run for the same image+block while one is active; review-queue UI (UUIDs in
+the Link dropdown instead of tree numbers, no distance/map, misleading
+"nothing left to review" while a run is clipping, always-visible 0% bar due
+to `.upload-progress{display:flex}` overriding `hidden`, unlabelled
+confidences, clipped Link button, "Confirm all" shown with nothing to
+confirm); block imagery page doesn't say which image covers the block;
+failure notification links to a raw API URL; API allows rejecting a
+confirmed detection / linking to a removed tree. The two stuck B3 runs
+will be marked failed by the stale sweep; re-run B3 after this fix.
+
+## Imagery audit: health labels (audit items #3, #4)
+
+**#3 — no more guessed "healthy".** A dead/grass prediction or an unusable
+image patch was stored as `healthy` at 0.0 confidence, and the tree was
+coloured from it. Both are now `unknown` at 0.0 (also the stub classifier).
+Separately, `Tree.current_health` is now only set from a *trustworthy*
+result (`TreeHealthClassification.is_trustworthy`: confidence >= 0.70 or
+human-reviewed); low-confidence unreviewed results no longer colour the map.
+Existing trees were not re-derived — the 269 current low-confidence ones
+keep their colour until reviewed or re-run.
+
+**#4 — health-label review (docs/06-ml-pipeline.md step 4).** The run's
+review page now has "Health labels to check": each low-confidence unreviewed
+result with its patch image, what the model said, and Healthy / Yellow /
+Unknown buttons (`ReviewClassificationView`). Choosing records the human
+correction (only if it differs), marks it reviewed, and updates the tree.
+Capped at 60 per page, lowest confidence first. Also on that page: the Link
+dropdown shows tree numbers (B5-0123) instead of UUIDs, and the two
+confidences are labelled "Detection confidence" / "Health confidence".
+
+Verified: imagery suite 90 passed (tests updated where they encoded the old
+low-confidence-sets-colour / healthy-fallback behaviour; 2 new tests);
+ruff clean. Not yet visually checked in the browser.
+
+## Imagery audit: duplicate-run guard and orphaned-file cleanup
+
+- `services.start_processing_run()` (used by the API and both dashboard
+  start paths): if the image is already being processed against that block
+  (pending/clipping/detecting/classifying), the existing run is returned
+  (API: 200) instead of starting another.
+- `delete_image()` now also deletes each run's clipped COG/preview files.
+- New `manage.py cleanup_orphaned_imagery` (dry run by default; `--delete`;
+  keeps files modified in the last 6 h). Run on real data with approval:
+  39 orphaned files, 11.67 GB deleted (two `.cogswap` leftovers, six clipped
+  files of deleted runs, the B2/B2.1 raw mosaics with no Image row, old
+  previews, test fixtures). All 3 remaining images still open.
+- Tests: guard, delete_image file removal, cleanup command; suite 434 passed.
+
+## Imagery audit: review-page polish and API guards
+
+- Progress bar: `.upload-progress[hidden]` now actually hides (the flex rule
+  overrode it, so a "0%" bar always showed).
+- Empty review state depends on the run: ready -> "No detections left";
+  failed -> says so; still working -> "Still processing". "Confirm all" only
+  appears when there's something to confirm; otherwise a note explains the
+  rest are ambiguous. Link select/button wrap instead of clipping.
+- Processing-failure notification links to the run's review page (was a raw
+  API URL).
+- API/dashboard: a detection already linked to a tree can't be rejected;
+  linking only accepts active trees. Tests added; suite green.
+- Not browser-checked visually this round.
+
 ## Recommended next step
 
 Run `docker compose up -d --build && docker compose exec web python
@@ -3749,3 +5039,20 @@ print `<function detector at ...>`/`<function classifier at ...>`, not
 that's the one-command way to confirm both env vars, the volume mount, and
 the actual weight files are all correctly wired together, before trying a
 real image upload against a real block.
+
+## Audit round 3: field-app sign-out, approval pipeline, sync
+
+- **PWA logout** now deletes the stored access/refresh tokens (`deleteMeta`); before, blanks were ignored and a reload signed straight back in.
+- **Field "Mark harvested/fertilized"** (single and bulk) now records an ActualHarvest/ActualFertilizer on the block's open plan (`operations.services.record_field_completion`) so the plan reaches done_wait for approval. "Log harvest/fertilizer here" (per-tree rows) now clears the tree's "needs" flag and stamps last-done.
+- **Health sync**: every `Tree.save(update_fields=["current_health"])` now includes `updated_at`, so health changes reach phones' incremental sync.
+- **PWA block list**: redraws when a sync finishes (list screens only); first-login sync no longer skipped when one is in flight.
+- Global `[hidden] { display: none !important }` (map legend showed hidden rows).
+- Review page: real health-check count + anchor on redirect; "not matched to an existing tree" wording; Overview card links to a run with waiting detections.
+- PIC Block can only read/run reports restricted to their own blocks; farm kg/ha only divides yield from blocks with an area; deleting an in-use audit template/checklist item returns 400; removed stray `test_signal_debug.py`.
+- Tests added (trees, reporting). Not yet browser-verified (browser pane unavailable).
+
+## Fertilizer flow aligned with harvest
+
+- Fertilizer panel is now "Plan fertilizer — select trees" + "Record fertilizer" (the four old buttons are gone). Planning marks the checked trees as needing fertilizer; recording also stamps the trees (last fertilized, clears the flag) and the tree-panel quick-mark goes through Record fertilizer too.
+- `ActualFertilizer.get_effective_quantity()` / `FertilizerTree.effective_quantity` are now gated on the plan being approved (done); `get_reported_quantity()` shows the pending figure. Fertilizer application history rows show "Pending approval" and an Approve button.
+- Tests updated/added (operations, dashboard). Not browser-verified (browser pane unavailable).

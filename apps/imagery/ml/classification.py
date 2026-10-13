@@ -243,7 +243,7 @@ def stub_classifier(crop):
     correctly routes every stub result to human review instead of treating
     it as a real automated classification.
     """
-    return "healthy", 0.0
+    return "unknown", 0.0
 
 
 def _build_health_model(num_classes, in_channels):
@@ -360,8 +360,10 @@ def _load_real_classifier(model_path, normalize_exposure_enabled=None):
             # A real prediction, but not one of this project's three health
             # classes (DEAD/GRASS — see module docstring) — treated exactly
             # like no usable prediction at all rather than forced into the
-            # closest-sounding real label.
-            return "healthy", 0.0
+            # closest-sounding real label. Stored as "unknown" (never
+            # "healthy": a dead palm used to be saved as healthy at 0.0
+            # confidence and colour the map green).
+            return "unknown", 0.0
 
         return label, confidence
 

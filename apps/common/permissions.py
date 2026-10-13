@@ -32,6 +32,36 @@ def user_role_on_farm(user, farm):
     )
 
 
+# Dotted paths from any farm-scoped record to its Farm, tried in order. The
+# operations records (ActualHarvest, HarvestTree, ...) reach their farm
+# through their parent plan, not a direct farm/farm_block attribute.
+_FARM_PATHS = (
+    "farm",
+    "farm_block.farm",
+    "harvest.farm_block.farm",
+    "fertilizer.farm_block.farm",
+    "actual_harvest.harvest.farm_block.farm",
+    "actual_fertilizer.fertilizer.farm_block.farm",
+)
+
+
+def farm_of(obj):
+    for path in _FARM_PATHS:
+        current = obj
+        for attr in path.split("."):
+            current = getattr(current, attr, None)
+            if current is None:
+                break
+        if current is not None:
+            return current
+    return None
+
+
+class IsSuperAdmin(BasePermission):
+    def has_permission(self, request, view):
+        return bool(request.user and request.user.is_superuser)
+
+
 class IsSuperAdminOrManager(BasePermission):
     """Allows Super Admin (global) or a Manager scoped to the object's farm.
     Use for approval actions and other Manager-only state changes — see
@@ -42,10 +72,29 @@ class IsSuperAdminOrManager(BasePermission):
     def has_object_permission(self, request, view, obj):
         if request.user.is_superuser:
             return True
-        farm = getattr(obj, "farm", None) or getattr(obj.farm_block, "farm", None)
+        farm = farm_of(obj)
         if farm is None:
             return False
         return user_role_on_farm(request.user, farm) == "manager"
+
+
+class ManagerOnlyChangesMixin:
+    """ViewSet mixin: editing or deleting an existing record requires Super
+    Admin or a Manager on the record's farm, while create/list/retrieve keep
+    the viewset's own permissions. For offline-writable records a PIC Block
+    user may create (docs/05-offline-sync.md), where sync is append-only and
+    editing is an online Manager action — without this, IsAuthenticated let
+    a PIC Block user PATCH an already-approved harvest weight or DELETE a
+    record outright.
+    """
+
+    manager_only_actions = ("update", "partial_update", "destroy")
+
+    def get_permissions(self):
+        permissions = super().get_permissions()
+        if self.action in self.manager_only_actions:
+            permissions.append(IsSuperAdminOrManager())
+        return permissions
 
 
 class IsAssignedPicBlockOrManagerOrSuperAdmin(BasePermission):

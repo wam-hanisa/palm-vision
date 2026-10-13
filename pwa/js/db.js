@@ -91,6 +91,18 @@ function putAll(storeName, records) {
   });
 }
 
+/** Remove records from `storeName` by id — applies a pull response's
+ * tombstones (server-side hard deletes, apps/sync/models.py's
+ * SyncTombstone) to the local cache. A separate function from putAll()
+ * since a delete isn't an upsert-by-id, it's the opposite.
+ */
+function deleteAll(storeName, ids) {
+  return runTx([storeName], "readwrite", (tx) => {
+    const store = tx.objectStore(storeName);
+    for (const id of ids) store.delete(id);
+  });
+}
+
 function getAll(storeName) {
   return runTx([storeName], "readonly", (tx) => {
     return new Promise((resolve, reject) => {
@@ -127,6 +139,10 @@ function getMeta(key) {
 
 function setMeta(key, value) {
   return runTx(["meta"], "readwrite", (tx) => tx.objectStore("meta").put({ key, value }));
+}
+
+function deleteMeta(key) {
+  return runTx(["meta"], "readwrite", (tx) => tx.objectStore("meta").delete(key));
 }
 
 /** Queue a write for replay. `method`/`path`/`body` mirror a fetch() call
@@ -178,14 +194,31 @@ function deleteOutboxEntry(outboxId) {
   return runTx(["outbox"], "readwrite", (tx) => tx.objectStore("outbox").delete(outboxId));
 }
 
+/** Wipe everything scoped to the signed-in user: every record store, the
+ * outbox, and the sync cursor. Keeps device_id (identifies the device, not
+ * the user). Without this, a second user on a shared field device inherited
+ * the first user's cached blocks, and their unsent writes were later
+ * uploaded under the new user's token.
+ */
+function clearUserData() {
+  return runTx([...RECORD_STORES, "outbox", "meta"], "readwrite", (tx) => {
+    for (const name of [...RECORD_STORES, "outbox"]) tx.objectStore(name).clear();
+    const meta = tx.objectStore("meta");
+    for (const key of ["sync_cursor", "last_synced_at", "username"]) meta.delete(key);
+  });
+}
+
 window.PalmVisionDB = {
+  clearUserData,
   RECORD_STORES,
   putAll,
+  deleteAll,
   getAll,
   getOne,
   putOne,
   getMeta,
   setMeta,
+  deleteMeta,
   enqueueOutbox,
   getOutboxEntries,
   updateOutboxEntry,

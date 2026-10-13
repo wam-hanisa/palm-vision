@@ -24,8 +24,8 @@
             {% if image.preview_file %}<img src="{{ image.preview_file.url }}" alt="" class="image-thumb">
             {% else %}<span class="muted">—</span>{% endif %}
           </td>
-          <td>{{ image.created_at }}</td>
-          <td>{{ image.captured_at|default:"—" }}</td>
+          <td>{{ image.created_at|date:"j M Y, H:i" }}</td>
+          <td>{{ image.captured_at|date:"j M Y, H:i"|default:"—" }}</td>
           <td>
             {% if farm_block.boundary %}
             <form method="post" action="{% url 'dashboard:imagery-process' block_id=farm_block.id image_id=image.id %}" class="inline-form">
@@ -52,7 +52,7 @@
       <tbody>
         {% for run in runs %}
         <tr>
-          <td>{{ run.created_at }}</td>
+          <td>{{ run.created_at|date:"j M Y, H:i" }}</td>
           <td>
             {% if run.status == "ready" %}<span class="tag tag-success">Ready</span>
             {% elif run.status == "failed" %}<span class="tag tag-danger">Failed — {{ run.error_message }}</span>

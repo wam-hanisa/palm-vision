@@ -160,3 +160,86 @@ def test_pic_block_cannot_edit_their_own_assigned_block(as_pic_block, block_a):
     assert response.status_code == status.HTTP_403_FORBIDDEN
     block_a.refresh_from_db()
     assert block_a.name != "Renamed"
+
+
+@pytest.mark.django_db
+def test_pic_block_cannot_delete_their_own_assigned_block(as_pic_block, block_a):
+    response = as_pic_block.delete(f"/api/farm-blocks/{block_a.id}/")
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert FarmBlock.objects.filter(id=block_a.id).exists()
+
+
+@pytest.mark.django_db
+def test_manager_can_delete_block_on_their_farm(as_manager, block_b):
+    response = as_manager.delete(f"/api/farm-blocks/{block_b.id}/")
+    assert response.status_code == status.HTTP_204_NO_CONTENT
+    assert not FarmBlock.objects.filter(id=block_b.id).exists()
+
+
+# --- Role assignment and farm lifecycle are Super Admin only. Previously an
+#     unaffiliated user could list every farm's roles, grant themselves
+#     Manager on any farm, then approve harvests and delete the farm. ---
+
+@pytest.mark.django_db
+def test_user_cannot_grant_themselves_manager(as_other_pic_block, other_pic_block, farm):
+    from apps.farms.models import UserFarmRole
+
+    response = as_other_pic_block.post(
+        "/api/user-farm-roles/",
+        {"user": other_pic_block.id, "farm": str(farm.id), "role": UserFarmRole.ROLE_MANAGER},
+        format="json",
+    )
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert not UserFarmRole.objects.filter(user=other_pic_block).exists()
+
+
+@pytest.mark.django_db
+def test_role_list_only_shows_the_requesters_own_roles(as_other_pic_block, farm_role_manager):
+    response = as_other_pic_block.get("/api/user-farm-roles/")
+    assert response.status_code == status.HTTP_200_OK
+    rows = response.data["results"] if isinstance(response.data, dict) else response.data
+    assert rows == []
+
+
+@pytest.mark.django_db
+def test_manager_cannot_change_roles(as_manager, farm_role_manager, pic_block, farm):
+    response = as_manager.post(
+        "/api/user-farm-roles/",
+        {"user": pic_block.id, "farm": str(farm.id), "role": "manager"},
+        format="json",
+    )
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+
+
+@pytest.mark.django_db
+def test_super_admin_can_assign_roles_and_it_is_audited(as_super_admin, pic_block, farm):
+    from apps.farms.models import UserFarmRole
+
+    response = as_super_admin.post(
+        "/api/user-farm-roles/",
+        {"user": pic_block.id, "farm": str(farm.id), "role": UserFarmRole.ROLE_PIC_BLOCK},
+        format="json",
+    )
+    assert response.status_code == status.HTTP_201_CREATED
+    role = UserFarmRole.objects.get(user=pic_block, farm=farm)
+    assert role.history.count() == 1
+
+
+@pytest.mark.django_db
+def test_manager_cannot_delete_their_farm(as_manager, farm):
+    from apps.farms.models import Farm
+
+    response = as_manager.delete(f"/api/farms/{farm.id}/")
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert Farm.objects.filter(id=farm.id).exists()
+
+
+@pytest.mark.django_db
+def test_manager_can_rename_their_farm_but_pic_cannot(as_manager, pic_block, farm):
+    from apps.farms.models import UserFarmRole
+    from conftest import authed_client
+
+    assert as_manager.patch(f"/api/farms/{farm.id}/", {"name": "Renamed"}, format="json").status_code == 200
+    UserFarmRole.objects.create(user=pic_block, farm=farm, role=UserFarmRole.ROLE_PIC_BLOCK)
+    response = authed_client(pic_block).patch(f"/api/farms/{farm.id}/", {"name": "Hijacked"}, format="json")
+    assert response.status_code == status.HTTP_403_FORBIDDEN

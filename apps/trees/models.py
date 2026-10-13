@@ -2,7 +2,7 @@ import uuid
 
 from django.conf import settings
 from django.contrib.gis.db import models as gis_models
-from django.db import models
+from django.db import models, transaction
 from django.utils import timezone
 from simple_history.models import HistoricalRecords
 
@@ -60,6 +60,16 @@ class Tree(gis_models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=True)
     farm_block = models.ForeignKey(FarmBlock, on_delete=models.CASCADE, related_name="trees")
     name = models.CharField(max_length=255, blank=True, default="")
+    number = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        editable=False,
+        help_text=(
+            "This tree's number within its block, shown as e.g. B4-0123 wherever it has no name. "
+            "Assigned automatically (next free number in the block) and never reused. Existing "
+            "trees were numbered by position, row by row across the block."
+        ),
+    )
     location = gis_models.PointField(srid=4326)
     source = models.CharField(max_length=32, choices=SOURCE_CHOICES, default=SOURCE_MANUAL)
     status = models.CharField(max_length=32, choices=STATUS_CHOICES, default=STATUS_ACTIVE)
@@ -85,7 +95,7 @@ class Tree(gis_models.Model):
         null=True,
         blank=True,
         help_text=(
-            "Quantity (bunches) recorded at the same time as last_harvested_at, if the person doing the "
+            "Quantity (kg) recorded at the same time as last_harvested_at, if the person doing the "
             "marking captured one — the mark-harvested action has never required a quantity (it's a "
             "'when was this last serviced' interval tracker, not the yield-reporting pipeline; see "
             "last_harvested_at's own help_text), so this is nullable and denormalized here rather than a "
@@ -147,11 +157,52 @@ class Tree(gis_models.Model):
     history = HistoricalRecords()
 
     class Meta:
-        ordering = ["farm_block", "name"]
+        ordering = ["farm_block", "number"]
         indexes = [models.Index(fields=["farm_block", "status"])]
+        constraints = [
+            models.UniqueConstraint(fields=["farm_block", "number"], name="unique_tree_number_per_block"),
+        ]
 
     def __str__(self):
-        return self.name or str(self.id)
+        return self.label
+
+    @property
+    def label(self):
+        """How a tree is identified to people: its name if it has one, else
+        block name + number (B4-0123). Trees used to show as "Unnamed tree"
+        (1,070 identical rows in the field app) or an 8-character id
+        fragment on the dashboard.
+        """
+        if self.name:
+            return self.name
+        if self.number is None:
+            return "New tree"
+        return f"{self.farm_block.name}-{self.number:04d}"
+
+    @classmethod
+    def from_db(cls, db, field_names, values):
+        instance = super().from_db(db, field_names, values)
+        instance._loaded_farm_block_id = instance.__dict__.get("farm_block_id")
+        return instance
+
+    def save(self, *args, **kwargs):
+        moved_block = (
+            not self._state.adding
+            and getattr(self, "_loaded_farm_block_id", self.farm_block_id) != self.farm_block_id
+        )
+        if self.farm_block_id and (self.number is None or moved_block):
+            with transaction.atomic():
+                # Lock the block row so two trees saved at once can't both
+                # take the same "next" number.
+                FarmBlock.objects.select_for_update().filter(pk=self.farm_block_id).first()
+                highest = Tree.objects.filter(farm_block_id=self.farm_block_id).aggregate(models.Max("number"))
+                self.number = (highest["number__max"] or 0) + 1
+                if kwargs.get("update_fields") is not None:
+                    kwargs["update_fields"] = {*kwargs["update_fields"], "number"}
+                super().save(*args, **kwargs)
+        else:
+            super().save(*args, **kwargs)
+        self._loaded_farm_block_id = self.farm_block_id
 
     def is_location_orphaned(self):
         """True if this tree's location falls outside every block boundary
@@ -226,8 +277,12 @@ class TreeCareRecord(models.Model):
     against a tree — one row per "mark harvested"/"mark fertilized" action
     (apps/trees/views.py TreeViewSet._mark_done, reached from the PWA, and
     apps/dashboard/views.py's MarkTreesHarvestedView/MarkTreesFertilizedView,
-    the office equivalent), alongside stamping Tree.last_harvested_at/
-    last_fertilized_at (and last_harvest_quantity/last_fertilizer_quantity)
+    the office equivalent) — and, since `action`/`batch_id` were added, also
+    one row per tree included in a stage-1 "mark needing harvest/fertilizer"
+    action (apps/dashboard/views.py's MarkTreesNeedHarvestView/
+    MarkTreesNeedFertilizeView). Both kinds of row alongside stamping
+    Tree.last_harvested_at/last_fertilized_at (and last_harvest_quantity/
+    last_fertilizer_quantity) or harvest_marked_at/harvest_marked_by
     themselves.
 
     Before this model existed, every mark simply overwrote the previous
@@ -235,6 +290,19 @@ class TreeCareRecord(models.Model):
     captured no quantity at all — reported directly as a UI/UX gap:
     "current harvest and fertilize only marking the trees giving date
     without telling how many quantities and there are no history too."
+
+    `action`/`batch_id` were added after a follow-up report: the dashboard's
+    block-wide history (BlockCareHistoryView) originally showed one row per
+    tree per completion — "not the each tree history but the marking
+    history itself" — and stage-1 "needs" assignments left no trace at all
+    once resolved. `batch_id` is shared by every row created from the same
+    bulk mark/record submission (generated once per request, not per row —
+    see MarkTreesHarvestedView/MarkTreesNeedHarvestView etc.), so the
+    dashboard can group rows back into one history entry per action
+    ("3 trees marked needing harvest" / "3 trees harvested, 42.5 kg
+    total") instead of one line per tree. The PWA's single-tree
+    mark_harvested/mark_fertilized just gets the field's own uuid4 default
+    — a "batch" of one is exactly what it is.
 
     Deliberately NOT apps.operations.models.Harvest/ActualHarvest/
     HarvestTree — that pipeline is the compliance/yield-reporting system,
@@ -254,21 +322,40 @@ class TreeCareRecord(models.Model):
         (KIND_FERTILIZER, "Fertilizer"),
     ]
 
+    ACTION_NEEDED = "needed"
+    ACTION_COMPLETED = "completed"
+    ACTION_CHOICES = [
+        (ACTION_NEEDED, "Marked as needed"),
+        (ACTION_COMPLETED, "Completed"),
+    ]
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     tree = models.ForeignKey(Tree, on_delete=models.CASCADE, related_name="care_records")
     kind = models.CharField(max_length=16, choices=KIND_CHOICES)
+    action = models.CharField(
+        max_length=16,
+        choices=ACTION_CHOICES,
+        default=ACTION_COMPLETED,
+        help_text="Whether this row logs a stage-1 'needs harvest/fertilizer' assignment or the completion itself. Quantity only ever applies to a completion.",
+    )
     date = models.DateField(help_text="The date the work was done, not necessarily today (a backdated mark is allowed, same as last_harvested_at).")
     quantity = models.FloatField(
         null=True,
         blank=True,
-        help_text="Bunches for a harvest record, kilograms for a fertilizer record. Optional — not every recording captures this.",
+        help_text="Kilograms, for both a harvest or a fertilizer record. Optional — not every recording captures this.",
     )
     recorded_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL)
     recorded_at = models.DateTimeField(auto_now_add=True)
+    batch_id = models.UUIDField(
+        default=uuid.uuid4,
+        editable=False,
+        db_index=True,
+        help_text="Shared by every row created from the same bulk mark/record submission, so the dashboard can group them back into one history entry per action instead of one row per tree.",
+    )
 
     class Meta:
         ordering = ["-date", "-recorded_at"]
-        indexes = [models.Index(fields=["tree", "kind"])]
+        indexes = [models.Index(fields=["tree", "kind"]), models.Index(fields=["batch_id"])]
 
     def __str__(self):
         return f"{self.get_kind_display()} — {self.tree} — {self.date}"

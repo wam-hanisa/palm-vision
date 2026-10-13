@@ -10,8 +10,10 @@ this aims at for the dashboard specifically: can a Manager sign in, see
 correctly-scoped data, and can a PIC Block user (who has no dashboard
 journey per docs/10-user-journeys.md) not get in at all.
 """
+import json
 import pathlib
 import re
+import uuid
 import numpy as np
 import pytest
 import rasterio
@@ -19,6 +21,7 @@ from django.conf import settings
 from django.contrib.gis.geos import Point
 from django.core.files import File
 from django.urls import reverse
+from django.utils import timezone
 from rasterio.transform import from_bounds
 
 from apps.compliance.models import (
@@ -34,7 +37,7 @@ from apps.compliance.models import (
 from apps.farms.models import Farm, FarmBlock
 from apps.imagery.models import Image, ImageProcessingRun, TreeDetection
 from apps.notifications.models import Notification, NotificationCategory
-from apps.operations.models import Fertilizer, Harvest
+from apps.operations.models import ActualFertilizer, ActualHarvest, Fertilizer, Harvest, PlanStatus
 from apps.reporting.models import ReportDefinition, ReportRun
 from apps.trees.models import Tree, TreeCareRecord
 
@@ -114,8 +117,15 @@ def test_unauthenticated_request_redirects_to_login(client):
 
 
 @pytest.mark.django_db
-def test_overview_counts_pending_harvest_approval(client, manager, farm_role_manager, block_a):
+def test_overview_counts_only_plans_that_can_be_approved(client, manager, farm_role_manager, block_a):
+    """Same set that shows an Approve button: a bare plan with nothing
+    recorded against it isn't pending anything — it used to be counted,
+    while the plans actually waiting on the Manager were missed."""
     Harvest.objects.create(farm_block=block_a, assessment_date="2026-08-01", assessment_quantity=100.0)
+    waiting = Harvest.objects.create(
+        farm_block=block_a, assessment_date="2026-08-02", assessment_quantity=100.0, status=PlanStatus.DONE_WAIT
+    )
+    ActualHarvest.objects.create(harvest=waiting, date="2026-08-03", weight_kg=50)
     client.login(username="manager", password="manager12345")
     response = client.get(reverse("dashboard:home"))
     assert response.context["pending_harvests"] == 1
@@ -173,6 +183,25 @@ def test_notifications_view_shows_only_the_logged_in_users_notifications(client,
     response = client.get(reverse("dashboard:notifications"))
     assert b"Mine" in response.content
     assert b"Not mine" not in response.content
+
+
+@pytest.mark.django_db
+def test_marking_notifications_read_only_touches_own_rows(client, manager, farm_role_manager, other_pic_block):
+    mine = Notification.objects.create(
+        user=manager, category=NotificationCategory.APPROVAL_PENDING, title="Mine", message="m", read=False,
+    )
+    theirs = Notification.objects.create(
+        user=other_pic_block, category=NotificationCategory.APPROVAL_PENDING, title="Theirs", message="t", read=False,
+    )
+    client.login(username="manager", password="manager12345")
+    # Posting someone else's id must not mark it read.
+    client.post(reverse("dashboard:notifications"), {"notification_id": str(theirs.id)})
+    theirs.refresh_from_db()
+    assert theirs.read is False
+    client.post(reverse("dashboard:notifications"))  # mark all (own) read
+    mine.refresh_from_db()
+    assert mine.read is True
+    assert client.get(reverse("dashboard:home")).context["unread_notifications"] == 0
 
 
 # --- Imagery: upload, block detail, review queue ---
@@ -1654,6 +1683,56 @@ def test_harvest_plan_add_ajax_post_success(client, manager, farm_role_manager, 
     assert Harvest.objects.filter(farm_block=block_a, assessment_quantity=12.5).exists()
 
 
+# --- Creating a Harvest plan with trees checked on "Plan harvest — select
+#     trees" now actually marks those trees as needing harvest — reported
+#     directly, with a real reproduction: "currently I make a harvest plan
+#     for 9 trees but there are no marked trees shown in both dashboard
+#     list and pwa," and asked directly to fix it by moving "Mark trees
+#     needing harvest"'s own behavior into this screen rather than adding
+#     separate tree-level plan scoping. ---
+
+@pytest.mark.django_db
+def test_harvest_plan_add_marks_selected_trees_as_needing_harvest(client, manager, farm_role_manager, block_a, tree_in_block_a):
+    client.login(username="manager", password="manager12345")
+    response = client.post(
+        reverse("dashboard:harvest-plan-add", kwargs={"block_id": block_a.id}),
+        {
+            "assessment_date": "2026-08-01",
+            "assessment_quantity": "12.5",
+            "tree_ids": json.dumps([str(tree_in_block_a.id)]),
+        },
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert "1 tree marked as needing harvest" in payload["message"]
+    tree_in_block_a.refresh_from_db()
+    assert tree_in_block_a.harvest_marked_at is not None
+    assert tree_in_block_a.harvest_marked_by == manager
+    assert TreeCareRecord.objects.filter(
+        tree=tree_in_block_a, kind=TreeCareRecord.KIND_HARVEST, action=TreeCareRecord.ACTION_NEEDED
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_harvest_plan_add_without_tree_ids_marks_nothing(client, manager, farm_role_manager, block_a, tree_in_block_a):
+    """Selecting zero trees on this screen must still be a valid way to
+    create a block-level plan with nothing marked — the checklist stays
+    optional, exactly as it was before this feature existed.
+    """
+    client.login(username="manager", password="manager12345")
+    response = client.post(
+        reverse("dashboard:harvest-plan-add", kwargs={"block_id": block_a.id}),
+        {"assessment_date": "2026-08-01", "assessment_quantity": "12.5"},
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    assert response.status_code == 200
+    assert "marked as needing harvest" not in response.json()["message"]
+    tree_in_block_a.refresh_from_db()
+    assert tree_in_block_a.harvest_marked_at is None
+
+
 @pytest.mark.django_db
 def test_fertilizer_plan_add_ajax_post_success(client, manager, farm_role_manager, block_a):
     """FertilizerPlanCreateView — Fertilizer's counterpart to
@@ -1684,6 +1763,213 @@ def test_fertilizer_plan_add_ajax_get_returns_form_fragment(client, manager, far
     )
     assert response.status_code == 200
     assert "data-panel-form" in response.json()["html"]
+
+
+# --- Recording an actual harvest/fertilizer is what moves the plan's own
+# status forward. Reported directly, from an excalidraw diagram of the two
+# recording systems: a plan could never actually reach "Done" through the
+# UI, because nothing anywhere ever set it to on_progress_wait/done_wait in
+# the first place — RecordActualHarvestView/RecordActualFertilizerView used
+# to create the ActualHarvest/ActualFertilizer + tree rows and leave the
+# parent plan's status untouched. Mirrors the original Laravel app's own
+# submit==="finish" flag (Palm_Vision_PDR.md § 3.6): recording an actual
+# with "finished" unchecked marks the plan on_progress_wait; checked marks
+# it done_wait, which advance_status()'s own has_actual_record() guard
+# (apps/operations/services.py) can then legitimately approve to done,
+# since an actual now genuinely exists.
+
+@pytest.mark.django_db
+def test_record_actual_harvest_auto_creates_plan_and_marks_in_progress(client, manager, farm_role_manager, block_a, tree_in_block_a):
+    client.login(username="manager", password="manager12345")
+    response = client.post(
+        reverse("dashboard:harvest-record", kwargs={"block_id": block_a.id}),
+        {
+            "tree_ids": json.dumps([str(tree_in_block_a.id)]),
+            "quantities": json.dumps({str(tree_in_block_a.id): "12"}),
+            "date": "2026-09-20",
+        },
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+
+    plan = Harvest.objects.get(farm_block=block_a)
+    assert plan.status == PlanStatus.ON_PROGRESS_WAIT
+    actual = ActualHarvest.objects.get(harvest=plan)
+    # weight_kg, not quantity — asked directly to move every harvest
+    # record from bunch count to kg (apps/operations/models.py).
+    assert actual.harvest_trees.get(tree=tree_in_block_a).weight_kg == 12.0
+
+
+@pytest.mark.django_db
+def test_record_actual_harvest_marked_finished_sets_plan_done_wait(client, manager, farm_role_manager, block_a, tree_in_block_a):
+    client.login(username="manager", password="manager12345")
+    response = client.post(
+        reverse("dashboard:harvest-record", kwargs={"block_id": block_a.id}),
+        {
+            "tree_ids": json.dumps([str(tree_in_block_a.id)]),
+            "total_quantity": "500",
+            "finished": "1",
+            "date": "2026-09-20",
+        },
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    assert response.status_code == 200
+    plan = Harvest.objects.get(farm_block=block_a)
+    assert plan.status == PlanStatus.DONE_WAIT
+
+
+@pytest.mark.django_db
+def test_record_actual_harvest_reuses_open_plan_instead_of_duplicating(client, manager, farm_role_manager, block_a, tree_in_block_a):
+    existing = Harvest.objects.create(farm_block=block_a, assessment_date="2026-09-01", assessment_quantity=100)
+    client.login(username="manager", password="manager12345")
+    client.post(
+        reverse("dashboard:harvest-record", kwargs={"block_id": block_a.id}),
+        {"tree_ids": json.dumps([str(tree_in_block_a.id)]), "date": "2026-09-20"},
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    assert Harvest.objects.filter(farm_block=block_a).count() == 1  # not duplicated
+    existing.refresh_from_db()
+    assert existing.status == PlanStatus.ON_PROGRESS_WAIT
+
+
+@pytest.mark.django_db
+def test_record_actual_harvest_never_reopens_an_already_done_plan(client, manager, farm_role_manager, block_a, tree_in_block_a):
+    done_plan = Harvest.objects.create(
+        farm_block=block_a, assessment_date="2026-09-01", assessment_quantity=100, status=PlanStatus.DONE
+    )
+    client.login(username="manager", password="manager12345")
+    # A plan at "done" is excluded from _get_open_or_new_plan()'s reuse
+    # query — this recording creates a SECOND plan (legitimate: further
+    # work after a plan was already marked complete), and must not walk
+    # the already-done one backwards.
+    client.post(
+        reverse("dashboard:harvest-record", kwargs={"block_id": block_a.id}),
+        {"tree_ids": json.dumps([str(tree_in_block_a.id)]), "date": "2026-09-20"},
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    done_plan.refresh_from_db()
+    assert done_plan.status == PlanStatus.DONE
+    assert Harvest.objects.filter(farm_block=block_a).count() == 2
+
+
+@pytest.mark.django_db
+def test_record_actual_harvest_then_approve_reaches_done(client, manager, farm_role_manager, block_a, tree_in_block_a):
+    """The full loop the original bug report was about: record a finishing
+    actual, then approve — should now genuinely reach "done", since an
+    actual record legitimately exists by the time Approve is clicked.
+    """
+    client.login(username="manager", password="manager12345")
+    client.post(
+        reverse("dashboard:harvest-record", kwargs={"block_id": block_a.id}),
+        {"tree_ids": json.dumps([str(tree_in_block_a.id)]), "total_quantity": "500", "finished": "1", "date": "2026-09-20"},
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    plan = Harvest.objects.get(farm_block=block_a)
+    assert plan.status == PlanStatus.DONE_WAIT
+
+    response = client.post(
+        reverse("dashboard:harvest-plan-approve", kwargs={"block_id": block_a.id, "harvest_id": plan.id}),
+        {},
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    plan.refresh_from_db()
+    assert plan.status == PlanStatus.DONE
+
+
+def _block_payload(farm_map_data, block_id):
+    return next(b for b in farm_map_data["blocks"] if b["id"] == str(block_id))
+
+
+@pytest.mark.django_db
+def test_yield_history_shows_pending_until_approved_then_counts_in_all_time(
+    client, manager, farm_role_manager, block_a, tree_in_block_a
+):
+    """The full compliance-grade flow, end to end: make harvest plan (here,
+    auto-created) → input actual harvest → approve → *only then* does it
+    move into yield reporting. Before approval the real reported figure is
+    still visible in "Yield history," just marked pending — see
+    ActualHarvest.get_effective_quantity()/get_reported_quantity()'s own
+    docstrings and _recent_yield_by_block()'s.
+    """
+    client.login(username="manager", password="manager12345")
+    response = client.post(
+        reverse("dashboard:harvest-record", kwargs={"block_id": block_a.id}),
+        {"tree_ids": json.dumps([str(tree_in_block_a.id)]), "total_quantity": "500", "finished": "1", "date": "2026-09-20"},
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    block_payload = _block_payload(response.json()["farm_map_data"], block_a.id)
+    assert block_payload["yield_summary"]["total"] == 0  # nothing approved yet
+    assert len(block_payload["recent_yield"]) == 1
+    entry = block_payload["recent_yield"][0]
+    assert entry["quantity"] == 500.0  # the real reported figure, visible regardless
+    assert entry["pending_approval"] is True
+
+    plan = Harvest.objects.get(farm_block=block_a)
+    response = client.post(
+        reverse("dashboard:harvest-plan-approve", kwargs={"block_id": block_a.id, "harvest_id": plan.id}),
+        {},
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    block_payload = _block_payload(response.json()["farm_map_data"], block_a.id)
+    assert block_payload["yield_summary"]["total"] == 500.0  # now counted
+    entry = block_payload["recent_yield"][0]
+    assert entry["quantity"] == 500.0
+    assert entry["pending_approval"] is False
+
+
+@pytest.mark.django_db
+def test_harvest_logged_from_the_pwa_can_be_approved_into_yield(client, manager, farm_role_manager, block_a, pic_block):
+    """The same flow, but with the harvest logged the way the PWA does it —
+    plan and actual both created through the API by the PIC Block user.
+    This used to be impossible to finish: the API never moved the plan out
+    of "created", so the first Approve sent it to created_confirmed (a dead
+    end), every later Approve failed, and the yield never counted.
+    """
+    from conftest import authed_client
+
+    pwa = authed_client(pic_block)
+    plan_id = str(uuid.uuid4())
+    pwa.post("/api/harvests/", {"id": plan_id, "farm_block": str(block_a.id),
+                                "assessment_date": "2026-09-20", "assessment_quantity": 0}, format="json")
+    pwa.post("/api/actual-harvests/", {"id": str(uuid.uuid4()), "harvest": plan_id,
+                                       "date": "2026-09-20", "weight_kg": 500}, format="json")
+    assert Harvest.objects.get(id=plan_id).status == PlanStatus.DONE_WAIT
+
+    client.login(username="manager", password="manager12345")
+    farm_map = client.get(reverse("dashboard:farms"), HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+    entry = _block_payload(farm_map.json()["farm_map_data"], block_a.id)["recent_yield"][0]
+    assert entry["pending_approval"] is True
+    assert entry["can_approve"] is True  # the Yield history row offers Approve
+
+    response = client.post(
+        reverse("dashboard:harvest-plan-approve", kwargs={"block_id": block_a.id, "harvest_id": plan_id}),
+        {},
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    assert Harvest.objects.get(id=plan_id).status == PlanStatus.DONE
+    block_payload = _block_payload(response.json()["farm_map_data"], block_a.id)
+    assert block_payload["yield_summary"]["total"] == 500.0
+
+
+@pytest.mark.django_db
+def test_record_actual_fertilizer_marked_finished_sets_plan_done_wait(client, manager, farm_role_manager, block_a, tree_in_block_a):
+    """Fertilizer's counterpart to test_record_actual_harvest_marked_finished_sets_plan_done_wait —
+    Fertilizer has no assessment_quantity field, so the auto-created plan's
+    create_kwargs branch (hasattr check) is exercised differently here.
+    """
+    client.login(username="manager", password="manager12345")
+    response = client.post(
+        reverse("dashboard:fertilizer-record", kwargs={"block_id": block_a.id}),
+        {"tree_ids": json.dumps([str(tree_in_block_a.id)]), "total_quantity": "40", "finished": "1", "date": "2026-09-20"},
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    assert response.status_code == 200
+    plan = Fertilizer.objects.get(farm_block=block_a)
+    assert plan.status == PlanStatus.DONE_WAIT
+    assert ActualFertilizer.objects.filter(fertilizer=plan).exists()
 
 
 @pytest.mark.django_db
@@ -1743,10 +2029,9 @@ def test_mark_trees_harvested_accepts_a_quantity_per_tree(client, manager, farm_
     response = client.post(
         reverse("dashboard:trees-mark-harvested", kwargs={"block_id": block_a.id}),
         {
-            "tree_ids": [str(tree_in_block_a.id), str(tree_b.id)],
+            "tree_ids": json.dumps([str(tree_in_block_a.id), str(tree_b.id)]),
             "date": "2026-01-15",
-            f"quantity_{tree_in_block_a.id}": "8",
-            f"quantity_{tree_b.id}": "11.5",
+            "quantities": json.dumps({str(tree_in_block_a.id): "8", str(tree_b.id): "11.5"}),
         },
         HTTP_X_REQUESTED_WITH="XMLHttpRequest",
     )
@@ -1771,7 +2056,7 @@ def test_mark_trees_harvested_without_any_quantity_still_succeeds(client, manage
     client.login(username="manager", password="manager12345")
     response = client.post(
         reverse("dashboard:trees-mark-harvested", kwargs={"block_id": block_a.id}),
-        {"tree_ids": [str(tree_in_block_a.id)], "date": "2026-01-15"},
+        {"tree_ids": json.dumps([str(tree_in_block_a.id)]), "date": "2026-01-15"},
         HTTP_X_REQUESTED_WITH="XMLHttpRequest",
     )
     assert response.status_code == 200
@@ -1784,7 +2069,11 @@ def test_mark_trees_fertilized_quantity_is_independent_of_harvest(client, manage
     client.login(username="manager", password="manager12345")
     response = client.post(
         reverse("dashboard:trees-mark-fertilized", kwargs={"block_id": block_a.id}),
-        {"tree_ids": [str(tree_in_block_a.id)], "date": "2026-01-15", f"quantity_{tree_in_block_a.id}": "2.25"},
+        {
+            "tree_ids": json.dumps([str(tree_in_block_a.id)]),
+            "date": "2026-01-15",
+            "quantities": json.dumps({str(tree_in_block_a.id): "2.25"}),
+        },
         HTTP_X_REQUESTED_WITH="XMLHttpRequest",
     )
     assert response.status_code == 200
@@ -1799,7 +2088,11 @@ def test_repeated_dashboard_marking_accumulates_history(client, manager, farm_ro
     for date, qty in [("2026-01-01", "5"), ("2026-01-15", "9")]:
         client.post(
             reverse("dashboard:trees-mark-harvested", kwargs={"block_id": block_a.id}),
-            {"tree_ids": [str(tree_in_block_a.id)], "date": date, f"quantity_{tree_in_block_a.id}": qty},
+            {
+                "tree_ids": json.dumps([str(tree_in_block_a.id)]),
+                "date": date,
+                "quantities": json.dumps({str(tree_in_block_a.id): qty}),
+            },
             HTTP_X_REQUESTED_WITH="XMLHttpRequest",
         )
     records = list(
@@ -1841,6 +2134,133 @@ def test_unrelated_manager_cannot_view_care_history_outside_their_scope(client, 
     assert response.status_code == 404
 
 
+# --- Block-wide care history — same TreeCareRecord rows as above, across
+# every tree in the block, backing the new Harvest/Fertilizer section
+# panels (renderBlockSectionPanel() in farm_map.html). ---
+
+def test_block_care_history_spans_every_tree_in_the_block(client, manager, farm_role_manager, block_a, tree_in_block_a, tree_b):
+    client.login(username="manager", password="manager12345")
+    TreeCareRecord.objects.create(tree=tree_in_block_a, kind=TreeCareRecord.KIND_HARVEST, date="2026-01-05", quantity=10)
+    TreeCareRecord.objects.create(tree=tree_b, kind=TreeCareRecord.KIND_HARVEST, date="2026-01-15", quantity=14)
+    TreeCareRecord.objects.create(tree=tree_b, kind=TreeCareRecord.KIND_FERTILIZER, date="2026-01-10", quantity=2)
+
+    response = client.get(reverse("dashboard:block-care-history", kwargs={"block_id": block_a.id}))
+    assert response.status_code == 200
+    history = response.json()["history"]
+    assert [h["date"] for h in history] == ["2026-01-15", "2026-01-10", "2026-01-05"]
+    # newest entry belongs to tree_b's harvest — each of these three
+    # records has a distinct default batch_id (none were created together
+    # as one bulk action), so each stays its own single-tree batch here
+    assert history[0]["tree_ids"] == [str(tree_b.id)]
+    assert history[0]["tree_count"] == 1
+    assert history[0]["total_quantity"] == 14
+    assert history[0]["kind"] == "harvest"
+    assert history[1]["kind"] == "fertilizer"
+
+
+def test_block_care_history_groups_rows_from_the_same_batch_into_one_entry(client, manager, farm_role_manager, block_a, tree_in_block_a, tree_b):
+    """The whole point of batch_id: marking/recording several trees in one
+    submission (MarkTreesHarvestedView etc. share one batch_id across the
+    loop) must collapse back into ONE history entry — "3 trees harvested,
+    X bunches total" — not three separate lines. Reported directly: "the
+    harvest marking history is not the each tree history but the marking
+    history itself.\""""
+    client.login(username="manager", password="manager12345")
+    batch_id = uuid.uuid4()
+    TreeCareRecord.objects.create(
+        tree=tree_in_block_a, kind=TreeCareRecord.KIND_HARVEST, date="2026-02-15", quantity=10, batch_id=batch_id,
+    )
+    TreeCareRecord.objects.create(
+        tree=tree_b, kind=TreeCareRecord.KIND_HARVEST, date="2026-02-15", quantity=15, batch_id=batch_id,
+    )
+
+    response = client.get(reverse("dashboard:block-care-history", kwargs={"block_id": block_a.id}))
+    assert response.status_code == 200
+    history = response.json()["history"]
+    assert len(history) == 1
+    assert history[0]["tree_count"] == 2
+    assert history[0]["total_quantity"] == 25
+    assert sorted(history[0]["tree_ids"]) == sorted([str(tree_in_block_a.id), str(tree_b.id)])
+
+
+def test_block_care_history_includes_needed_action_with_no_quantity(client, manager, farm_role_manager, block_a, tree_in_block_a):
+    """A stage-1 'needs harvest' assignment (no work done yet, no
+    quantity) must still show up in the block's marking history — reported
+    directly as missing before: "if I mark need to harvest ... it show the
+    marking history.\""""
+    client.login(username="manager", password="manager12345")
+    TreeCareRecord.objects.create(
+        tree=tree_in_block_a, kind=TreeCareRecord.KIND_HARVEST, action=TreeCareRecord.ACTION_NEEDED,
+        date="2026-02-15", quantity=None,
+    )
+
+    response = client.get(reverse("dashboard:block-care-history", kwargs={"block_id": block_a.id}))
+    assert response.status_code == 200
+    history = response.json()["history"]
+    assert len(history) == 1
+    assert history[0]["action"] == "needed"
+    assert history[0]["total_quantity"] is None
+    assert history[0]["tree_count"] == 1
+
+
+def test_block_care_history_excludes_other_blocks(client, manager, farm_role_manager, block_a, block_b, tree_in_block_a):
+    """A record against a tree in a DIFFERENT block in the same farm must
+    not leak into this block's history — the query filters on
+    tree__farm_block_id, not tree__farm_block__farm_id."""
+    other_block_tree = Tree.objects.create(farm_block=block_b, name="B-block tree", location=Point(101.448, 0.532, srid=4326))
+    TreeCareRecord.objects.create(tree=tree_in_block_a, kind=TreeCareRecord.KIND_HARVEST, date="2026-01-05", quantity=10)
+    TreeCareRecord.objects.create(tree=other_block_tree, kind=TreeCareRecord.KIND_HARVEST, date="2026-01-06", quantity=99)
+
+    client.login(username="manager", password="manager12345")
+    response = client.get(reverse("dashboard:block-care-history", kwargs={"block_id": block_a.id}))
+    assert response.status_code == 200
+    history = response.json()["history"]
+    assert len(history) == 1
+    assert history[0]["total_quantity"] == 10
+
+
+def test_block_care_history_empty_when_no_records(client, manager, farm_role_manager, block_a):
+    client.login(username="manager", password="manager12345")
+    response = client.get(reverse("dashboard:block-care-history", kwargs={"block_id": block_a.id}))
+    assert response.status_code == 200
+    assert response.json()["history"] == []
+
+
+def test_unrelated_manager_cannot_view_block_care_history_outside_their_scope(client, manager, farm_role_manager):
+    other_farm = Farm.objects.create(name="Someone else's farm")
+    other_block = FarmBlock.objects.create(farm=other_farm, name="Not managed")
+    client.login(username="manager", password="manager12345")
+    response = client.get(reverse("dashboard:block-care-history", kwargs={"block_id": other_block.id}))
+    assert response.status_code == 404
+
+
+def test_mark_trees_need_harvest_creates_one_batch_of_needed_care_records(client, manager, farm_role_manager, block_a, tree_in_block_a, tree_b):
+    """MarkTreesNeedHarvestView (stage 1) previously left no trace at all
+    once resolved — only Tree.harvest_marked_at, which completion clears
+    right back. Now logs one TreeCareRecord per tree (action=needed, no
+    quantity) sharing a single batch_id, so BlockCareHistoryView can group
+    them into one "N trees marked needing harvest" entry."""
+    client.login(username="manager", password="manager12345")
+    response = client.post(
+        reverse("dashboard:trees-mark-need-harvest", kwargs={"block_id": block_a.id}),
+        {"tree_ids": json.dumps([str(tree_in_block_a.id), str(tree_b.id)])},
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+
+    records = TreeCareRecord.objects.filter(kind=TreeCareRecord.KIND_HARVEST, action=TreeCareRecord.ACTION_NEEDED)
+    assert records.count() == 2
+    batch_ids = set(records.values_list("batch_id", flat=True))
+    assert len(batch_ids) == 1  # one shared batch for the whole submission
+    assert all(r.quantity is None for r in records)
+
+    history = client.get(reverse("dashboard:block-care-history", kwargs={"block_id": block_a.id})).json()["history"]
+    assert len(history) == 1
+    assert history[0]["action"] == "needed"
+    assert history[0]["tree_count"] == 2
+
+
 def test_mark_trees_ajax_scope_still_enforced_for_the_new_quantity_path(client, manager, farm_role_manager):
     """Same scoping check as test_ajax_write_actions_still_enforce_scope
     above, specifically for the quantity-carrying path added to this view —
@@ -1853,7 +2273,11 @@ def test_mark_trees_ajax_scope_still_enforced_for_the_new_quantity_path(client, 
     client.login(username="manager", password="manager12345")
     response = client.post(
         reverse("dashboard:trees-mark-harvested", kwargs={"block_id": other_block.id}),
-        {"tree_ids": [str(other_tree.id)], "date": "2026-01-15", f"quantity_{other_tree.id}": "99"},
+        {
+            "tree_ids": json.dumps([str(other_tree.id)]),
+            "date": "2026-01-15",
+            "quantities": json.dumps({str(other_tree.id): "99"}),
+        },
         HTTP_X_REQUESTED_WITH="XMLHttpRequest",
     )
     assert response.status_code == 404
@@ -1878,9 +2302,6 @@ def test_vendored_frontend_assets_exist_on_disk():
         ("vendor", "leaflet", "leaflet.css"),
         ("vendor", "leaflet", "leaflet.draw.js"),
         ("vendor", "leaflet", "leaflet.draw.css"),
-        ("vendor", "leaflet", "leaflet.markercluster.js"),
-        ("vendor", "leaflet", "MarkerCluster.css"),
-        ("vendor", "leaflet", "MarkerCluster.Default.css"),
         ("vendor", "chartjs", "chart.umd.js"),
         ("fonts", "public-sans-latin.woff2"),
     ]:
@@ -1951,3 +2372,56 @@ def test_every_leaflet_map_container_has_a_height_rule():
         f"{missing}. They render at height 0, and the surrounding page's "
         "JavaScript breaks when the first layer is added."
     )
+
+
+# --- Harvest panel consolidated to two actions on one system: Record
+#     harvest also updates the trees (what "Record harvest directly" did),
+#     so a recorded harvest reaches approval/yield AND the trees' own
+#     last-harvested date and "needs harvest" to-do. Fertilizer unchanged. ---
+
+@pytest.mark.django_db
+def test_record_harvest_also_completes_the_selected_trees(client, manager, farm_role_manager, block_a, tree_in_block_a):
+    tree_in_block_a.harvest_marked_at = timezone.now()
+    tree_in_block_a.save(update_fields=["harvest_marked_at"])
+    client.login(username="manager", password="manager12345")
+    response = client.post(
+        reverse("dashboard:harvest-record", kwargs={"block_id": block_a.id}),
+        {"tree_ids": json.dumps([str(tree_in_block_a.id)]), "quantities": json.dumps({str(tree_in_block_a.id): "42"}),
+         "date": "2026-09-20", "finished": "1"},
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    assert response.json()["ok"] is True
+    tree_in_block_a.refresh_from_db()
+    assert tree_in_block_a.last_harvested_at.isoformat() == "2026-09-20"
+    assert tree_in_block_a.last_harvest_quantity == 42.0
+    assert tree_in_block_a.harvest_marked_at is None  # cleared from "needs harvest"
+    assert TreeCareRecord.objects.filter(
+        tree=tree_in_block_a, kind=TreeCareRecord.KIND_HARVEST, action=TreeCareRecord.ACTION_COMPLETED
+    ).exists()
+    actual = ActualHarvest.objects.get(harvest__farm_block=block_a)  # and it went to approval/yield as before
+    assert actual.harvest.status == PlanStatus.DONE_WAIT
+
+
+@pytest.mark.django_db
+def test_record_fertilizer_also_updates_the_selected_trees(client, manager, farm_role_manager, block_a, tree_in_block_a):
+    client.login(username="manager", password="manager12345")
+    client.post(
+        reverse("dashboard:fertilizer-record", kwargs={"block_id": block_a.id}),
+        {"tree_ids": json.dumps([str(tree_in_block_a.id)]), "date": "2026-09-20"},
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    tree_in_block_a.refresh_from_db()
+    assert str(tree_in_block_a.last_fertilized_at) == "2026-09-20"
+
+
+@pytest.mark.django_db
+def test_fertilizer_plan_marks_the_selected_trees(client, manager, farm_role_manager, block_a, tree_in_block_a):
+    client.login(username="manager", password="manager12345")
+    resp = client.post(
+        reverse("dashboard:fertilizer-plan-add", kwargs={"block_id": block_a.id}),
+        {"assessment_date": "2026-09-20", "tree_ids": json.dumps([str(tree_in_block_a.id)])},
+        HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+    )
+    assert resp.status_code == 200
+    tree_in_block_a.refresh_from_db()
+    assert tree_in_block_a.fertilizer_marked_at is not None

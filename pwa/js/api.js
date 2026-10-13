@@ -3,8 +3,11 @@
  * write-or-queue decision for offline-writable resources.
  *
  * IMPORTANT per docs/05-offline-sync.md § Conflict handling: only *creates*
- * on offline-writable resources (Tree, HarvestTree, FertilizerTree,
- * ActualHarvest, ActualFertilizer) go through the queue — see
+ * on offline-writable resources (Tree, Harvest, HarvestTree, Fertilizer,
+ * FertilizerTree, ActualHarvest, ActualFertilizer) go through the queue —
+ * Harvest/Fertilizer joined this list once findOrCreatePlan() (app.js)
+ * started auto-creating a plan for a block with none yet, same offline
+ * requirement as every other record here. See
  * queueableWrite() below. Editing an existing record (e.g. app.js's tree
  * edit form) and the approve action are online-only — see
  * onlineOnlyWrite() below. Two differently-named functions, not one
@@ -41,7 +44,11 @@ async function login(username, password) {
 }
 
 async function logout() {
-  await setTokens({ access: "", refresh: "" });
+  // Delete, don't blank: setTokens() ignores empty values, so the old
+  // version left both tokens stored and the next page load signed straight
+  // back in as the previous user.
+  await window.PalmVisionDB.deleteMeta("access_token");
+  await window.PalmVisionDB.deleteMeta("refresh_token");
 }
 
 async function refreshAccessToken() {
@@ -115,10 +122,7 @@ async function queueableWrite(resource, path, method, body) {
     // server has already told us is invalid — surface it now while the
     // field worker can still correct it.
     const errorBody = await response.json().catch(() => ({}));
-    const error = new Error("Request rejected by the server.");
-    error.status = response.status;
-    error.body = errorBody;
-    throw error;
+    throw rejectionError(response.status, errorBody);
   } catch (err) {
     if (err.isNetworkError) {
       const outboxId = await window.PalmVisionDB.enqueueOutbox({ resource, path, method, body });
@@ -144,12 +148,33 @@ async function onlineOnlyWrite(path, method, body) {
   const response = await apiFetch(path, { method, body: JSON.stringify(body) });
   if (!response.ok) {
     const errorBody = await response.json().catch(() => ({}));
-    const error = new Error("Request rejected by the server.");
-    error.status = response.status;
-    error.body = errorBody;
-    throw error;
+    throw rejectionError(response.status, errorBody);
   }
   return response.json();
+}
+
+/** A DRF error body ({"field": ["msg"]}, {"detail": "msg"}, or a list) as
+ * one readable line. Field names are dropped — the messages themselves are
+ * written for the person reading them.
+ */
+function describeServerError(body) {
+  if (body === null || body === undefined) return "";
+  if (Array.isArray(body)) return body.map(describeServerError).filter(Boolean).join(" ");
+  if (typeof body === "object") {
+    if (body.detail) return String(body.detail);
+    return Object.values(body).map(describeServerError).filter(Boolean).join(" ");
+  }
+  return String(body);
+}
+
+/** The server's reason used to be attached to the error but never shown —
+ * a field worker only ever saw "Request rejected by the server." */
+function rejectionError(status, body) {
+  const reason = describeServerError(body);
+  const error = new Error(reason ? `Not saved: ${reason}` : "Request rejected by the server.");
+  error.status = status;
+  error.body = body;
+  return error;
 }
 
 window.PalmVisionAPI = {
@@ -159,4 +184,5 @@ window.PalmVisionAPI = {
   queueableWrite,
   onlineOnlyWrite,
   getTokens,
+  describeServerError,
 };

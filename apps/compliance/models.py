@@ -260,6 +260,11 @@ class HarvestBatch(models.Model):
     of when it was closed/exported, not silently change if new ActualHarvest
     rows get linked afterwards. Call recompute_totals() explicitly (done by
     the export action) to refresh them.
+
+    `total_weight_kg` is the authoritative figure — every harvest record's
+    unit is kg now, not bunch count (see apps/operations/models.py).
+    `total_quantity` is the optional, best-effort bunch-count total; see
+    recompute_totals()'s own docstring for exactly how each is derived.
     """
 
     EXPORT_STATUS_DRAFT = "draft"
@@ -286,18 +291,31 @@ class HarvestBatch(models.Model):
         return f"Batch — {self.farm_block} — {self.period_start}..{self.period_end}"
 
     def recompute_totals(self, save=True):
-        """Sums ActualHarvest.get_effective_quantity() (and weight, via
-        HarvestTree.weight_kg where present) across every ActualHarvest
-        linked to this batch. See apps/operations/models.py — ActualHarvest
-        gained a nullable `batch` FK for this purpose.
+        """Sums across every ActualHarvest linked to this batch. See
+        apps/operations/models.py — ActualHarvest gained a nullable
+        `batch` FK for this purpose.
+
+        Update — asked directly to move every harvest record from bunch
+        count to kg: `total_weight_kg` is now the authoritative figure,
+        summing ActualHarvest.get_effective_quantity() (the same manual-
+        total-wins-with-remainder-split rule used everywhere else in this
+        pipeline). This also fixes a real, separate bug this method had
+        before that change: it used to sum HarvestTree.weight_kg directly,
+        which silently ignored an action's own manual ActualHarvest total
+        whenever no tree-level breakdown existed for it — the exact
+        "tree-sum should never quietly override a real reported total"
+        mistake get_effective_quantity() itself was built to prevent.
+        `total_quantity` is now the bunch-count total — optional,
+        best-effort, summed straight from ActualHarvest.quantity since
+        that field is supplementary detail only and has no derived/
+        estimated-remainder concept of its own.
         """
         actuals = self.actual_harvests.all()
         total_quantity = 0.0
         total_weight = 0.0
         for actual in actuals:
-            total_quantity += actual.get_effective_quantity() or 0
-            weight = actual.harvest_trees.aggregate(total=models.Sum("weight_kg"))["total"]
-            total_weight += weight or 0
+            total_quantity += actual.quantity or 0
+            total_weight += actual.get_effective_quantity() or 0
         self.total_quantity = total_quantity
         self.total_weight_kg = total_weight
         if save:

@@ -126,3 +126,88 @@ def test_manager_cannot_reassign_a_report_definition_to_a_farm_they_do_not_manag
     assert response.status_code == status.HTTP_403_FORBIDDEN
     definition.refresh_from_db()
     assert definition.farm_id == farm.id
+
+
+# --- Subscribers must manage the report's own farm (or be a Super Admin).
+#     Previously any farm's Manager could be subscribed, so one farm's
+#     reports could be emailed to another farm's staff. ---
+
+def _manager_of(farm, username):
+    from apps.farms.models import UserFarmRole
+    from apps.users.models import User
+
+    user = User.objects.create_user(username=username, email=f"{username}@example.com", password="x12345678")
+    UserFarmRole.objects.create(user=user, farm=farm, role=UserFarmRole.ROLE_MANAGER)
+    return user
+
+
+@pytest.mark.django_db
+def test_cannot_subscribe_another_farms_manager_via_api(as_manager, farm, manager):
+    outsider = _manager_of(Farm.objects.create(name="Other farm"), "other_manager")
+    payload = {"farm": str(farm.id), "name": "Weekly", "report_type": "production", "export_format": "pdf",
+               "recurrence": "weekly", "subscribers": [outsider.id]}
+    response = as_manager.post("/api/reports/", payload, format="json")
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert "subscribers" in response.data
+
+    payload["subscribers"] = [manager.id]
+    assert as_manager.post("/api/reports/", payload, format="json").status_code == status.HTTP_201_CREATED
+
+
+@pytest.mark.django_db
+def test_scheduled_email_skips_subscribers_who_no_longer_manage_the_farm(farm, block_a, harvest_data, mailoutbox):
+    from apps.farms.models import UserFarmRole
+    from apps.reporting.tasks import _email_subscribers
+
+    current = _manager_of(farm, "current_manager")
+    former = _manager_of(farm, "former_manager")
+    definition = _definition(farm, ReportDefinition.TYPE_PRODUCTION, ReportDefinition.FORMAT_PDF)
+    definition.recurrence = ReportDefinition.RECURRENCE_WEEKLY
+    definition.save()
+    definition.subscribers.set([current, former])
+    UserFarmRole.objects.filter(user=former).delete()  # role removed after subscribing
+
+    run = generate_report(ReportRun.objects.create(definition=definition))
+    _email_subscribers(run)
+    assert len(mailoutbox) == 1
+    assert mailoutbox[0].to == ["current_manager@example.com"]
+
+
+@pytest.mark.django_db
+def test_dashboard_report_form_hides_and_rejects_other_farms_managers(manager, farm_role_manager, farm):
+    from apps.dashboard.forms import ReportDefinitionForm
+
+    outsider = _manager_of(Farm.objects.create(name="Other farm"), "other_manager")
+    form = ReportDefinitionForm(user=manager)
+    assert outsider not in form.fields["subscribers"].queryset
+    assert manager in form.fields["subscribers"].queryset
+
+    bound = ReportDefinitionForm(
+        data={"farm": farm.id, "name": "Weekly", "report_type": "production", "export_format": "pdf",
+              "recurrence": "weekly", "subscribers": [outsider.id]},
+        user=manager,
+    )
+    assert not bound.is_valid()
+    assert "subscribers" in bound.errors
+
+
+@pytest.mark.django_db
+def test_dashboard_report_form_offers_only_types_that_generate(manager, farm_role_manager):
+    from apps.dashboard.forms import ReportDefinitionForm
+
+    form = ReportDefinitionForm(user=manager)
+    offered = {value for value, _ in form.fields["report_type"].choices}
+    assert offered == {ReportDefinition.TYPE_PRODUCTION, ReportDefinition.TYPE_TREE_HEALTH}
+    assert form.fields["farm"].empty_label == "Choose a farm…"
+
+
+@pytest.mark.django_db
+def test_pic_block_cannot_see_reports_for_other_blocks(as_pic_block, farm, block_a, block_b):
+    from apps.reporting.models import ReportDefinition
+
+    own = ReportDefinition.objects.create(farm=farm, name="own", report_type="production", filters={"farm_block_id": str(block_a.id)})
+    other = ReportDefinition.objects.create(farm=farm, name="other", report_type="production", filters={"farm_block_id": str(block_b.id)})
+    farmwide = ReportDefinition.objects.create(farm=farm, name="all", report_type="production")
+    assert as_pic_block.get(f"/api/reports/{own.id}/").status_code == 200
+    assert as_pic_block.get(f"/api/reports/{other.id}/").status_code == 404
+    assert as_pic_block.get(f"/api/reports/{farmwide.id}/").status_code == 404

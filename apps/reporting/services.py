@@ -24,11 +24,29 @@ from django.core.files.base import ContentFile
 from django.db.models import Sum
 from django.utils import timezone
 
-from apps.farms.models import FarmBlock
+from django.contrib.auth import get_user_model
+from django.db.models import Q
+
+from apps.farms.models import FarmBlock, UserFarmRole
 from apps.imagery.models import TreeHealthClassification
 from apps.operations.models import ActualHarvest, Harvest
 
 from .models import ReportDefinition, ReportRun
+
+
+def eligible_subscribers(farm):
+    """Who may receive a farm's report by email: Super Admins and that
+    farm's Managers. Enforced when subscribers are chosen (dashboard form,
+    API) and again at send time, so removing someone's Manager role also
+    stops their emails. Previously any Manager of *any* farm could be
+    subscribed, which let one farm's reports be emailed to another farm's
+    staff.
+    """
+    return (
+        get_user_model()
+        .objects.filter(Q(is_superuser=True) | Q(farm_roles__farm=farm, farm_roles__role=UserFarmRole.ROLE_MANAGER))
+        .distinct()
+    )
 
 
 class ReportGenerationError(Exception):
@@ -125,6 +143,10 @@ _DATA_BUILDERS = {
     ReportDefinition.TYPE_TREE_HEALTH: _build_tree_health_data,
 }
 
+# The dashboard form only offers these — the other TYPE_CHOICES exist on the
+# model but generate nothing yet.
+IMPLEMENTED_REPORT_TYPES = frozenset(_DATA_BUILDERS)
+
 
 def _render_pdf(definition: ReportDefinition, data: dict) -> bytes:
     from weasyprint import HTML
@@ -198,9 +220,8 @@ def generate_report(run: ReportRun) -> ReportRun:
         builder = _DATA_BUILDERS.get(definition.report_type)
         if builder is None:
             raise ReportGenerationError(
-                f"Report type '{definition.report_type}' isn't implemented yet — "
-                "only production and tree_health are built in Phase 7. "
-                "See apps/reporting/models.py's docstring."
+                f"{definition.get_report_type_display()} reports are not implemented yet — "
+                "only Production and Tree health reports can be generated."
             )
         data = builder(definition)
 

@@ -4,23 +4,19 @@
 {% block page_title %}Overview{% endblock %}
 {% block content %}
 <div class="card-grid">
-  <div class="metric-card {% if pending_approvals_total %}metric-attention{% endif %}">
+  <a class="metric-card {% if pending_approvals_total %}metric-attention{% endif %}" href="{% url 'dashboard:farms' %}">
     <div class="metric-value">{{ pending_approvals_total }}</div>
     <div class="metric-label">Pending approvals</div>
     <div class="metric-sub">{{ pending_harvests }} harvest · {{ pending_fertilizers }} fertilizer</div>
-  </div>
-  <div class="metric-card {% if review_queue_count %}metric-attention{% endif %}">
+  </a>
+  <a class="metric-card {% if review_queue_count %}metric-attention{% endif %}" href="{% if review_run_id %}{% url 'dashboard:imagery-run' run_id=review_run_id %}{% else %}{% url 'dashboard:imagery' %}{% endif %}">
     <div class="metric-value">{{ review_queue_count }}</div>
     <div class="metric-label">Detections awaiting review</div>
-  </div>
-  <div class="metric-card {% if compliance_attention_count %}metric-attention{% endif %}">
-    <div class="metric-value">{{ compliance_attention_count }}</div>
-    <div class="metric-label">Compliance docs expiring/expired</div>
-  </div>
-  <div class="metric-card {% if unread_notifications %}metric-attention{% endif %}">
+  </a>
+  <a class="metric-card {% if unread_notifications %}metric-attention{% endif %}" href="{% url 'dashboard:notifications' %}">
     <div class="metric-value">{{ unread_notifications }}</div>
     <div class="metric-label">Unread notifications</div>
-  </div>
+  </a>
   <div class="metric-card">
     <div class="metric-value">{{ farm_count }}</div>
     <div class="metric-label">Farms in scope</div>
@@ -31,12 +27,7 @@
   </div>
 </div>
 
-<p class="panel-note">
-  This overview mirrors what the daily notification checks already watch
-  (apps/notifications/tasks.py) — pending approvals, the detection review
-  queue, and compliance expiry — scoped to what you manage, the same way
-  the API scopes it.
-</p>
+<p class="panel-note">Counts cover the farms and blocks you manage. Click a card to open it.</p>
 
 {% comment %}
 Chart.js (CDN — same accepted exception this app already makes for
@@ -74,6 +65,17 @@ blank chart.
   if (typeof Chart === "undefined") return; // charts just don't render, rest of the page is unaffected
 
   var healthColors = { Healthy: "#6B8F71", Yellow: "#B85C4A", Unknown: "#8A8578" };
+
+  // Text equivalent for screen readers: "Label: value, Label: value, …".
+  function describe(canvasId, title, labels, values, unit) {
+    var canvas = document.getElementById(canvasId);
+    if (!canvas || !labels.length) return;
+    canvas.setAttribute("role", "img");
+    canvas.setAttribute("aria-label", title + ". " + labels.map(function (l, i) { return l + ": " + values[i] + (unit ? " " + unit : ""); }).join(", "));
+  }
+  describe("yield-chart", "Yield by month", data.yield.labels, data.yield.values, "");
+  describe("health-chart", "Tree health", data.health.labels, data.health.values, "trees");
+  describe("tree-quantities-chart", "Trees per block", data.tree_quantities.labels, data.tree_quantities.values, "trees");
 
   function renderOrHide(canvasId, hasData, renderFn) {
     var canvas = document.getElementById(canvasId);

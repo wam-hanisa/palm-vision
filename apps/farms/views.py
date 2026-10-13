@@ -4,7 +4,7 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from apps.common.permissions import user_role_on_farm
+from apps.common.permissions import IsSuperAdmin, user_role_on_farm
 from apps.common.scoping import scoped_farm_blocks, scoped_farms
 
 from .models import FarmBlock, UserFarmRole
@@ -25,13 +25,28 @@ from apps.trees.serializers import TreeSerializer
 class FarmViewSet(viewsets.ModelViewSet):
     """See docs/04-api-spec.md. List is scoped: Super Admin sees every farm;
     everyone else sees only farms they hold a UserFarmRole on.
+
+    Creating or deleting a farm is Super Admin only (a farm is the top-level
+    scope every role hangs off, and deleting one cascades to all its blocks,
+    trees and records); renaming one is also open to that farm's Manager.
     """
 
     serializer_class = FarmSerializer
     permission_classes = [IsAuthenticated]
 
+    def get_permissions(self):
+        if self.action in ("create", "destroy"):
+            return [IsAuthenticated(), IsSuperAdmin()]
+        return super().get_permissions()
+
     def get_queryset(self):
         return scoped_farms(self.request.user)
+
+    def perform_update(self, serializer):
+        user = self.request.user
+        if not (user.is_superuser or user_role_on_farm(user, serializer.instance) == UserFarmRole.ROLE_MANAGER):
+            raise PermissionDenied("Only a Manager of this farm or a Super Admin can edit it.")
+        serializer.save()
 
 
 class FarmBlockViewSet(viewsets.ModelViewSet):
@@ -73,6 +88,10 @@ class FarmBlockViewSet(viewsets.ModelViewSet):
         self._require_manager_or_superadmin_for_farm(farm)
         serializer.save()
 
+    def perform_destroy(self, instance):
+        self._require_manager_or_superadmin_for_farm(instance.farm)
+        instance.delete()
+
     @action(detail=True, methods=["get"])
     def geojson(self, request, pk=None):
         """Map-ready GeoJSON for a single block — docs/05-offline-sync.md
@@ -99,14 +118,23 @@ class FarmBlockViewSet(viewsets.ModelViewSet):
 
 
 class UserFarmRoleViewSet(viewsets.ModelViewSet):
-    """Super Admin only in practice — enforced by settings.REST_FRAMEWORK
-    DEFAULT_PERMISSION_CLASSES (IsAuthenticated) plus the queryset below;
-    a stricter IsSuperAdmin-only permission class can be added here once
-    the admin UI for role assignment is built (not yet — this exists so
-    the API surface is complete per docs/04-api-spec.md, not because the
-    UI for managing it exists this phase).
+    """Role assignment is Super Admin only. Everyone else can only read
+    their own roles. Previously this relied on IsAuthenticated with an
+    unscoped queryset, which let any logged-in user list every farm's role
+    assignments and grant themselves Manager on any farm — and through
+    that, approve harvests and delete whole farms.
     """
 
     serializer_class = UserFarmRoleSerializer
     permission_classes = [IsAuthenticated]
-    queryset = UserFarmRole.objects.select_related("user", "farm")
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return super().get_permissions()
+        return [IsAuthenticated(), IsSuperAdmin()]
+
+    def get_queryset(self):
+        qs = UserFarmRole.objects.select_related("user", "farm")
+        if self.request.user.is_superuser:
+            return qs
+        return qs.filter(user=self.request.user)

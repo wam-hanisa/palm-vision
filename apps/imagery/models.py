@@ -441,6 +441,19 @@ class TreeHealthClassification(models.Model):
     def __str__(self):
         return f"{self.health_label} ({self.confidence:.2f})"
 
+    REVIEW_THRESHOLD = 0.70  # docs/06-ml-pipeline.md step 4
+
+    @property
+    def needs_review(self):
+        return not self.reviewed and self.confidence < self.REVIEW_THRESHOLD
+
+    @property
+    def is_trustworthy(self):
+        """Whether this result may drive Tree.current_health: a human has
+        reviewed it, or the model was confident. Low-confidence unreviewed
+        results used to colour the map as if confirmed."""
+        return not self.needs_review
+
     @property
     def effective_label(self):
         """What should actually drive Tree.current_health — the human

@@ -70,6 +70,7 @@ TEMPLATES = [
                 "django.template.context_processors.request",
                 "django.contrib.auth.context_processors.auth",
                 "django.contrib.messages.context_processors.messages",
+                "apps.dashboard.context_processors.unread_notifications",
             ],
         },
     },
@@ -295,6 +296,30 @@ IMAGE_UPLOAD_CHUNK_SIZE_BYTES = int(os.environ.get("IMAGE_UPLOAD_CHUNK_SIZE_BYTE
 # IMAGE_UPLOAD_CHUNK_SIZE_BYTES is ever raised via its own env var, this
 # stays ahead of it automatically.
 DATA_UPLOAD_MAX_MEMORY_SIZE = IMAGE_UPLOAD_CHUNK_SIZE_BYTES + (2 * 1024 * 1024)
+
+# Django's *default* DATA_UPLOAD_MAX_NUMBER_FIELDS (1000) counts GET params
+# and POST fields alike — raised here because it's hit by legitimate use of
+# this app's own data, not an attack. TreeCareRecord (apps/trees/models.py)
+# is an append-only audit log written one row per tree by the dashboard/
+# PWA's bulk mark/record flows (a single lasso selection over a large block
+# — "a farm block can hold over a thousand trees" is this app's own stated
+# scale — creates one row per tree under one batch_id), so its Django admin
+# changelist (/admin/trees/treecarerecord/) is exactly the kind of
+# large-table admin page this setting's default is too low for: selecting
+# many rows for a bulk admin action, or a search/filter that happens to
+# match a few thousand of them, raises TooManyFieldsSent well before this
+# table's realistic size is actually a problem. Confirmed live (see
+# BUILD_STATUS.md). Every other write path in this app that can involve a
+# similarly large number of trees already sends them as one JSON-encoded
+# field instead of one field each (see farm_map.html's/views.py's own "Fix
+# TooManyFieldsSent on large tree selections") — Django's own built-in admin
+# bulk actions have no such workaround available, so the fix here is to
+# raise the ceiling itself, same trade-off DATA_UPLOAD_MAX_MEMORY_SIZE above
+# already makes for a different Django upload-size default that was also too
+# conservative for this app's own real data. The admin is staff-only
+# (authenticated + is_staff), not public, so this doesn't weaken the DoS
+# protection this setting exists for anywhere a stranger could reach it.
+DATA_UPLOAD_MAX_NUMBER_FIELDS = int(os.environ.get("DATA_UPLOAD_MAX_NUMBER_FIELDS", 10000))
 
 # Paths to trained model weights — apps/imagery/ml/detection.py and
 # classification.py fall back to a stub (no detections / always-low-

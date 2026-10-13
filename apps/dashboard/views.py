@@ -24,6 +24,7 @@ into those existing per-block pages rather than adding any new bare
 "act on whatever's under the pin" shortcut.
 """
 import json as _json
+import uuid
 from collections import defaultdict
 
 from django.conf import settings
@@ -32,6 +33,8 @@ from django.contrib.auth.mixins import LoginRequiredMixin
 from django.contrib.auth.views import LoginView, LogoutView
 from django.contrib.gis.geos import GEOSGeometry, Point
 from django.core.exceptions import PermissionDenied
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import transaction
 from django.db.models import Count, Q
 from django.http import HttpResponseBadRequest, JsonResponse
 from django.shortcuts import get_object_or_404, redirect
@@ -57,10 +60,17 @@ from apps.farms.models import FarmBlock, UserFarmRole
 from apps.farms.views import FarmBlockViewSet, FarmViewSet
 from apps.imagery import services as imagery_services
 from apps.imagery.models import Image, ImageProcessingRun, ImageUploadSession, TreeDetection, TreeHealthClassification
-from apps.imagery.tasks import georeference_image_task, run_processing_task
+from apps.imagery.tasks import georeference_image_task
 from apps.imagery.views import ImageViewSet
 from apps.notifications.models import Notification
-from apps.operations.models import ActualHarvest, PlanStatus
+from apps.operations.models import ActualFertilizer, ActualHarvest, Fertilizer, FertilizerTree, Harvest, HarvestTree, PlanStatus
+from apps.operations.services import (
+    advance_status,
+    awaiting_approval,
+    can_advance,
+    has_actual_record,
+    record_actual_progress,
+)
 from apps.operations.views import ActualHarvestViewSet, FertilizerViewSet, HarvestViewSet
 from apps.reporting.models import ReportRun
 from apps.reporting.tasks import generate_report_task
@@ -90,6 +100,12 @@ from .forms import (
 # points at the right place if a URL pattern ever changes. Never used as
 # an actual id; always replaced before a request is made.
 _URL_PLACEHOLDER_UUID = "00000000-0000-0000-0000-000000000000"
+
+# Second placeholder, for the handful of URLs below with two dynamic UUID
+# segments (block_id + a plan/actual id) — JS's buildUrl() only replaces
+# one placeholder, so a two-segment URL needs a second, distinct token to
+# substitute against (see buildUrl2() in farm_map.html).
+_URL_PLACEHOLDER_UUID_2 = "11111111-1111-1111-1111-111111111111"
 
 
 def _build_image_confirm_data(image):
@@ -193,16 +209,24 @@ class HomeView(ManagerOrSuperAdminRequiredMixin, TemplateView):
         context = super().get_context_data(**kwargs)
         request = self.request
 
-        pending_harvests = _viewset_queryset(HarvestViewSet, request).filter(status=PlanStatus.CREATED).count()
-        pending_fertilizers = _viewset_queryset(FertilizerViewSet, request).filter(status=PlanStatus.CREATED).count()
+        pending_harvests = awaiting_approval(_viewset_queryset(HarvestViewSet, request)).count()
+        pending_fertilizers = awaiting_approval(_viewset_queryset(FertilizerViewSet, request)).count()
 
-        review_queue_count = scoped_to_user_blocks(
+        review_queryset = scoped_to_user_blocks(
             TreeDetection.objects.filter(
-                match_status__in=[TreeDetection.MATCH_NEW_CANDIDATE, TreeDetection.MATCH_AMBIGUOUS]
+                match_status__in=[TreeDetection.MATCH_NEW_CANDIDATE, TreeDetection.MATCH_AMBIGUOUS],
+                tree__isnull=True,  # same filter ReviewQueueView uses; without it, confirmed detections count forever
             ),
             request.user,
             block_field="processing_run__farm_block",
-        ).count()
+        )
+        review_queue_count = review_queryset.count()
+        # Link the card straight to a run that has something to review,
+        # not the Imagery list, which shows no sign of the waiting items.
+        review_run_id = (
+            review_queryset.order_by("-processing_run__created_at")
+            .values_list("processing_run_id", flat=True).first()
+        )
 
         # ComplianceDocument.status is a computed property, not a DB field
         # (apps/compliance/models.py — deliberate, so it's always current,
@@ -225,6 +249,7 @@ class HomeView(ManagerOrSuperAdminRequiredMixin, TemplateView):
                 "pending_fertilizers": pending_fertilizers,
                 "pending_approvals_total": pending_harvests + pending_fertilizers,
                 "review_queue_count": review_queue_count,
+                "review_run_id": review_run_id,
                 "compliance_attention_count": compliance_attention_count,
                 "unread_notifications": unread_notifications,
                 "farm_count": len(farms),
@@ -244,16 +269,19 @@ class HomeView(ManagerOrSuperAdminRequiredMixin, TemplateView):
         for Leaflet/tile imagery, see map.html's own comment).
 
         Yield is deliberately aggregated in Python, not a single nested SQL
-        aggregate query — `ActualHarvest.get_effective_quantity()` (the
-        model's own existing logic) is "tree-level total if any HarvestTree
-        rows exist, otherwise the manual block-level quantity," and
-        re-aggregating an already-aggregated-per-row annotation by month in
-        the same query risks Django generating an incorrect nested
-        GROUP BY (aggregate-of-aggregate) rather than what's intended. One
-        annotate() per ActualHarvest row (safe — a single aggregation level,
-        correctly grouped by that row's own PK) followed by a plain Python
-        month-bucket sum is slower at very large scale but is *correct*,
-        which matters more for a number that's literally called "yield."
+        aggregate query — calls `ActualHarvest.get_effective_quantity()`
+        itself per row (the model's own authoritative "manual total wins
+        whenever set, tree-sum is only a fallback when no total was ever
+        given" rule) rather than annotating a `Sum("harvest_trees__quantity")`
+        and picking between the two here. That annotate-then-override shape
+        looks equivalent but isn't: Django's Sum silently ignores NULL rows
+        and still returns a real, non-None number the moment even one
+        sibling HarvestTree has a quantity, which would make a manually-
+        reported total get quietly overridden by a partial tree-sum again —
+        exactly the bug get_effective_quantity() exists to prevent (see its
+        own docstring). This was a real, confirmed bug in this exact chart:
+        typing a 900-total action with only 2 of 3 trees individually
+        measured (500+200) summed to 700 here before this fix.
         Flagged here as a known scaling limit, not a hidden trade-off: if
         this dashboard is ever used somewhere with years of dense per-tree
         harvest history, this should move to a database-side rollup
@@ -261,18 +289,15 @@ class HomeView(ManagerOrSuperAdminRequiredMixin, TemplateView):
         """
         from datetime import timedelta
 
-        from django.db.models import Count, Sum
+        from django.db.models import Count
 
         cutoff = timezone.now().date() - timedelta(days=180)
-        actual_harvests = (
-            _viewset_queryset(ActualHarvestViewSet, request)
-            .filter(date__gte=cutoff)
-            .annotate(tree_total=Sum("harvest_trees__quantity"))
-        )
+        actual_harvests = _viewset_queryset(ActualHarvestViewSet, request).filter(date__gte=cutoff)
         yield_by_month = defaultdict(float)
         for ah in actual_harvests:
-            effective = ah.tree_total if ah.tree_total is not None else (ah.quantity or 0)
-            yield_by_month[ah.date.replace(day=1).isoformat()] += effective
+            effective = ah.get_effective_quantity()
+            if effective is not None:
+                yield_by_month[ah.date.replace(day=1).isoformat()] += effective
         yield_months = sorted(yield_by_month)
 
         active_trees = _viewset_queryset(TreeViewSet, request).filter(status=Tree.STATUS_ACTIVE)
@@ -309,6 +334,21 @@ class HomeView(ManagerOrSuperAdminRequiredMixin, TemplateView):
         }
 
 
+def _bad_amounts_message(date, quantities):
+    """A message if the chosen date is in the future or any typed quantity is
+    negative — checked server-side because the form's min/max attributes are
+    only a convenience."""
+    if date > timezone.localdate():
+        return "The date can't be in the future."
+    for raw in (quantities or {}).values():
+        try:
+            if raw not in (None, "") and float(raw) < 0:
+                return "Quantities can't be negative."
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _is_ajax(request):
     """The one signal every write-action fetch() call on the Farm Map page
     sets (see farm_map.html's postJson()/getJson() helpers) to ask for a
@@ -334,6 +374,29 @@ def _recent_yield_by_block(block_ids):
     aggregation, not a new pattern. A farm with years of dense per-block
     harvest history would eventually want this pushed to a database-side
     query instead.
+
+    Update — asked directly for a compliance-grade maker-checker flow:
+    ActualHarvest.get_effective_quantity() now returns None until the
+    parent Harvest plan is approved to "done" (see that method's own
+    docstring). This list shows every entry either way — using
+    get_reported_quantity() (the real, always-visible figure) rather than
+    the possibly-None effective one — with `pending_approval` marking the
+    ones that don't count toward official yield yet, so a Manager can see
+    what's waiting on them instead of it silently disappearing. The
+    per-block/farm "All-time" totals (_yield_totals_by_block() below)
+    still use the gated get_effective_quantity(), so this list and that
+    total deliberately don't always agree — the gap between them IS the
+    "pending approval" backlog.
+
+    Update — "in yield history there are no approve button": a pending
+    entry's parent plan needed approving from the "Harvest plans" list
+    instead, which isn't where a Manager scanning this list would look.
+    Each entry now also carries `harvest_id` and `can_approve` (same
+    can_advance() rule _plan_entries() uses — has_actual_record() is
+    skipped here since this *is* an actual record for that plan, so it's
+    always already satisfied) so the template can render an Approve
+    action right on the row itself, posting to the same
+    HarvestPlanApproveView either list already uses.
     """
     by_block = {}
     actual_harvests = (
@@ -344,8 +407,152 @@ def _recent_yield_by_block(block_ids):
     for actual in actual_harvests:
         bucket = by_block.setdefault(actual.harvest.farm_block_id, [])
         if len(bucket) < 10:
-            bucket.append({"date": actual.date.isoformat(), "quantity": actual.get_effective_quantity()})
+            pending = actual.harvest.status != PlanStatus.DONE
+            bucket.append({
+                "id": str(actual.id),
+                "date": actual.date.isoformat(),
+                "quantity": actual.get_reported_quantity(),
+                "pending_approval": pending,
+                "harvest_id": str(actual.harvest_id),
+                "can_approve": pending and can_advance(actual.harvest.status),
+            })
     return by_block
+
+
+def _recent_fertilizer_by_block(block_ids):
+    """Fertilizer's counterpart to _recent_yield_by_block() above — same
+    shape, same bounding, so the new "Fertilizer applications" list (and
+    its Edit/Delete actions) has something to read from, the same way the
+    harvest side already did before this round.
+    """
+    by_block = {}
+    actual_fertilizers = (
+        ActualFertilizer.objects.filter(fertilizer__farm_block_id__in=block_ids)
+        .select_related("fertilizer")
+        .order_by("-date")[:500]
+    )
+    for actual in actual_fertilizers:
+        bucket = by_block.setdefault(actual.fertilizer.farm_block_id, [])
+        if len(bucket) < 10:
+            pending = actual.fertilizer.status != PlanStatus.DONE
+            bucket.append({
+                "id": str(actual.id),
+                "date": actual.date.isoformat(),
+                "pending_approval": pending,
+                "fertilizer_id": str(actual.fertilizer_id),
+                "can_approve": pending and can_advance(actual.fertilizer.status),
+                "quantity": actual.get_reported_quantity(),
+            })
+    return by_block
+
+
+def _yield_totals_by_block(block_ids):
+    """All-time per-block harvest total (sum of every ActualHarvest's own
+    get_effective_quantity()) — powers the new yield-summary line on the
+    Farm Map's block/farm panels.
+
+    Calls get_effective_quantity() itself (the model's own authoritative
+    "manual total wins whenever set, tree-sum is only a fallback" rule —
+    apps/operations/models.py) per row, rather than annotating a
+    `Sum("harvest_trees__quantity")` and picking between the two here —
+    that annotate-then-override shape looks equivalent but isn't: Django's
+    Sum silently ignores NULL rows and still returns a real (non-None)
+    number the moment even ONE sibling HarvestTree has a quantity, which
+    would make a manually-reported total get quietly overridden by a
+    partial tree-sum again — exactly the bug get_effective_quantity() was
+    written to fix. Confirmed against this bug directly: 500+200 typed on
+    two trees, a manual total of 900 on the action itself, summed to 700
+    before this fix. Same Python-side "read what's needed, don't try to
+    re-aggregate an already-derived value in SQL" trade-off
+    _recent_yield_by_block() above already uses and documents.
+
+    Update — get_effective_quantity() now also gates on plan approval
+    (returns None until the Harvest plan is "done" — see that method's
+    own docstring), so this total only ever reflects approved yield. This
+    is deliberate, not a side effect to work around: _recent_yield_by_block()
+    above shows every entry, approved or not, specifically so this total
+    and that list visibly disagree while something is still pending.
+    """
+    totals = defaultdict(float)
+    actual_harvests = ActualHarvest.objects.filter(harvest__farm_block_id__in=block_ids).select_related("harvest")
+    for actual in actual_harvests:
+        effective = actual.get_effective_quantity()
+        if effective is not None:
+            totals[actual.harvest.farm_block_id] += effective
+    return totals
+
+
+def _fertilizer_totals_by_block(block_ids):
+    """Fertilizer's counterpart to _yield_totals_by_block() above — same
+    reasoning, mirrored for ActualFertilizer/FertilizerTree.
+    """
+    totals = defaultdict(float)
+    actual_fertilizers = (
+        ActualFertilizer.objects.filter(fertilizer__farm_block_id__in=block_ids).select_related("fertilizer")
+    )
+    for actual in actual_fertilizers:
+        effective = actual.get_effective_quantity()
+        if effective is not None:
+            totals[actual.fertilizer.farm_block_id] += effective
+    return totals
+
+
+def _rate_summary(total, area_ha, rate_total=None):
+    """Shared shape for every yield/fertilizer summary sent to the Farm Map
+    (block-level and farm-level alike) — total, the area it's measured
+    against (None if never recorded), and the derived per-hectare rate
+    (None, never a fabricated 0, when there's no area to divide by — same
+    "don't guess from missing data" principle effective_quantity already
+    follows).
+    """
+    return {
+        "total": round(total, 2),
+        "area_ha": area_ha,
+        # rate_total: only the part of `total` from blocks that have an area
+        # (farm rollups), so blocks without one don't inflate the per-ha rate.
+        "per_ha": round((total if rate_total is None else rate_total) / area_ha, 2) if area_ha else None,
+    }
+
+
+def _plan_has_actual(plan):
+    """Whether `plan` already has a recorded actual harvest/fertilizer —
+    see apps.operations.services.has_actual_record() for why this matters
+    (it's what gates the done_wait -> done transition there). Prefers the
+    `actual_count` annotation set on harvest_plans_by_block/
+    fertilizer_plans_by_block's querysets below, to avoid one extra query
+    per plan; falls back to a direct .exists() check for a plan that
+    wasn't annotated (e.g. reused from somewhere else in the future).
+    """
+    count = getattr(plan, "actual_count", None)
+    if count is not None:
+        return count > 0
+    return has_actual_record(plan)
+
+
+def _plan_entries(plans):
+    return [
+        {
+            "id": str(plan.id),
+            "assessment_date": plan.assessment_date.isoformat(),
+            "assessment_quantity": getattr(plan, "assessment_quantity", None),
+            "status": plan.status,
+            "status_display": plan.get_status_display(),
+            # can_advance(status) alone isn't enough — advance_status()
+            # (apps/operations/services.py) now refuses EVERY approval
+            # step, not just done_wait -> done, with no actual record yet
+            # (services.has_actual_record()), so the button here has to
+            # reflect the same rule or it'd show as clickable and then
+            # fail server-side. Reported directly: a bare plan with zero
+            # actuals could still be approved created -> created_confirmed
+            # — "there are no need approve for harvest plan, only approve
+            # harvest plan that already inputted by the pic block."
+            "can_approve": can_advance(plan.status) and _plan_has_actual(plan),
+            # Lets the template explain *why* the button is missing,
+            # rather than a Manager just not seeing it with no context.
+            "needs_actual_to_approve": can_advance(plan.status) and not _plan_has_actual(plan),
+        }
+        for plan in plans
+    ]
 
 
 def _build_farm_map_data(request):
@@ -381,6 +588,29 @@ def _build_farm_map_data(request):
     )
     block_ids = [b.id for b in blocks]
     recent_yield_by_block = _recent_yield_by_block(block_ids)
+    recent_fertilizer_by_block = _recent_fertilizer_by_block(block_ids)
+    yield_totals_by_block = _yield_totals_by_block(block_ids)
+    fertilizer_totals_by_block = _fertilizer_totals_by_block(block_ids)
+
+    harvest_plans_by_block = defaultdict(list)
+    harvest_plans_qs = (
+        Harvest.objects.filter(farm_block_id__in=block_ids)
+        # actual_count feeds _plan_has_actual() in _plan_entries() below —
+        # annotated here so it's one query for every plan in this request
+        # rather than one .exists() query per plan.
+        .annotate(actual_count=Count("actual_harvests", distinct=True))
+        .order_by("-assessment_date")
+    )
+    for plan in harvest_plans_qs:
+        harvest_plans_by_block[plan.farm_block_id].append(plan)
+    fertilizer_plans_by_block = defaultdict(list)
+    fertilizer_plans_qs = (
+        Fertilizer.objects.filter(farm_block_id__in=block_ids)
+        .annotate(actual_count=Count("actual_fertilizers", distinct=True))
+        .order_by("-assessment_date")
+    )
+    for plan in fertilizer_plans_qs:
+        fertilizer_plans_by_block[plan.farm_block_id].append(plan)
 
     # Which uploaded images have actually been PROCESSED against each
     # block, and (when the clip succeeded) their block-scoped clipped
@@ -425,8 +655,40 @@ def _build_farm_map_data(request):
                 }
             )
 
+    # Farm-level yield/fertilizer rollups — summed from each farm's own
+    # blocks, not a separate query. area_ha only counts blocks that have one
+    # recorded (a block with no area contributes to the total but not the
+    # denominator, same "don't dilute/fabricate from missing data"
+    # principle _rate_summary() above already documents).
+    farm_yield_total = defaultdict(float)
+    farm_fertilizer_total = defaultdict(float)
+    farm_area_ha = defaultdict(float)
+    farm_yield_rated = defaultdict(float)
+    farm_fertilizer_rated = defaultdict(float)
+    for block in blocks:
+        farm_yield_total[block.farm_id] += yield_totals_by_block.get(block.id, 0.0)
+        farm_fertilizer_total[block.farm_id] += fertilizer_totals_by_block.get(block.id, 0.0)
+        if block.area:
+            farm_area_ha[block.farm_id] += block.area
+            farm_yield_rated[block.farm_id] += yield_totals_by_block.get(block.id, 0.0)
+            farm_fertilizer_rated[block.farm_id] += fertilizer_totals_by_block.get(block.id, 0.0)
+
     return {
-        "farms": [{"id": str(farm.id), "name": farm.name} for farm in farms],
+        "farms": [
+            {
+                "id": str(farm.id),
+                "name": farm.name,
+                "yield_summary": _rate_summary(
+                    farm_yield_total.get(farm.id, 0.0), farm_area_ha.get(farm.id) or None,
+                    farm_yield_rated.get(farm.id, 0.0),
+                ),
+                "fertilizer_summary": _rate_summary(
+                    farm_fertilizer_total.get(farm.id, 0.0), farm_area_ha.get(farm.id) or None,
+                    farm_fertilizer_rated.get(farm.id, 0.0),
+                ),
+            }
+            for farm in farms
+        ],
         "blocks": [
             {
                 "id": str(block.id),
@@ -447,6 +709,18 @@ def _build_farm_map_data(request):
                 # Read-only yield-by-date history — see _recent_yield_by_block()
                 # above. Newest first, capped at 10 rows.
                 "recent_yield": recent_yield_by_block.get(block.id, []),
+                # Fertilizer's counterpart — see _recent_fertilizer_by_block()
+                # above.
+                "recent_fertilizer": recent_fertilizer_by_block.get(block.id, []),
+                # All-time yield/fertilizer totals — see _rate_summary()/
+                # _yield_totals_by_block()/_fertilizer_totals_by_block() above.
+                "yield_summary": _rate_summary(yield_totals_by_block.get(block.id, 0.0), block.area),
+                "fertilizer_summary": _rate_summary(fertilizer_totals_by_block.get(block.id, 0.0), block.area),
+                # Harvest/Fertilizer plan (assessment) rows for this block —
+                # see _plan_entries() above. Newest first, unbounded (a
+                # block realistically has a handful of plans, not hundreds).
+                "harvest_plans": _plan_entries(harvest_plans_by_block.get(block.id, [])),
+                "fertilizer_plans": _plan_entries(fertilizer_plans_by_block.get(block.id, [])),
                 # IDs into the top-level "images" list below that have
                 # actually been processed against this block — see
                 # processed_image_ids_by_block above.
@@ -464,7 +738,7 @@ def _build_farm_map_data(request):
                 "id": str(tree.id),
                 "farm_id": str(tree.farm_block.farm_id),
                 "block_id": str(tree.farm_block_id),
-                "name": tree.name or str(tree.id)[:8],
+                "name": tree.label,
                 "source": tree.source,
                 "source_display": tree.get_source_display(),
                 "health": tree.current_health,
@@ -523,8 +797,54 @@ def _build_farm_map_data(request):
             "harvest_plan_add": reverse(
                 "dashboard:harvest-plan-add", kwargs={"block_id": _URL_PLACEHOLDER_UUID}
             ),
+            "harvest_plan_edit": reverse(
+                "dashboard:harvest-plan-edit",
+                kwargs={"block_id": _URL_PLACEHOLDER_UUID, "harvest_id": _URL_PLACEHOLDER_UUID_2},
+            ),
+            "harvest_plan_delete": reverse(
+                "dashboard:harvest-plan-delete",
+                kwargs={"block_id": _URL_PLACEHOLDER_UUID, "harvest_id": _URL_PLACEHOLDER_UUID_2},
+            ),
+            "harvest_plan_approve": reverse(
+                "dashboard:harvest-plan-approve",
+                kwargs={"block_id": _URL_PLACEHOLDER_UUID, "harvest_id": _URL_PLACEHOLDER_UUID_2},
+            ),
             "fertilizer_plan_add": reverse(
                 "dashboard:fertilizer-plan-add", kwargs={"block_id": _URL_PLACEHOLDER_UUID}
+            ),
+            "fertilizer_plan_edit": reverse(
+                "dashboard:fertilizer-plan-edit",
+                kwargs={"block_id": _URL_PLACEHOLDER_UUID, "fertilizer_id": _URL_PLACEHOLDER_UUID_2},
+            ),
+            "fertilizer_plan_delete": reverse(
+                "dashboard:fertilizer-plan-delete",
+                kwargs={"block_id": _URL_PLACEHOLDER_UUID, "fertilizer_id": _URL_PLACEHOLDER_UUID_2},
+            ),
+            "fertilizer_plan_approve": reverse(
+                "dashboard:fertilizer-plan-approve",
+                kwargs={"block_id": _URL_PLACEHOLDER_UUID, "fertilizer_id": _URL_PLACEHOLDER_UUID_2},
+            ),
+            "harvest_record": reverse(
+                "dashboard:harvest-record", kwargs={"block_id": _URL_PLACEHOLDER_UUID}
+            ),
+            "harvest_actual_edit": reverse(
+                "dashboard:harvest-actual-edit",
+                kwargs={"block_id": _URL_PLACEHOLDER_UUID, "actual_id": _URL_PLACEHOLDER_UUID_2},
+            ),
+            "harvest_actual_delete": reverse(
+                "dashboard:harvest-actual-delete",
+                kwargs={"block_id": _URL_PLACEHOLDER_UUID, "actual_id": _URL_PLACEHOLDER_UUID_2},
+            ),
+            "fertilizer_record": reverse(
+                "dashboard:fertilizer-record", kwargs={"block_id": _URL_PLACEHOLDER_UUID}
+            ),
+            "fertilizer_actual_edit": reverse(
+                "dashboard:fertilizer-actual-edit",
+                kwargs={"block_id": _URL_PLACEHOLDER_UUID, "actual_id": _URL_PLACEHOLDER_UUID_2},
+            ),
+            "fertilizer_actual_delete": reverse(
+                "dashboard:fertilizer-actual-delete",
+                kwargs={"block_id": _URL_PLACEHOLDER_UUID, "actual_id": _URL_PLACEHOLDER_UUID_2},
             ),
             "trees_mark_harvested": reverse(
                 "dashboard:trees-mark-harvested", kwargs={"block_id": _URL_PLACEHOLDER_UUID}
@@ -544,9 +864,13 @@ def _build_farm_map_data(request):
             "tree_care_history": reverse(
                 "dashboard:tree-care-history", kwargs={"tree_id": _URL_PLACEHOLDER_UUID}
             ),
+            "block_care_history": reverse(
+                "dashboard:block-care-history", kwargs={"block_id": _URL_PLACEHOLDER_UUID}
+            ),
             "farm_map": reverse("dashboard:farms"),
         },
         "url_placeholder": _URL_PLACEHOLDER_UUID,
+        "url_placeholder_2": _URL_PLACEHOLDER_UUID_2,
         # Read by farm_map.html's own in-page upload form — same setting
         # ImageListUploadView's full-page form already uses, so the two
         # surfaces can't quietly disagree on chunk size.
@@ -1016,8 +1340,8 @@ class TreeCreateView(ManagerOrSuperAdminRequiredMixin, TemplateView):
             "boundary": geometry_to_6dp_geojson(self.block.boundary) if self.block.boundary else None,
             "existing_point": None,
             "other_trees": [
-                {"name": t.name or str(t.id)[:8], "geometry": geometry_to_6dp_geojson(t.location)}
-                for t in self.block.trees.filter(status=Tree.STATUS_ACTIVE)
+                {"name": t.label, "geometry": geometry_to_6dp_geojson(t.location)}
+                for t in self.block.trees.filter(status=Tree.STATUS_ACTIVE).select_related("farm_block")
             ],
         }
         return context
@@ -1070,7 +1394,7 @@ class TreeUpdateView(ManagerOrSuperAdminRequiredMixin, TemplateView):
             tree.location = Point(float(lng), float(lat), srid=4326)
         tree.updated_by = request.user
         tree.save()
-        message = f"Tree “{tree.name or str(tree.id)[:8]}” updated."
+        message = f"Tree “{tree.label}” updated."
         if _is_ajax(request):
             return JsonResponse({
                 "ok": True,
@@ -1091,8 +1415,8 @@ class TreeUpdateView(ManagerOrSuperAdminRequiredMixin, TemplateView):
             "boundary": geometry_to_6dp_geojson(self.block.boundary) if self.block.boundary else None,
             "existing_point": geometry_to_6dp_geojson(self.tree.location),
             "other_trees": [
-                {"name": t.name or str(t.id)[:8], "geometry": geometry_to_6dp_geojson(t.location)}
-                for t in self.block.trees.filter(status=Tree.STATUS_ACTIVE).exclude(id=self.tree.id)
+                {"name": t.label, "geometry": geometry_to_6dp_geojson(t.location)}
+                for t in self.block.trees.filter(status=Tree.STATUS_ACTIVE).select_related("farm_block").exclude(id=self.tree.id)
             ],
         }
         return context
@@ -1112,7 +1436,7 @@ class TreeRemoveView(ManagerOrSuperAdminRequiredMixin, View):
         tree.status = Tree.STATUS_REMOVED
         tree.updated_by = request.user
         tree.save(update_fields=["status", "updated_by", "updated_at"])
-        message = f"Tree “{tree.name or str(tree.id)[:8]}” marked removed."
+        message = f"Tree “{tree.label}” marked removed."
         if _is_ajax(request):
             return JsonResponse({
                 "ok": True,
@@ -1169,10 +1493,18 @@ class TreeCareHistoryView(ManagerOrSuperAdminRequiredMixin, View):
     TreeCareRecord rows (apps/trees/models.py), one per "mark
     harvested"/"mark fertilized" completion from either surface (the PWA's
     mark_harvested/mark_fertilized API actions, or this dashboard's own
-    MarkTreesHarvestedView/MarkTreesFertilizedView). Mirrors
-    TreeHealthHistoryView immediately above — same on-demand-fetch shape,
-    same reasoning for not baking this into _build_farm_map_data() (a farm
-    block can hold over a thousand trees; see that view's own docstring).
+    MarkTreesHarvestedView/MarkTreesFertilizedView), plus (since `action`
+    was added) one per stage-1 "needs" assignment this tree was ever part
+    of. Mirrors TreeHealthHistoryView immediately above — same
+    on-demand-fetch shape, same reasoning for not baking this into
+    _build_farm_map_data() (a farm block can hold over a thousand trees;
+    see that view's own docstring).
+
+    Not grouped by batch_id like BlockCareHistoryView below — a single
+    bulk action can only ever include a given tree once (it's a checkbox
+    selection), so scoped to one tree every row is already its own
+    complete "this happened" entry; batching only matters once you're
+    looking across many trees at once.
 
     Both kinds are returned together, newest first, with `kind` on each
     entry so the panel can label/group them — a tree's harvest and
@@ -1193,6 +1525,8 @@ class TreeCareHistoryView(ManagerOrSuperAdminRequiredMixin, View):
                 "date": r.date.isoformat(),
                 "kind": r.kind,
                 "kind_display": r.get_kind_display(),
+                "action": r.action,
+                "action_display": r.get_action_display(),
                 "quantity": r.quantity,
                 "recorded_by_name": r.recorded_by.get_full_name() or r.recorded_by.username if r.recorded_by else None,
             }
@@ -1201,28 +1535,259 @@ class TreeCareHistoryView(ManagerOrSuperAdminRequiredMixin, View):
         return JsonResponse({"history": history})
 
 
-class HarvestPlanCreateView(ManagerOrSuperAdminRequiredMixin, TemplateView):
-    """Creates a block-level Harvest plan from the Farm Map panel — this is
-    the "choosing trees for harvest/field logging" entry point from the
-    project owner's original direction, phased per the explicitly agreed
-    "Phase 2 first" sequencing: block-level only for now, since Harvest has
-    no tree-level scoping field yet (confirmed by reading
-    apps/operations/models.py before planning, not assumed). Selecting
-    individual trees on the map before reaching this form is a client-side
-    visual affordance only (see farm_map.html) — nothing about which trees
-    were checked is sent here or persisted. Real tree-level harvest
-    scoping (a HarvestTree-style planning link, a dedicated approval
-    screen surfacing per-tree detail, PWA plan selection) is explicitly
-    deferred to a later, separate round — see BUILD_STATUS.md "Farm Map
-    unification".
+class BlockCareHistoryView(ManagerOrSuperAdminRequiredMixin, View):
+    """Block-wide harvest/fertilizer marking history — grouped by the
+    bulk mark/record ACTION (TreeCareRecord.batch_id), not one row per
+    tree per completion. Backs the Harvest/Fertilizer section panels
+    (farm_map.html's renderBlockSectionPanel()).
+
+    Originally returned one flat row per TreeCareRecord, each labelled
+    with its own tree — reported directly as wrong: "the harvest marking
+    history is not the each tree history but the marking history itself,"
+    e.g. marking 3 trees as needing harvest on one date should show as ONE
+    history entry (how many trees, and for a completion, the total
+    quantity), not 3 separate lines — and clicking that entry should
+    highlight just those trees on the map, not jump into one of them.
+    Every row from the same bulk submission already shares one batch_id
+    (see TreeCareRecord's own docstring), so grouping by it here is enough
+    to reconstruct "one action" without a separate batch table.
+
+    Two passes, not one capped slice — a single bulk action can now cover
+    however many trees a block actually holds (confirmed directly: a
+    600-tree "Record harvest directly" selection, the exact scale the
+    tree_ids/quantities JSON-payload fix above exists for). A single
+    `[:N]` slice on the raw TreeCareRecord rows would risk cutting off
+    partway through one large batch and silently under-reporting its own
+    tree_count/total_quantity — reproduced exactly that during testing (a
+    600-tree batch showed as "400 trees, 5000 bunches" under the old
+    400-row cap). So: pass 1 walks the ordered rows only far enough to
+    collect the 50 most recent DISTINCT batch_ids (cheap — most batches
+    are a handful of trees), then pass 2 fetches every row belonging to
+    just those batches, however many that turns out to be, so each
+    batch's own totals are always complete.
     """
 
-    template_name = "dashboard/harvest_plan_form.html"
+    HISTORY_BATCH_LIMIT = 500  # the PWA marks one tree per batch, so 50 covered only a day or two of field work
+
+    def get(self, request, block_id):
+        block = get_object_or_404(_viewset_queryset(FarmBlockViewSet, request), id=block_id)
+        _require_manager_for_farm(request.user, block.farm)
+
+        ordered_batch_ids = (
+            TreeCareRecord.objects.filter(tree__farm_block_id=block.id)
+            .order_by("-date", "-recorded_at")
+            .values_list("batch_id", flat=True)
+        )
+        recent_batch_ids = []
+        seen = set()
+        for batch_id in ordered_batch_ids.iterator():
+            if batch_id not in seen:
+                seen.add(batch_id)
+                recent_batch_ids.append(batch_id)
+                if len(recent_batch_ids) >= self.HISTORY_BATCH_LIMIT:
+                    break
+
+        records = (
+            TreeCareRecord.objects.filter(batch_id__in=recent_batch_ids)
+            .select_related("recorded_by", "tree")
+        )
+        batches = {}
+        for r in records:
+            batch = batches.get(r.batch_id)
+            if batch is None:
+                batch = {
+                    "batch_id": str(r.batch_id),
+                    "date": r.date.isoformat(),
+                    "kind": r.kind,
+                    "kind_display": r.get_kind_display(),
+                    "action": r.action,
+                    "action_display": r.get_action_display(),
+                    "recorded_by_name": r.recorded_by.get_full_name() or r.recorded_by.username if r.recorded_by else None,
+                    "tree_ids": [],
+                    "quantities": [],
+                }
+                batches[r.batch_id] = batch
+            batch["tree_ids"].append(str(r.tree_id))
+            if r.quantity is not None:
+                batch["quantities"].append(r.quantity)
+
+        history = []
+        for batch_id in recent_batch_ids:
+            batch = batches[batch_id]
+            quantities = batch.pop("quantities")
+            batch["tree_count"] = len(batch["tree_ids"])
+            batch["total_quantity"] = sum(quantities) if quantities else None
+            history.append(batch)
+        return JsonResponse({"history": history})
+
+
+class _MarkTreesActionMixin:
+    """Shared plumbing for every "select trees on the map, then confirm one
+    action" view below — stage-1 assignment (_MarkTreesNeedView) and
+    completion (_MarkTreesView) alike, plus HarvestPlanCreateView's own
+    tree checklist. POST-only, no GET/form-fragment branch: there's no
+    separate form to fetch, the tree-selection UI it submits from is
+    already live in the panel (renderTreeSelectionChecklist()/
+    renderMarkTreesSection() in farm_map.html) — this is "confirm the
+    selection I'm already looking at," not "open a form." (HarvestPlanCreateView
+    is the one exception — it does fetch/submit a real form, for the plan's
+    own assessment_date/assessment_quantity fields, but reuses this mixin's
+    tree-selection helpers for the checklist embedded in that same screen.)
+    """
 
     def _get_block(self):
         block = get_object_or_404(_viewset_queryset(FarmBlockViewSet, self.request), id=self.kwargs["block_id"])
         _require_manager_for_farm(self.request.user, block.farm)
         return block
+
+    def _get_selected_trees(self, request, block):
+        tree_ids = self._tree_ids_from_request(request)
+        if not tree_ids:
+            return None
+        return Tree.objects.filter(id__in=tree_ids, farm_block=block, status=Tree.STATUS_ACTIVE)
+
+    def _tree_ids_from_request(self, request):
+        """Reads the selected tree ids from ONE JSON-encoded `tree_ids`
+        field, not one `tree_ids` POST field per tree. Reported directly,
+        with a real reproduction: lasso-selecting roughly half of a
+        ~1000-tree block ("Record harvest directly," which also sends a
+        `quantity_<id>` field per tree — see the old _quantity_for below)
+        pushed the total POST field count past Django's
+        DATA_UPLOAD_MAX_NUMBER_FIELDS (1000), which fails the WHOLE
+        request with a 400 before this view ever runs — the frontend could
+        only report that as a generic "couldn't save." A single JSON field
+        scales to however many trees a block actually holds, independent
+        of the selection size.
+        """
+        raw = request.POST.get("tree_ids") or "[]"
+        try:
+            parsed = _json.loads(raw)
+        except (TypeError, ValueError):
+            return []
+        return [str(i) for i in parsed] if isinstance(parsed, list) else []
+
+    def _no_selection_response(self, request, block):
+        message = "Select at least one tree first."
+        if _is_ajax(request):
+            return JsonResponse({"ok": False, "message": message}, status=400)
+        messages.error(request, message)
+        return redirect(f"{reverse('dashboard:farms')}?block={block.id}")
+
+    def _quantities_from_request(self, request):
+        """Reads every tree's optional quantity from ONE JSON-encoded
+        `quantities` field (`{tree_id: value}`), not one `quantity_<id>`
+        field per tree — see _tree_ids_from_request()'s docstring above for
+        why one-field-per-tree doesn't scale to a real block's tree count.
+        Different trees still yield different amounts (this is a dict, not
+        a single shared value); a blank/missing/unparseable entry is a
+        normal input for this optional field, not an error — same
+        reasoning as the API path's _mark_done(). Moved up from
+        _MarkTreesView (below) so RecordActualHarvestView/
+        RecordActualFertilizerView can reuse the exact same decoding.
+        """
+        raw = request.POST.get("quantities") or "{}"
+        try:
+            parsed = _json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _quantity_for(self, quantities, tree_id):
+        raw = quantities.get(str(tree_id))
+        if raw in (None, ""):
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _success_response(self, request, block, message):
+        if _is_ajax(request):
+            return JsonResponse({
+                "ok": True,
+                "message": message,
+                "farm_map_data": _build_farm_map_data(request),
+                "focus": {"type": "block", "id": str(block.id)},
+            })
+        messages.success(request, message)
+        return redirect(f"{reverse('dashboard:farms')}?block={block.id}")
+
+    def _mark_trees_done(
+        self, request, trees, date, quantities, *, date_field, quantity_field, marked_at_field, marked_by_field, kind,
+    ):
+        """Completes each tree: sets its last-done date and quantity
+        (`quantities` maps tree id → value or None), clears its "needs …"
+        flag, and logs one TreeCareRecord per tree sharing a batch_id. Used
+        by the "mark done" views and by Record harvest, so recording a
+        harvest also updates the trees the same way. Saves per tree, not a
+        bulk .update(), so simple_history records each change.
+        """
+        batch_id = uuid.uuid4()
+        for tree in trees:
+            quantity = quantities.get(tree.id)
+            setattr(tree, date_field, date)
+            setattr(tree, quantity_field, quantity)
+            setattr(tree, marked_at_field, None)
+            setattr(tree, marked_by_field, None)
+            tree.updated_by = request.user
+            tree.save(update_fields=[date_field, quantity_field, marked_at_field, marked_by_field, "updated_by", "updated_at"])
+            TreeCareRecord.objects.create(
+                tree=tree, kind=kind, action=TreeCareRecord.ACTION_COMPLETED,
+                date=date, quantity=quantity, recorded_by=request.user, batch_id=batch_id,
+            )
+        return len(trees)
+
+    def _mark_trees_needing(self, request, trees, marked_at_field, marked_by_field, kind):
+        """The actual "flag these trees" write — sets Tree.harvest_marked_at/
+        harvest_marked_by (or the fertilizer equivalents) and logs one
+        TreeCareRecord per tree sharing a batch_id, same as
+        _MarkTreesNeedView.post() below (which this was pulled out of).
+        Shared so HarvestPlanCreateView can mark a plan's selected trees
+        exactly the same way "Mark trees needing harvest" already does,
+        rather than a second, drifting copy of the same loop — requested
+        directly: "move this feature into plan harvest - select trees. so
+        selected trees in plan-harvest is marked." Returns the count marked.
+        """
+        now = timezone.now()
+        marked_date = timezone.localdate()
+        batch_id = uuid.uuid4()
+        count = 0
+        for tree in trees:
+            setattr(tree, marked_at_field, now)
+            setattr(tree, marked_by_field, request.user)
+            tree.updated_by = request.user
+            tree.save(update_fields=[marked_at_field, marked_by_field, "updated_by", "updated_at"])
+            TreeCareRecord.objects.create(
+                tree=tree, kind=kind, action=TreeCareRecord.ACTION_NEEDED,
+                date=marked_date, quantity=None, recorded_by=request.user, batch_id=batch_id,
+            )
+            count += 1
+        return count
+
+
+class HarvestPlanCreateView(_MarkTreesActionMixin, ManagerOrSuperAdminRequiredMixin, TemplateView):
+    """Creates a block-level Harvest plan from the Farm Map panel. The plan
+    itself stays block-level — Harvest has no tree-level scoping field
+    (docs/03-data-model.md), and that's an explicit, separate scope
+    decision, not something this view changes.
+
+    Update — the tree checklist on this screen ("Plan harvest — select
+    trees") used to be a client-side visual affordance only: nothing about
+    which trees were checked was ever sent here or persisted, which
+    surprised a user who selected 9 trees and found none of them showing
+    up as "needing harvest" anywhere. Asked directly to fix this by moving
+    "Mark trees needing harvest"'s own behavior into this flow instead of
+    building separate tree-level plan scoping — selecting trees here now
+    marks them via the exact same `_mark_trees_needing()`
+    (_MarkTreesActionMixin, above) that `MarkTreesNeedHarvestView` calls,
+    so both entry points behave identically and share one implementation.
+    Selecting zero trees still creates a plan with nothing marked, exactly
+    as before — the tree checklist remains optional here, unlike the
+    dedicated "Mark trees needing harvest" action where a selection is
+    required.
+    """
+
+    template_name = "dashboard/harvest_plan_form.html"
 
     def get(self, request, *args, **kwargs):
         self.block = self._get_block()
@@ -1245,7 +1810,19 @@ class HarvestPlanCreateView(ManagerOrSuperAdminRequiredMixin, TemplateView):
         plan = self.form.save(commit=False)
         plan.farm_block = self.block
         plan.save()
+
+        # Selecting trees on this screen is optional — a Manager who just
+        # wants a block-level plan with no specific trees flagged yet
+        # still has that option, same as before this feature existed.
+        trees = self._get_selected_trees(request, self.block)
+        marked_count = (
+            self._mark_trees_needing(request, trees, "harvest_marked_at", "harvest_marked_by", TreeCareRecord.KIND_HARVEST)
+            if trees is not None else 0
+        )
+
         message = f"Harvest plan created for “{self.block.name}”."
+        if marked_count:
+            message += f" {marked_count} tree{'s' if marked_count != 1 else ''} marked as needing harvest."
         if _is_ajax(request):
             return JsonResponse({
                 "ok": True,
@@ -1263,7 +1840,7 @@ class HarvestPlanCreateView(ManagerOrSuperAdminRequiredMixin, TemplateView):
         return context
 
 
-class FertilizerPlanCreateView(ManagerOrSuperAdminRequiredMixin, TemplateView):
+class FertilizerPlanCreateView(_MarkTreesActionMixin, ManagerOrSuperAdminRequiredMixin, TemplateView):
     """Creates a block-level Fertilizer plan from the Farm Map panel — the
     fertilizer counterpart to HarvestPlanCreateView above, added after
     direct feedback asking where the fertilizer process was on the map
@@ -1299,7 +1876,17 @@ class FertilizerPlanCreateView(ManagerOrSuperAdminRequiredMixin, TemplateView):
         plan = self.form.save(commit=False)
         plan.farm_block = self.block
         plan.save()
+        # Same as HarvestPlanCreateView: trees checked while planning are
+        # marked as needing fertilizer (optional — none checked is fine).
+        trees = self._get_selected_trees(request, self.block)
+        marked_count = (
+            self._mark_trees_needing(
+                request, trees, "fertilizer_marked_at", "fertilizer_marked_by", TreeCareRecord.KIND_FERTILIZER,
+            ) if trees is not None else 0
+        )
         message = f"Fertilizer plan created for “{self.block.name}”."
+        if marked_count:
+            message += f" {marked_count} tree{'s' if marked_count != 1 else ''} marked as needing fertilizer."
         if _is_ajax(request):
             return JsonResponse({
                 "ok": True,
@@ -1317,46 +1904,6 @@ class FertilizerPlanCreateView(ManagerOrSuperAdminRequiredMixin, TemplateView):
         return context
 
 
-class _MarkTreesActionMixin:
-    """Shared plumbing for every "select trees on the map, then confirm one
-    action" view below — stage-1 assignment (_MarkTreesNeedView) and
-    completion (_MarkTreesView) alike. POST-only, no GET/form-fragment
-    branch: there's no separate form to fetch, the tree-selection UI it
-    submits from is already live in the panel (renderTreeSelectionChecklist()/
-    renderMarkTreesSection() in farm_map.html) — this is "confirm the
-    selection I'm already looking at," not "open a form."
-    """
-
-    def _get_block(self):
-        block = get_object_or_404(_viewset_queryset(FarmBlockViewSet, self.request), id=self.kwargs["block_id"])
-        _require_manager_for_farm(self.request.user, block.farm)
-        return block
-
-    def _get_selected_trees(self, request, block):
-        tree_ids = request.POST.getlist("tree_ids")
-        if not tree_ids:
-            return None
-        return Tree.objects.filter(id__in=tree_ids, farm_block=block, status=Tree.STATUS_ACTIVE)
-
-    def _no_selection_response(self, request, block):
-        message = "Select at least one tree first."
-        if _is_ajax(request):
-            return JsonResponse({"ok": False, "message": message}, status=400)
-        messages.error(request, message)
-        return redirect(f"{reverse('dashboard:farms')}?block={block.id}")
-
-    def _success_response(self, request, block, message):
-        if _is_ajax(request):
-            return JsonResponse({
-                "ok": True,
-                "message": message,
-                "farm_map_data": _build_farm_map_data(request),
-                "focus": {"type": "block", "id": str(block.id)},
-            })
-        messages.success(request, message)
-        return redirect(f"{reverse('dashboard:farms')}?block={block.id}")
-
-
 class _MarkTreesNeedView(_MarkTreesActionMixin, ManagerOrSuperAdminRequiredMixin, View):
     """Stage 1 of the two-stage harvest/fertilizer workflow — a Manager
     flags which trees need harvesting/fertilizing, from the office, before
@@ -1367,11 +1914,21 @@ class _MarkTreesNeedView(_MarkTreesActionMixin, ManagerOrSuperAdminRequiredMixin
     done) is deliberately NOT here — it's apps.trees.views.TreeViewSet's
     mark_harvested/mark_fertilized API actions, reached from the PWA, per
     this app's existing Manager-dashboard/PIC-Block-PWA split.
+
+    Also logs one TreeCareRecord per tree (action=ACTION_NEEDED, no
+    quantity — nothing's actually happened yet) sharing a single batch_id
+    for the whole request. Reported directly: this assignment previously
+    left no trace once the "needs" pending list moved on (the tree gets
+    completed, or reassigned later) — only Tree.harvest_marked_at existed,
+    which this action itself immediately clears again on completion. The
+    block-wide history (BlockCareHistoryView) is what actually surfaces
+    these, grouped by batch_id into one "N trees marked needing X" entry.
     """
 
     marked_at_field = None  # "harvest_marked_at" or "fertilizer_marked_at" — set by subclass
     marked_by_field = None  # "harvest_marked_by" or "fertilizer_marked_by" — set by subclass
     verb = None  # "harvest" or "fertilizer" — set by subclass
+    kind = None  # TreeCareRecord.KIND_HARVEST or KIND_FERTILIZER — set by subclass
 
     def post(self, request, *args, **kwargs):
         block = self._get_block()
@@ -1379,14 +1936,7 @@ class _MarkTreesNeedView(_MarkTreesActionMixin, ManagerOrSuperAdminRequiredMixin
         if trees is None:
             return self._no_selection_response(request, block)
 
-        now = timezone.now()
-        count = 0
-        for tree in trees:
-            setattr(tree, self.marked_at_field, now)
-            setattr(tree, self.marked_by_field, request.user)
-            tree.updated_by = request.user
-            tree.save(update_fields=[self.marked_at_field, self.marked_by_field, "updated_by", "updated_at"])
-            count += 1
+        count = self._mark_trees_needing(request, trees, self.marked_at_field, self.marked_by_field, self.kind)
 
         message = f"Marked {count} tree{'s' if count != 1 else ''} as needing {self.verb} — the assigned PIC Block user will see this in the field app."
         return self._success_response(request, block, message)
@@ -1396,12 +1946,14 @@ class MarkTreesNeedHarvestView(_MarkTreesNeedView):
     marked_at_field = "harvest_marked_at"
     marked_by_field = "harvest_marked_by"
     verb = "harvest"
+    kind = TreeCareRecord.KIND_HARVEST
 
 
 class MarkTreesNeedFertilizeView(_MarkTreesNeedView):
     marked_at_field = "fertilizer_marked_at"
     marked_by_field = "fertilizer_marked_by"
     verb = "fertilizer"
+    kind = TreeCareRecord.KIND_FERTILIZER
 
 
 class _MarkTreesView(_MarkTreesActionMixin, ManagerOrSuperAdminRequiredMixin, View):
@@ -1431,24 +1983,6 @@ class _MarkTreesView(_MarkTreesActionMixin, ManagerOrSuperAdminRequiredMixin, Vi
     verb = None  # "harvested" or "fertilized" — set by subclass
     kind = None  # TreeCareRecord.KIND_HARVEST or KIND_FERTILIZER — set by subclass
 
-    def _quantity_for(self, request, tree_id):
-        """Reads `quantity_<tree_id>` — one optional field per row in the
-        selection checklist (renderMarkTreesSection() in farm_map.html),
-        not a single value shared across every selected tree. Different
-        trees yield different amounts; a lone quantity field applied to a
-        whole multi-tree selection would either be wrong for most of them
-        or silently encourage typing in a total and calling it per-tree.
-        Blank/missing/unparseable is a normal input for this optional
-        field, not an error — same reasoning as the API path's _mark_done().
-        """
-        raw = request.POST.get(f"quantity_{tree_id}")
-        if raw in (None, ""):
-            return None
-        try:
-            return float(raw)
-        except (TypeError, ValueError):
-            return None
-
     def post(self, request, *args, **kwargs):
         block = self._get_block()
         trees = self._get_selected_trees(request, block)
@@ -1456,22 +1990,16 @@ class _MarkTreesView(_MarkTreesActionMixin, ManagerOrSuperAdminRequiredMixin, Vi
             return self._no_selection_response(request, block)
 
         marked_date = parse_date(request.POST.get("date") or "") or timezone.localdate()
-        count = 0
-        for tree in trees:
-            quantity = self._quantity_for(request, tree.id)
-            setattr(tree, self.date_field, marked_date)
-            setattr(tree, self.quantity_field, quantity)
-            setattr(tree, self.marked_at_field, None)
-            setattr(tree, self.marked_by_field, None)
-            tree.updated_by = request.user
-            tree.save(update_fields=[
-                self.date_field, self.quantity_field, self.marked_at_field, self.marked_by_field,
-                "updated_by", "updated_at",
-            ])
-            TreeCareRecord.objects.create(
-                tree=tree, kind=self.kind, date=marked_date, quantity=quantity, recorded_by=request.user,
-            )
-            count += 1
+        quantities = self._quantities_from_request(request)
+        bad = _bad_amounts_message(marked_date, quantities)
+        if bad:
+            return JsonResponse({"ok": False, "message": bad}, status=400)
+        trees = list(trees)
+        count = self._mark_trees_done(
+            request, trees, marked_date, {tree.id: self._quantity_for(quantities, tree.id) for tree in trees},
+            date_field=self.date_field, quantity_field=self.quantity_field,
+            marked_at_field=self.marked_at_field, marked_by_field=self.marked_by_field, kind=self.kind,
+        )
 
         message = f"Marked {count} tree{'s' if count != 1 else ''} as {self.verb} ({marked_date.isoformat()})."
         return self._success_response(request, block, message)
@@ -1495,6 +2023,553 @@ class MarkTreesFertilizedView(_MarkTreesView):
     kind = TreeCareRecord.KIND_FERTILIZER
 
 
+# --- The operations pipeline's own dashboard UI (Harvest/ActualHarvest/
+# HarvestTree, Fertilizer/ActualFertilizer/FertilizerTree —
+# apps/operations/models.py). Built API-only through the last several
+# rounds (see BUILD_STATUS.md); requested directly, alongside making
+# farm/block yield actually visible once this pipeline has somewhere to
+# get its data from. Deliberately a separate model/path from
+# TreeCareRecord's own mark_harvested/mark_fertilized flows above — see
+# _MarkTreesView's own docstring for why those two don't share a table. ---
+
+
+class _RecordActualMixin(_MarkTreesActionMixin):
+    """Shared plumbing for RecordActualHarvestView/RecordActualFertilizerView
+    below — both create one "actual" row plus a per-tree row for every
+    selected tree, from the exact same tree_ids/quantities encoding
+    _MarkTreesActionMixin already reads, plus an optional `total_quantity`
+    field (the actual/action-level manual total — a real, distinct field on
+    ActualHarvest/ActualFertilizer that TreeCareRecord never had one for).
+    """
+
+    plan_model = None  # Harvest or Fertilizer — set by subclass
+    actual_model = None  # ActualHarvest or ActualFertilizer — set by subclass
+    tree_model = None  # HarvestTree or FertilizerTree — set by subclass
+    plan_fk_field = None  # "harvest" or "fertilizer" — the FK name on actual_model
+    actual_fk_field = None  # "actual_harvest" or "actual_fertilizer" — the FK name on tree_model
+    noun = None  # "harvest" or "fertilizer application" — set by subclass
+    # "weight_kg" for Harvest (asked directly to move every harvest record
+    # from bunch count to kg — weight_kg is now the authoritative field on
+    # both ActualHarvest and HarvestTree, see apps/operations/models.py)
+    # or "quantity" for Fertilizer (already kg-native, unchanged) — the
+    # field this view actually writes the reported total/per-tree value
+    # into. `quantity` stays a separate, optional bunch-count field on the
+    # Harvest side; nothing here ever touches it.
+    value_field = None
+    # When set, recording also completes the selected trees the way "Record
+    # harvest directly" used to (last-done date/quantity, clears "needs …",
+    # marking history) — kwargs for _mark_trees_done(). None keeps the two
+    # systems separate.
+    tree_completion = None
+
+    def _total_quantity_from_request(self, request):
+        raw = request.POST.get("total_quantity")
+        try:
+            return float(raw) if raw not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    def _advance_plan_progress(self, plan, finished):
+        """Recording an actual is what moves a plan out of "just created"
+        and toward "done" — the piece this pipeline was missing entirely.
+        `advance_status()` (apps/operations/services.py) can only ever
+        advance *out of* created/on_progress_wait/done_wait; nothing set a
+        plan TO on_progress_wait or done_wait in the first place, so a plan
+        could never actually reach Done through the UI no matter how much
+        real field work got recorded against it.
+
+        Mirrors the original Laravel app's own behavior (Palm_Vision_PDR.md
+        § 3.6 — `ActualFertilizerController::store` flips the parent's
+        status to DONE_WAIT or ON_PROGRESS_WAIT depending on whether the
+        submission was marked "finish"): the Manager still has to Approve
+        the final done_wait -> done step (and that step still refuses to
+        fire with zero actual records, per advance_status()'s own guard —
+        this is what makes that guard reachable at all), but recording an
+        actual is what signals "this plan has real progress against it,"
+        the same one-click way "Record harvest directly" already worked.
+
+        Never downgrades an already-Done plan — recording a further actual
+        against a completed plan is legitimate historical record-keeping,
+        not a reason to reopen it. The rule itself lives in
+        apps.operations.services.record_actual_progress(), shared with the
+        API path the PWA uses.
+        """
+        record_actual_progress(plan, finished)
+
+    def _get_open_or_new_plan(self, block, date, total_quantity, fallback_quantity):
+        """Reuses the block's own most recent still-open plan (status not
+        yet DONE) if one exists — an explicit "Plan harvest"/"Plan
+        fertilizer application" a Manager already created isn't silently
+        duplicated by then clicking "Record actual" — otherwise creates a
+        minimal one automatically, so recording an actual is a single click
+        the same way "Record harvest directly" already is (requested
+        directly rather than forcing a separate "create a plan first"
+        step).
+        """
+        plan = (
+            self.plan_model.objects.filter(farm_block=block)
+            .exclude(status=PlanStatus.DONE)
+            .order_by("-assessment_date")
+            .first()
+        )
+        if plan is not None:
+            return plan
+        create_kwargs = {"farm_block": block, "assessment_date": date}
+        if hasattr(self.plan_model, "assessment_quantity"):
+            create_kwargs["assessment_quantity"] = (
+                total_quantity if total_quantity is not None else (fallback_quantity or 0.0)
+            )
+        return self.plan_model.objects.create(**create_kwargs)
+
+    def post(self, request, *args, **kwargs):
+        block = self._get_block()
+        trees = self._get_selected_trees(request, block)
+        if trees is None:
+            return self._no_selection_response(request, block)
+        trees = list(trees)
+
+        date = parse_date(request.POST.get("date") or "") or timezone.localdate()
+        quantities = self._quantities_from_request(request)
+        total_quantity = self._total_quantity_from_request(request)
+        bad = _bad_amounts_message(date, {**quantities, "_total": total_quantity})
+        if bad:
+            return JsonResponse({"ok": False, "message": bad}, status=400)
+        finished = request.POST.get("finished") == "1"
+        per_tree = {tree.id: self._quantity_for(quantities, tree.id) for tree in trees}
+        fallback_quantity = sum(q for q in per_tree.values() if q is not None)
+
+        with transaction.atomic():
+            plan = self._get_open_or_new_plan(block, date, total_quantity, fallback_quantity)
+            actual = self.actual_model.objects.create(
+                **{self.plan_fk_field: plan}, date=date, **{self.value_field: total_quantity},
+            )
+            self.tree_model.objects.bulk_create([
+                self.tree_model(
+                    **{self.actual_fk_field: actual}, tree=tree, **{self.value_field: per_tree[tree.id]},
+                    recorded_by=request.user,
+                )
+                for tree in trees
+            ])
+            self._advance_plan_progress(plan, finished)
+            if self.tree_completion:
+                self._mark_trees_done(request, trees, date, per_tree, **self.tree_completion)
+        # Reads plan.status AFTER _advance_plan_progress() rather than
+        # assuming from `finished` — an already-Done plan is deliberately
+        # left untouched by that call, so the message has to reflect what
+        # actually happened, not what was requested.
+        status_notes = {
+            PlanStatus.DONE: "plan already marked done",
+            PlanStatus.DONE_WAIT: "plan awaiting approval as done",
+            PlanStatus.ON_PROGRESS_WAIT: "plan marked in progress",
+        }
+        status_note = status_notes.get(plan.status, f"plan status: {plan.get_status_display()}")
+        message = (
+            f"Recorded actual {self.noun} for {len(trees)} tree{'s' if len(trees) != 1 else ''} "
+            f"— {status_note}."
+        )
+        return self._success_response(request, block, message)
+
+
+class RecordActualHarvestView(_RecordActualMixin, ManagerOrSuperAdminRequiredMixin, View):
+    """Creates one ActualHarvest + a HarvestTree row per selected tree — see
+    _RecordActualMixin above for the shared logic. Per-tree weights are
+    saved exactly as typed (a blank stays blank —
+    HarvestTree.weight_kg=None — not auto-filled with a split share;
+    that's what HarvestTree.effective_quantity already computes at read
+    time).
+    """
+
+    plan_model = Harvest
+    actual_model = ActualHarvest
+    tree_model = HarvestTree
+    plan_fk_field = "harvest"
+    actual_fk_field = "actual_harvest"
+    noun = "harvest"
+    value_field = "weight_kg"
+    # Asked directly to consolidate the Harvest panel to two actions on one
+    # system: recording a harvest now also does what "Record harvest
+    # directly" did to the trees, so there's no separate button whose
+    # records never reach approval or yield. Harvest only for now — the
+    # Fertilizer panel waits on the user's go-ahead.
+    tree_completion = {
+        "date_field": "last_harvested_at",
+        "quantity_field": "last_harvest_quantity",
+        "marked_at_field": "harvest_marked_at",
+        "marked_by_field": "harvest_marked_by",
+        "kind": TreeCareRecord.KIND_HARVEST,
+    }
+
+
+class RecordActualFertilizerView(_RecordActualMixin, ManagerOrSuperAdminRequiredMixin, View):
+    """Fertilizer's counterpart to RecordActualHarvestView above."""
+
+    plan_model = Fertilizer
+    actual_model = ActualFertilizer
+    tree_model = FertilizerTree
+    plan_fk_field = "fertilizer"
+    actual_fk_field = "actual_fertilizer"
+    noun = "fertilizer application"
+    tree_completion = {
+        "date_field": "last_fertilized_at",
+        "quantity_field": "last_fertilizer_quantity",
+        "marked_at_field": "fertilizer_marked_at",
+        "marked_by_field": "fertilizer_marked_by",
+        "kind": TreeCareRecord.KIND_FERTILIZER,
+    }
+    value_field = "quantity"
+
+
+class _PlanUpdateView(ManagerOrSuperAdminRequiredMixin, TemplateView):
+    """Shared Update logic for Harvest/Fertilizer plans — same AJAX-first
+    shape as FarmBlockUpdateView, reusing the exact same create forms
+    (HarvestPlanForm/FertilizerPlanForm) with `instance=` rather than a
+    separate Update form, since the fields being edited are identical.
+    """
+
+    plan_model = None  # Harvest or Fertilizer — set by subclass
+    plan_form_class = None  # HarvestPlanForm or FertilizerPlanForm — set by subclass
+    partial_template_name = None  # the shared _partials/*.html fragment — set by subclass
+    url_kwarg = None  # "harvest_id" or "fertilizer_id" — set by subclass
+    plan_noun = None  # "Harvest" or "Fertilizer" — set by subclass
+
+    def _get_block(self):
+        block = get_object_or_404(_viewset_queryset(FarmBlockViewSet, self.request), id=self.kwargs["block_id"])
+        _require_manager_for_farm(self.request.user, block.farm)
+        return block
+
+    def _get_plan(self, block):
+        return get_object_or_404(self.plan_model, id=self.kwargs[self.url_kwarg], farm_block=block)
+
+    def get(self, request, *args, **kwargs):
+        self.block = self._get_block()
+        self.plan = self._get_plan(self.block)
+        self.form = self.plan_form_class(instance=self.plan)
+        if _is_ajax(request):
+            return JsonResponse(
+                {"html": render_to_string(self.partial_template_name, self.get_context_data(), request=request)}
+            )
+        return super().get(request, *args, **kwargs)
+
+    def post(self, request, *args, **kwargs):
+        self.block = self._get_block()
+        self.plan = self._get_plan(self.block)
+        self.form = self.plan_form_class(request.POST, instance=self.plan)
+        if not self.form.is_valid():
+            if _is_ajax(request):
+                return JsonResponse(
+                    {
+                        "ok": False,
+                        "html": render_to_string(self.partial_template_name, self.get_context_data(), request=request),
+                    },
+                    status=400,
+                )
+            return self.render_to_response(self.get_context_data())
+        self.form.save()
+        message = f"{self.plan_noun} plan updated for “{self.block.name}”."
+        if _is_ajax(request):
+            return JsonResponse({
+                "ok": True, "message": message,
+                "farm_map_data": _build_farm_map_data(request),
+                "focus": {"type": "block", "id": str(self.block.id)},
+            })
+        messages.success(request, message)
+        return redirect(f"{reverse('dashboard:farms')}?block={self.block.id}")
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["form"] = self.form
+        context["farm_block"] = self.block
+        context["plan"] = self.plan
+        context["is_update"] = True
+        return context
+
+
+class HarvestPlanUpdateView(_PlanUpdateView):
+    # Full page for a direct/non-AJAX GET (includes the partial below via
+    # {% include %}, same relationship as HarvestPlanCreateView's own
+    # template); the AJAX branch renders partial_template_name directly.
+    template_name = "dashboard/harvest_plan_form.html"
+    partial_template_name = "dashboard/_partials/harvest_plan_form.html"
+    plan_model = Harvest
+    plan_form_class = HarvestPlanForm
+    url_kwarg = "harvest_id"
+    plan_noun = "Harvest"
+
+
+class FertilizerPlanUpdateView(_PlanUpdateView):
+    template_name = "dashboard/fertilizer_plan_form.html"
+    partial_template_name = "dashboard/_partials/fertilizer_plan_form.html"
+    plan_model = Fertilizer
+    plan_form_class = FertilizerPlanForm
+    url_kwarg = "fertilizer_id"
+    plan_noun = "Fertilizer"
+
+
+class _PlanDeleteView(ManagerOrSuperAdminRequiredMixin, View):
+    """POST-only, client-side window.confirm() gate (same pattern
+    farm_map.html's removeTree() already uses) rather than a separate
+    confirm page — deleting a plan cascades to its ActualHarvest/
+    ActualFertilizer rows (and their tree rows), which is a legitimate
+    correction (creating the wrong plan, or one auto-created behind the
+    scenes that shouldn't have been), not a destructive-enough action to
+    need FarmBlockDeleteView's stronger "refuse if used" guard.
+    """
+
+    plan_model = None  # Harvest or Fertilizer — set by subclass
+    actuals_related_name = None  # "actual_harvests" or "actual_fertilizers" — set by subclass
+    url_kwarg = None  # "harvest_id" or "fertilizer_id" — set by subclass
+    plan_noun = None  # "Harvest" or "Fertilizer" — set by subclass
+
+    def post(self, request, *args, **kwargs):
+        block = get_object_or_404(_viewset_queryset(FarmBlockViewSet, request), id=kwargs["block_id"])
+        _require_manager_for_farm(request.user, block.farm)
+        plan = get_object_or_404(self.plan_model, id=kwargs[self.url_kwarg], farm_block=block)
+        actual_count = getattr(plan, self.actuals_related_name).count()
+        plan.delete()
+        message = f"{self.plan_noun} plan deleted."
+        if actual_count:
+            message += f" ({actual_count} actual record{'s' if actual_count != 1 else ''} removed with it.)"
+        if _is_ajax(request):
+            return JsonResponse({
+                "ok": True, "message": message,
+                "farm_map_data": _build_farm_map_data(request),
+                "focus": {"type": "block", "id": str(block.id)},
+            })
+        messages.success(request, message)
+        return redirect(f"{reverse('dashboard:farms')}?block={block.id}")
+
+
+class HarvestPlanDeleteView(_PlanDeleteView):
+    plan_model = Harvest
+    actuals_related_name = "actual_harvests"
+    url_kwarg = "harvest_id"
+    plan_noun = "Harvest"
+
+
+class FertilizerPlanDeleteView(_PlanDeleteView):
+    plan_model = Fertilizer
+    actuals_related_name = "actual_fertilizers"
+    url_kwarg = "fertilizer_id"
+    plan_noun = "Fertilizer"
+
+
+class _PlanApproveView(ManagerOrSuperAdminRequiredMixin, View):
+    """Advances a plan's status one step via apps.operations.services'
+    own advance_status() — reused directly rather than reimplementing the
+    _TRANSITIONS table, same as apps/operations/views.py's own `approve`
+    API action. farm_map.html only ever shows the button when
+    can_advance(plan.status) is true (see _plan_entries() above), but this
+    still re-validates server-side — a stale panel showing a now-invalid
+    button shouldn't be trusted blindly.
+    """
+
+    plan_model = None  # Harvest or Fertilizer — set by subclass
+    url_kwarg = None  # "harvest_id" or "fertilizer_id" — set by subclass
+    plan_noun = None  # "Harvest" or "Fertilizer" — set by subclass
+
+    def post(self, request, *args, **kwargs):
+        block = get_object_or_404(_viewset_queryset(FarmBlockViewSet, request), id=kwargs["block_id"])
+        _require_manager_for_farm(request.user, block.farm)
+        plan = get_object_or_404(self.plan_model, id=kwargs[self.url_kwarg], farm_block=block)
+        try:
+            advance_status(plan)
+        except DjangoValidationError as exc:
+            message = exc.messages[0] if hasattr(exc, "messages") else str(exc)
+            if _is_ajax(request):
+                return JsonResponse({"ok": False, "message": message}, status=400)
+            messages.error(request, message)
+            return redirect(f"{reverse('dashboard:farms')}?block={block.id}")
+        message = f"{self.plan_noun} plan advanced to “{plan.get_status_display()}”."
+        if _is_ajax(request):
+            return JsonResponse({
+                "ok": True, "message": message,
+                "farm_map_data": _build_farm_map_data(request),
+                "focus": {"type": "block", "id": str(block.id)},
+            })
+        messages.success(request, message)
+        return redirect(f"{reverse('dashboard:farms')}?block={block.id}")
+
+
+class HarvestPlanApproveView(_PlanApproveView):
+    plan_model = Harvest
+    url_kwarg = "harvest_id"
+    plan_noun = "Harvest"
+
+
+class FertilizerPlanApproveView(_PlanApproveView):
+    plan_model = Fertilizer
+    url_kwarg = "fertilizer_id"
+    plan_noun = "Fertilizer"
+
+
+class _ActualUpdateView(ManagerOrSuperAdminRequiredMixin, View):
+    """Edits an existing ActualHarvest/ActualFertilizer — GET returns raw
+    JSON (not an html fragment like every Django-form-backed view above)
+    because the tree checklist it prefills is entirely client-rendered
+    (renderTreeSelectionChecklist() in farm_map.html), not a server
+    template; there's no Django form to render server-side for the
+    per-tree rows. POST deletes and recreates the tree rows from the
+    submitted selection rather than diffing add/removed/changed as three
+    separate cases — simplest correct approach for what's realistically a
+    handful of rows per action.
+    """
+
+    actual_model = None  # ActualHarvest or ActualFertilizer — set by subclass
+    tree_model = None  # HarvestTree or FertilizerTree — set by subclass
+    plan_fk_field = None  # "harvest" or "fertilizer" — set by subclass
+    actual_fk_field = None  # "actual_harvest" or "actual_fertilizer" — set by subclass
+    related_name = None  # "harvest_trees" or "fertilizer_trees" — set by subclass
+    url_kwarg = None  # "actual_id" — set by subclass
+    noun = None  # "harvest" or "fertilizer application" — set by subclass
+    # "weight_kg" for Harvest, "quantity" for Fertilizer — see
+    # _RecordActualMixin.value_field's own comment above for why.
+    value_field = None
+
+    def _get_block(self, request):
+        block = get_object_or_404(_viewset_queryset(FarmBlockViewSet, request), id=self.kwargs["block_id"])
+        _require_manager_for_farm(request.user, block.farm)
+        return block
+
+    def _get_actual(self, block):
+        farm_block_lookup = f"{self.plan_fk_field}__farm_block"
+        return get_object_or_404(
+            self.actual_model.objects.select_related(self.plan_fk_field).prefetch_related(self.related_name),
+            id=self.kwargs[self.url_kwarg], **{farm_block_lookup: block},
+        )
+
+    def get(self, request, *args, **kwargs):
+        block = self._get_block(request)
+        actual = self._get_actual(block)
+        return JsonResponse({
+            "ok": True,
+            "actual": {
+                "id": str(actual.id),
+                "date": actual.date.isoformat(),
+                "quantity": getattr(actual, self.value_field),
+                "trees": [
+                    {"id": str(row.tree_id), "quantity": getattr(row, self.value_field)}
+                    for row in getattr(actual, self.related_name).all()
+                ],
+            },
+        })
+
+    def post(self, request, *args, **kwargs):
+        block = self._get_block(request)
+        actual = self._get_actual(block)
+        try:
+            tree_ids = _json.loads(request.POST.get("tree_ids") or "[]")
+        except (TypeError, ValueError):
+            tree_ids = []
+        tree_ids = [str(i) for i in tree_ids] if isinstance(tree_ids, list) else []
+        try:
+            raw_quantities = _json.loads(request.POST.get("quantities") or "{}")
+        except (TypeError, ValueError):
+            raw_quantities = {}
+        quantities = raw_quantities if isinstance(raw_quantities, dict) else {}
+
+        def quantity_for(tree_id):
+            raw = quantities.get(str(tree_id))
+            if raw in (None, ""):
+                return None
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return None
+
+        total_raw = request.POST.get("total_quantity")
+        try:
+            total_quantity = float(total_raw) if total_raw not in (None, "") else None
+        except (TypeError, ValueError):
+            total_quantity = None
+        date = parse_date(request.POST.get("date") or "") or actual.date
+
+        actual.date = date
+        setattr(actual, self.value_field, total_quantity)
+        actual.save(update_fields=["date", self.value_field])
+        getattr(actual, self.related_name).all().delete()
+        trees = Tree.objects.filter(id__in=tree_ids, farm_block=block, status=Tree.STATUS_ACTIVE)
+        self.tree_model.objects.bulk_create([
+            self.tree_model(
+                **{self.actual_fk_field: actual, self.value_field: quantity_for(tree.id)}, tree=tree,
+                recorded_by=request.user,
+            )
+            for tree in trees
+        ])
+        message = f"Updated actual {self.noun} record."
+        if _is_ajax(request):
+            return JsonResponse({
+                "ok": True, "message": message,
+                "farm_map_data": _build_farm_map_data(request),
+                "focus": {"type": "block", "id": str(block.id)},
+            })
+        messages.success(request, message)
+        return redirect(f"{reverse('dashboard:farms')}?block={block.id}")
+
+
+class ActualHarvestUpdateView(_ActualUpdateView):
+    actual_model = ActualHarvest
+    tree_model = HarvestTree
+    plan_fk_field = "harvest"
+    actual_fk_field = "actual_harvest"
+    related_name = "harvest_trees"
+    url_kwarg = "actual_id"
+    noun = "harvest"
+    value_field = "weight_kg"
+
+
+class ActualFertilizerUpdateView(_ActualUpdateView):
+    actual_model = ActualFertilizer
+    tree_model = FertilizerTree
+    plan_fk_field = "fertilizer"
+    actual_fk_field = "actual_fertilizer"
+    related_name = "fertilizer_trees"
+    url_kwarg = "actual_id"
+    noun = "fertilizer application"
+    value_field = "quantity"
+
+
+class _ActualDeleteView(ManagerOrSuperAdminRequiredMixin, View):
+    """POST-only, client-side confirm — deletes an ActualHarvest/
+    ActualFertilizer (cascades to its own tree rows only; the optional
+    HarvestBatch link on ActualHarvest is SET_NULL, so this never orphans
+    compliance data)."""
+
+    actual_model = None  # ActualHarvest or ActualFertilizer — set by subclass
+    plan_fk_field = None  # "harvest" or "fertilizer" — set by subclass
+    url_kwarg = None  # "actual_id" — set by subclass
+    noun = None  # "harvest" or "fertilizer application" — set by subclass
+
+    def post(self, request, *args, **kwargs):
+        block = get_object_or_404(_viewset_queryset(FarmBlockViewSet, request), id=kwargs["block_id"])
+        _require_manager_for_farm(request.user, block.farm)
+        farm_block_lookup = f"{self.plan_fk_field}__farm_block"
+        actual = get_object_or_404(self.actual_model, id=kwargs[self.url_kwarg], **{farm_block_lookup: block})
+        actual.delete()
+        message = f"Deleted actual {self.noun} record."
+        if _is_ajax(request):
+            return JsonResponse({
+                "ok": True, "message": message,
+                "farm_map_data": _build_farm_map_data(request),
+                "focus": {"type": "block", "id": str(block.id)},
+            })
+        messages.success(request, message)
+        return redirect(f"{reverse('dashboard:farms')}?block={block.id}")
+
+
+class ActualHarvestDeleteView(_ActualDeleteView):
+    actual_model = ActualHarvest
+    plan_fk_field = "harvest"
+    url_kwarg = "actual_id"
+    noun = "harvest"
+
+
+class ActualFertilizerDeleteView(_ActualDeleteView):
+    actual_model = ActualFertilizer
+    plan_fk_field = "fertilizer"
+    url_kwarg = "actual_id"
+    noun = "fertilizer application"
+
+
 class NotificationListView(ManagerOrSuperAdminRequiredMixin, TemplateView):
     """The Manager's own in-app notification feed — apps/notifications/
     services.py's notify() is what actually populates this; this view only
@@ -1507,7 +2582,18 @@ class NotificationListView(ManagerOrSuperAdminRequiredMixin, TemplateView):
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
         context["notifications"] = Notification.objects.filter(user=self.request.user)[:50]
+        context["unread_count"] = Notification.objects.filter(user=self.request.user, read=False).count()
         return context
+
+    def post(self, request, *args, **kwargs):
+        """Mark one notification (`notification_id`) or all of them read —
+        only ever the requesting user's own rows."""
+        qs = Notification.objects.filter(user=request.user, read=False)
+        note_id = request.POST.get("notification_id")
+        if note_id:
+            qs = qs.filter(id=note_id)
+        qs.update(read=True)
+        return redirect("dashboard:notifications")
 
 
 # --- Imagery: upload, block-level processing, and the review queue —
@@ -1781,12 +2867,14 @@ class ImageConfirmBlocksView(ManagerOrSuperAdminRequiredMixin, TemplateView):
         if not blocks:
             return fail("None of the selected blocks were valid — nothing was started.")
 
+        started, already = [], []
         for block in blocks:
-            run = ImageProcessingRun.objects.create(image=image, farm_block=block, triggered_by=request.user)
-            run_processing_task.delay(str(run.id))
+            _, was_started = imagery_services.start_processing_run(image, block, request.user)
+            (started if was_started else already).append(block.name)
 
-        names = ", ".join(block.name for block in blocks)
-        message = f"Processing started against: {names}."
+        message = f"Processing started against: {', '.join(started)}." if started else "Nothing new started."
+        if already:
+            message += f" Already running for: {', '.join(already)}."
         if _is_ajax(request):
             return JsonResponse({
                 "ok": True,
@@ -1935,9 +3023,11 @@ class TriggerProcessingView(ManagerOrSuperAdminRequiredMixin, View):
             messages.error(request, "This image hasn't finished georeferencing yet — try again shortly.")
             return redirect("dashboard:imagery-block", block_id=block.id)
 
-        run = ImageProcessingRun.objects.create(image=image, farm_block=block, triggered_by=request.user)
-        run_processing_task.delay(str(run.id))
-        messages.success(request, "Processing started.")
+        run, started = imagery_services.start_processing_run(image, block, request.user)
+        if started:
+            messages.success(request, "Processing started.")
+        else:
+            messages.info(request, "This image is already being processed against this block — showing that run.")
         return redirect("dashboard:imagery-run", run_id=run.id)
 
 
@@ -2025,7 +3115,8 @@ class ReviewQueueView(ManagerOrSuperAdminRequiredMixin, TemplateView):
         # detection, the same in-memory-geometry trade-off
         # _build_farm_map_data() already makes.
         block_trees = list(
-            Tree.objects.filter(farm_block=run.farm_block, status=Tree.STATUS_ACTIVE).only("id", "name", "location")
+            Tree.objects.filter(farm_block=run.farm_block, status=Tree.STATUS_ACTIVE)
+            .select_related("farm_block").only("id", "name", "number", "location", "farm_block__name")
         )
         for detection in detections:
             # GEOSGeometry.distance() on SRID 4326 returns DEGREES, not
@@ -2043,7 +3134,17 @@ class ReviewQueueView(ManagerOrSuperAdminRequiredMixin, TemplateView):
         # all" button's own label/empty-state can be honest about excluding
         # ambiguous ones, same restriction that view enforces server-side.
         confirmable_count = sum(1 for d in detections if d.match_status == TreeDetection.MATCH_NEW_CANDIDATE)
+        health_qs = TreeHealthClassification.objects.filter(
+            tree_detection__processing_run=run, reviewed=False,
+            confidence__lt=TreeHealthClassification.REVIEW_THRESHOLD,
+        )
+        health_checks_total = health_qs.count()
+        health_checks = list(
+            health_qs.select_related("tree_detection__tree__farm_block").order_by("confidence")[:60]
+        )
         context.update({
+            "health_checks": health_checks,
+            "health_checks_total": health_checks_total,
             "run": run,
             "detections": detections,
             "confirmable_count": confirmable_count,
@@ -2105,7 +3206,9 @@ class ConfirmAllDetectionsView(ManagerOrSuperAdminRequiredMixin, View):
             tree_detection__in=detections
         ).count() < len(detections):
             try:
-                clipped = imagery_services.clip_to_block(run.image, run.farm_block)
+                clipped = imagery_services.clip_to_block(
+                    run.image, run.farm_block, max_gsd_m=run.farm_block.effective_detection_target_gsd_m()
+                )
             except Exception:  # noqa: BLE001 — same trade-off confirm_new_candidate() makes: a missing health label must never block confirmation
                 clipped = None
 
@@ -2124,15 +3227,47 @@ class ConfirmAllDetectionsView(ManagerOrSuperAdminRequiredMixin, View):
         return redirect("dashboard:imagery-run", run_id=run.id)
 
 
+class ReviewClassificationView(ManagerOrSuperAdminRequiredMixin, View):
+    """Human check of a low-confidence health label (docs/06-ml-pipeline.md
+    step 4). Posting a label records it as the correction (when it differs
+    from the model's), marks the result reviewed, and — since a reviewed
+    result is trustworthy — updates the tree's health if it has one."""
+
+    def post(self, request, classification_id):
+        classification = get_object_or_404(
+            TreeHealthClassification.objects.select_related("tree_detection__processing_run__farm_block__farm", "tree_detection__tree"),
+            id=classification_id,
+        )
+        run = classification.tree_detection.processing_run
+        _require_manager_for_farm(request.user, run.farm_block.farm)
+        label = request.POST.get("label")
+        if label not in dict(TreeHealthClassification.HEALTH_CHOICES):
+            messages.error(request, "Choose Healthy, Yellow or Unknown.")
+            return redirect(reverse("dashboard:imagery-run", kwargs={"run_id": run.id}) + "#health-checks")
+        classification.corrected_label = "" if label == classification.health_label else label
+        classification.reviewed = True
+        classification.reviewed_by = request.user
+        classification.save(update_fields=["corrected_label", "reviewed", "reviewed_by"])
+        tree = classification.tree_detection.tree
+        if tree is not None:
+            tree.current_health = classification.effective_label
+            tree.save(update_fields=["current_health", "updated_at"])
+        messages.success(request, f"Health set to {label}.")
+        return redirect(reverse("dashboard:imagery-run", kwargs={"run_id": run.id}) + "#health-checks")
+
+
 class RejectDetectionView(ManagerOrSuperAdminRequiredMixin, View):
     def post(self, request, detection_id):
         detection = get_object_or_404(
             TreeDetection.objects.select_related("processing_run__farm_block__farm"), id=detection_id
         )
         _require_manager_for_farm(request.user, detection.processing_run.farm_block.farm)
-        detection.match_status = TreeDetection.MATCH_REJECTED
-        detection.save(update_fields=["match_status"])
-        messages.success(request, "Detection rejected.")
+        if detection.tree_id:
+            messages.error(request, "This detection is already linked to a tree — it can't be rejected.")
+        else:
+            detection.match_status = TreeDetection.MATCH_REJECTED
+            detection.save(update_fields=["match_status"])
+            messages.success(request, "Detection rejected.")
         return redirect("dashboard:imagery-run", run_id=detection.processing_run_id)
 
 
@@ -2146,7 +3281,9 @@ class LinkDetectionView(ManagerOrSuperAdminRequiredMixin, View):
         if not tree_id:
             messages.error(request, "Choose a tree to link this detection to.")
             return redirect("dashboard:imagery-run", run_id=detection.processing_run_id)
-        tree = get_object_or_404(Tree, id=tree_id, farm_block=detection.processing_run.farm_block)
+        tree = get_object_or_404(
+            Tree, id=tree_id, farm_block=detection.processing_run.farm_block, status=Tree.STATUS_ACTIVE
+        )
         detection.tree = tree
         detection.match_status = TreeDetection.MATCH_MATCHED
         detection.save(update_fields=["tree", "match_status"])
@@ -2415,9 +3552,7 @@ class ReportRunListView(ManagerOrSuperAdminRequiredMixin, TemplateView):
 # bare "act on whatever's under the pin" shortcut — see this module's
 # docstring for why that distinction matters here specifically. Every
 # feature carries `farm_id` so the template's farm filter can select
-# client-side without a round trip, and tree markers are clustered
-# (Leaflet.markercluster) rather than plotted individually, since a real
-# farm can carry far more trees than this project's test-scale fixtures. ---
+# client-side without a round trip. ---
 
 # MapView (old, separate map page) removed — superseded by FarmMapView,
 # which merges browsing, farm/block/tree management, imagery-upload

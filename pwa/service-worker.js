@@ -1,18 +1,28 @@
 /**
- * App-shell service worker. Two jobs only:
- *  1. Cache the PWA's own static assets so the app shell loads offline.
- *  2. NEVER intercept /api/ or /admin/ requests — those must always hit
- *     the network (or fail visibly), since serving a stale cached API
- *     response would be actively wrong (e.g. showing old JWT-protected
- *     data as if it were current). All actual offline data access goes
- *     through IndexedDB (pwa/js/db.js), not the HTTP cache.
+ * App-shell service worker for the PWA field client. Two jobs only:
+ *  1. Keep the field app's own files (/field/, /pwa/*, the manifest)
+ *     available offline.
+ *  2. Leave every other request alone — /api/ (live data must never come
+ *     from an HTTP cache; offline data lives in IndexedDB, pwa/js/db.js),
+ *     the office dashboard, /admin/, /media/.
  *
- * Registered at the site root (see palmvision/urls.py — served from
- * /service-worker.js, not /pwa/service-worker.js) so its scope covers the
- * whole origin; the fetch handler below is what keeps that safe.
+ * Registered at the site root (palmvision/urls.py serves it from
+ * /service-worker.js), so its scope covers the whole origin, dashboard
+ * included. That's why job 2 is an explicit allowlist below rather than a
+ * short denylist: an earlier version intercepted every same-origin GET
+ * except /api/ and /admin/ cache-first, which silently cached dashboard
+ * pages (with their embedded data and CSRF token) and served them stale
+ * forever.
+ *
+ * Network-first, not cache-first: online, every load revalidates against
+ * the server (a cheap 304 when unchanged), so a deployed fix reaches field
+ * devices on the next load instead of never — cache-first with a fixed
+ * cache name meant new app.js/sync.js versions were never picked up.
+ * Offline, or when the network is too slow to be usable in the field, the
+ * cached copy is served.
  */
 
-const CACHE_NAME = "palmvision-shell-v2";
+const CACHE_NAME = "palmvision-shell-v3";
 const APP_SHELL = [
   "/field/",
   "/pwa/css/app.css",
@@ -26,14 +36,60 @@ const APP_SHELL = [
   "/pwa/fonts/public-sans-latin.woff2",
   "/manifest.webmanifest",
 ];
+const NETWORK_TIMEOUT_MS = 4000;
+
+function isFieldAppFile(url) {
+  if (url.origin !== self.location.origin) return false;
+  return (
+    url.pathname.startsWith("/field/") ||
+    url.pathname.startsWith("/pwa/") ||
+    url.pathname === "/manifest.webmanifest"
+  );
+}
+
+function fetchFresh(url) {
+  // cache: "no-cache" makes the browser revalidate with the server instead
+  // of trusting its own HTTP cache's guess at freshness.
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("network timeout")), NETWORK_TIMEOUT_MS);
+    fetch(url, { cache: "no-cache", credentials: "same-origin" }).then(
+      (response) => {
+        clearTimeout(timer);
+        resolve(response);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
+async function networkFirst(request) {
+  const cache = await caches.open(CACHE_NAME);
+  try {
+    const response = await fetchFresh(request.url);
+    if (response.ok) await cache.put(request.url, response.clone());
+    return response;
+  } catch (err) {
+    const cached = await cache.match(request.url);
+    if (cached) return cached;
+    throw err;
+  }
+}
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL)).then(() => self.skipWaiting())
+    caches
+      .open(CACHE_NAME)
+      .then((cache) => cache.addAll(APP_SHELL.map((url) => new Request(url, { cache: "reload" }))))
+      .then(() => self.skipWaiting())
   );
 });
 
 self.addEventListener("activate", (event) => {
+  // Deleting every other cache also purges the old "palmvision-shell-v2"
+  // cache, which holds stale copies of dashboard pages.
   event.waitUntil(
     caches
       .keys()
@@ -43,32 +99,9 @@ self.addEventListener("activate", (event) => {
 });
 
 self.addEventListener("fetch", (event) => {
-  const url = new URL(event.request.url);
-
-  // Never cache-intercept the API or Django admin — always go to network.
-  if (url.pathname.startsWith("/api/") || url.pathname.startsWith("/admin/")) {
-    return;
-  }
-
   if (event.request.method !== "GET") return;
-
-  // Cache-first for the app shell, falling back to network (and caching
-  // what comes back) for anything else same-origin — e.g. Leaflet tiles
-  // are cross-origin and untouched by this handler entirely.
-  event.respondWith(
-    caches.match(event.request).then((cached) => {
-      if (cached) return cached;
-      return fetch(event.request)
-        .then((response) => {
-          if (response.ok && url.origin === self.location.origin) {
-            const clone = response.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
-          }
-          return response;
-        })
-        .catch(() => cached); // offline and not in cache: let it fail naturally
-    })
-  );
+  if (!isFieldAppFile(new URL(event.request.url))) return;
+  event.respondWith(networkFirst(event.request));
 });
 
 /**

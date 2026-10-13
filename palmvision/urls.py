@@ -36,10 +36,22 @@ if settings.DEBUG:
 # service-worker.js and manifest.webmanifest are served from the site root
 # (not under /pwa/) specifically so the service worker's default scope
 # covers the whole origin — see pwa/service-worker.js's docstring for why
-# that's safe (it never intercepts /api/ or /admin/).
+# that's safe (it only ever handles the field app's own files).
+
+
+def _pwa_serve(request, **kwargs):
+    # Without Cache-Control, browsers apply heuristic freshness (~10% of the
+    # time since Last-Modified) and keep running an old app.js/sync.js for
+    # hours after a change. no-cache still lets them reuse their copy, but
+    # only after a revalidation (a cheap 304 when nothing changed).
+    response = static_serve(request, **kwargs)
+    response["Cache-Control"] = "no-cache"
+    return response
+
+
 urlpatterns += [
-    path("field/", static_serve, {"document_root": settings.BASE_DIR / "pwa", "path": "index.html"}, name="pwa-shell"),
-    path("service-worker.js", static_serve, {"document_root": settings.BASE_DIR / "pwa", "path": "service-worker.js"}),
-    path("manifest.webmanifest", static_serve, {"document_root": settings.BASE_DIR / "pwa", "path": "manifest.webmanifest"}),
-    path("pwa/<path:path>", static_serve, {"document_root": settings.BASE_DIR / "pwa"}),
+    path("field/", _pwa_serve, {"document_root": settings.BASE_DIR / "pwa", "path": "index.html"}, name="pwa-shell"),
+    path("service-worker.js", _pwa_serve, {"document_root": settings.BASE_DIR / "pwa", "path": "service-worker.js"}),
+    path("manifest.webmanifest", _pwa_serve, {"document_root": settings.BASE_DIR / "pwa", "path": "manifest.webmanifest"}),
+    path("pwa/<path:path>", _pwa_serve, {"document_root": settings.BASE_DIR / "pwa"}),
 ]
